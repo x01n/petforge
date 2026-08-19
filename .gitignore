@@ -1,0 +1,101 @@
+
+# 虚拟环境
+.venv/
+venv/
+env/
+_python/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+*.py.back
+*.back
+
+# 配置文件（可能含密钥）
+config.json
+config_settings.json
+config_settings.json.bak
+config*.bak*
+openclaw_device_identity.json
+pet_window_state.json
+wizard_window_state.json
+
+# 日志与本地运行数据
+*.log
+*.log.*
+logs/
+*.download
+*.tmp
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+mea_memory.db
+tts_debug.log
+chat_errors.log
+
+# 运行时缓存 / 下载物
+audio_cache/
+voice_cache/
+voice_asr/
+models/voice_asr/
+screenshots/
+wheels/
+OllamaSetup.exe
+_python.zip
+
+# 测试 / 静态检查缓存
+.coverage*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# IDE 配置
+.vscode/
+.idea/
+
+# Local assistant/developer instructions are not project artifacts.
+/AGENTS.md
+/CLAUDE.md
+
+# 构建产物
+mea_pet.egg-info/
+dist/
+build/
+debug_grab_frame.png
+
+# 误提交的运行时/调试残留文件
+/_standby=True
+/stop
+screenshots/
+
+# ── 大型运行时资源（模型权重 / 音频样本 / 精灵图 / 词典）──
+# 均为训练或第三方产物，体积大且可重新下载，不适合进入 Git 仓库。
+# 若历史版本已跟踪，运行 scripts/clean_git_tracking.sh 从索引移除。
+GPT-Sovits/
+models/
+sprites/
+dic/
+vits_models/
+live2d/*
+!live2d/KEEP_README.md
+
+# 密钥与本地凭据（防御层：即使未按约定放入 config.json）
+*.env
+.env*
+secrets*.json
+*_key.json
+*_token.json
+*cert*.pem
+*.key.pem
+
+# 下载脚本 / 缓存脚本生成的临时产物
+*.wav.tmp
+*.pth.tmp
+*.ckpt.tmp
+*.pt.tmp
