@@ -99,3 +99,5 @@ secrets*.json
 *.pth.tmp
 *.ckpt.tmp
 *.pt.tmp
+temp/
+.serena/

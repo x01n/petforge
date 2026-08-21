@@ -1,1 +1,0 @@
-"""MeaPet setup wizard package"""

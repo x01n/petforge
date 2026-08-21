@@ -1,1 +1,0 @@
-"""Desktop pet UI package."""
