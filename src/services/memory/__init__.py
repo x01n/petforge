@@ -1,0 +1,52 @@
+"""长期记忆服务。"""
+
+from .semantic import SemanticMemorySettings
+from .service import (
+    AUTO_EXTRACT_DEFAULT_PRIORITY,
+    AUTO_EXTRACT_MAX_CHARS,
+    AUTO_EXTRACT_MAX_ITEMS,
+    AUTO_EXTRACT_MIN_CONFIDENCE,
+    CONTEXT_MAX_CHARS,
+    MAX_IMPORT_BYTES,
+    MAX_IMPORT_ITEMS,
+    MAX_MEMORIES,
+    RECALL_ACCESS_WEIGHT,
+    RECALL_EXACT_WEIGHT,
+    RECALL_IMPORTANCE_WEIGHT,
+    RECALL_RECENCY_WEIGHT,
+    RECALL_RELEVANCE_WEIGHT,
+    RECALL_SEMANTIC_WEIGHT,
+    RECALL_TAG_WEIGHT,
+    ExtractedMemory,
+    Memory,
+    MemoryService,
+    MemorySettings,
+    SummarizationBatch,
+)
+from .summarizer import MemorySummaryCoordinator, MemorySummaryStatus
+
+__all__ = [
+    "CONTEXT_MAX_CHARS",
+    "RECALL_ACCESS_WEIGHT",
+    "RECALL_EXACT_WEIGHT",
+    "RECALL_IMPORTANCE_WEIGHT",
+    "RECALL_RECENCY_WEIGHT",
+    "RECALL_RELEVANCE_WEIGHT",
+    "RECALL_SEMANTIC_WEIGHT",
+    "RECALL_TAG_WEIGHT",
+    "AUTO_EXTRACT_DEFAULT_PRIORITY",
+    "AUTO_EXTRACT_MAX_CHARS",
+    "AUTO_EXTRACT_MAX_ITEMS",
+    "AUTO_EXTRACT_MIN_CONFIDENCE",
+    "MAX_IMPORT_BYTES",
+    "MAX_IMPORT_ITEMS",
+    "MAX_MEMORIES",
+    "Memory",
+    "ExtractedMemory",
+    "MemorySettings",
+    "SemanticMemorySettings",
+    "SummarizationBatch",
+    "MemoryService",
+    "MemorySummaryCoordinator",
+    "MemorySummaryStatus",
+]

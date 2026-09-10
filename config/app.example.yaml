@@ -1,0 +1,384 @@
+app:
+  name: MeaPet
+  # 旧版 system_prompt 仍兼容；新配置优先使用 prompts.dialogue。
+  system_prompt: ''
+  persona:
+    name: Mea
+    role: 桌面伙伴
+    user_address: 你
+    relationship: 陪伴并协助用户完成桌面任务
+    language: zh-CN
+    speaking_style: 自然、简洁、温和
+    background: ''
+    traits:
+    - 好奇
+    - 可靠
+    goals:
+    - 在不越过权限边界的前提下帮助用户
+    boundaries:
+    - 未收到成功回执时不得声称操作已经完成
+    likes: []
+    dislikes:
+    - 重复执行完全相同的工具调用
+    custom_instructions: ''
+    proactive_enabled: true
+  prompts:
+    dialogue: 你是一个有边界感、会主动行动的桌宠。
+    tool_guidance: 需要桌面信息或操作时使用已提供的工具；不要声称执行了没有成功回执的操作。
+    memory_summary: 你负责整理桌宠长期记忆。只输出简洁事实摘要；保留用户偏好、习惯、关系和未完成事项；忽略工具协议、推理过程、密钥、令牌、密码、联系方式与地址；不要输出 JSON、标题或解释。
+    memory_extract: 你负责从用户消息中提取可长期使用的稳定事实。只返回严格 JSON 数组，不要 Markdown 或解释。每项只允许 content、priority、confidence、tags、rule 字段；不要记录密钥、令牌、密码、联系方式、地址或模型推测。
+logging:
+  level: INFO
+  console:
+    enabled: true
+    level: INFO
+    color: auto
+  file:
+    enabled: false
+    path: ../data/meapet.log
+    level: INFO
+    rotation: time
+    when: midnight
+    interval: 1
+    backup_count: 7
+    max_bytes: 10485760
+  memory:
+    enabled: true
+    level: INFO
+    capacity: 1000
+llm:
+  channels:
+  # 模型向导先选择适配器，再从该适配器的协议列表选择协议。
+  - id: primary
+    preset: openai
+    protocol: openai_responses
+    base_url: http://127.0.0.1:8317/v1
+    # 默认由环境变量提供密钥；模型向导可显式勾选本机明文持久化（文件权限 0600）。
+    api_key_env: OPENAI_API_KEY
+    api_key: ''
+    model: gpt-5.4-mini
+    capabilities:
+    - streaming
+    - tools
+    - vision
+    enabled: true
+    priority: 10
+  models: {}
+  routing:
+    dialogue:
+      channel: primary
+      required_capabilities:
+      - streaming
+      fallback_channels: []
+    vision:
+      channel: primary
+      required_capabilities:
+      - streaming
+      - vision
+    memory:
+      channel: primary
+      required_capabilities:
+      - streaming
+    proactive:
+      channel: primary
+      required_capabilities:
+      - streaming
+      - tools
+tools:
+  groups:
+    desktop_observation:
+    - desktop:observe_foreground
+    - desktop:list_processes
+    - desktop:context_snapshot
+    - desktop:capture_screen
+    - desktop:ocr
+    desktop_control:
+    - desktop:click_at
+    desktop_automation:
+    - desktop:automation_batch
+    pet_control:
+    - pet:move
+    - pet:set_expression
+    - pet:play_motion
+    - pet:speak
+    - pet:set_click_through
+    scheduler:
+    - scheduler:upsert
+    system:
+    - system:module_status
+    - system:transcribe_audio
+    - system:run_command
+  permissions:
+    bypass_approval: false
+    auto_allow_low_risk: true
+    allow: []
+    deny: []
+    approval_ttl_seconds: 90
+  command_allowlist: []
+  active_groups:
+  - desktop_observation
+  - desktop_control
+  - desktop_automation
+  - pet_control
+  - pet_diary
+  - scheduler
+  - system
+  - mcp
+mcp:
+  enabled: false
+  servers: []
+plugins:
+  # 插件目录相对于本配置文件所在目录；不存在时保持空发现结果。
+  enabled: true
+  directories: []
+  entry_points_enabled: false
+  entry_point_group: meapet.plugins
+  reload_enabled: true
+  reload_interval_seconds: 1.0
+web:
+  local_api:
+    enabled: false
+    host: 127.0.0.1
+    port: 0
+    events: true
+    event_limit: 64
+memory:
+  enabled: true
+  recall_limit: 7
+  context_max_chars: 6000
+  context_memory_item_chars: 500
+  recent_exchange_limit: 10
+  max_memories: 2000
+  decay_days: 7
+  prune_days: 30
+  prune_importance_floor: 1
+  consolidation_enabled: true
+  consolidation_similarity: 0.85
+  max_consolidation_memories: 200
+  summarize_every_n: 20
+  summary_chat_limit: 20
+  summarization_enabled: true
+  summarize_daily: true
+  summary_interval_minutes: 360
+  summary_min_messages: 4
+  exchange_min_chars: 20
+  exchange_importance: 2
+  exchange_decay_factor: 0.8
+  auto_extract_enabled: true
+  extract_max_items: 3
+  extract_max_chars: 240
+  extract_min_confidence: 0.8
+  extract_default_priority: 5
+  recall_min_similarity: 0.04
+  always_recall_priority: 9
+  # 真实语义索引默认关闭；启用时只读取本地模型，不隐式联网下载。
+  semantic:
+    enabled: false
+    provider: sentence_transformers
+    model_path: ''
+    model_id: ''
+    model_revision: ''
+    dimension: 384
+    batch_size: 16
+    timeout_seconds: 5.0
+    startup_timeout_seconds: 60.0
+    shutdown_timeout_seconds: 2.0
+    max_text_chars: 10000
+    max_text_bytes: 40000
+    device: cpu
+    backend: torch
+    index_dir: ''
+    hnsw_m: 16
+    hnsw_ef_construction: 200
+    hnsw_ef_search: 64
+tts:
+  enabled: true
+  # 应用持有一个 JSONL IPC worker；默认在 worker 内预载 GPT-SoVITS，
+  # 只有未配置可用 engine_root 时才适配下面的外部 endpoint。
+  backend: gpt_sovits_stdio
+  language: zh
+  role: ""
+  # 空值跟随系统默认扬声器；可填写 Qt QAudioDevice.id() 固定输出设备。
+  output_device_id: ''
+  expected_sample_rate: 32000
+  queue_size: 16
+  segmentation:
+    max_chars: 120
+    hard_boundaries: "。！？!?…｡．.\n\r"
+    soft_boundaries: "，,、；;：: \t"
+  audio_features:
+    enabled: true
+    silence_threshold: 0.02
+    open_threshold: 0.35
+  endpoint: http://127.0.0.1:9880/tts
+  # 内置 worker 直接持有模型；engine_root 不可用时才使用上面的 endpoint。
+  engine_root: ../temp/third_party/GPT-SoVITS
+  engine_config: GPT_SoVITS/configs/tts_infer.yaml
+  # 默认配置会根据当前平台自动发现 Python venv 入口：POSIX 使用
+  # `.venv/bin/python`，Windows 原生 venv 使用 `.venv/Scripts/python.exe`。
+  gpt_path: ../resources/models/GPT_weights/mea_pro-e50.ckpt
+  sovits_path: ../resources/models/SoVITS_weights/mea_pro_e24_s13704.pth
+  ref_dir: ../resources/GPT-Sovits
+  ref_audio_path: ''
+  prompt_text: ''
+  prompt_lang: ''
+  media_type: wav
+  streaming_mode: 3
+  timeout_seconds: 60
+  startup_timeout_seconds: 300
+  shutdown_timeout_seconds: 2
+  startup_handshake: true
+  health_probe: true
+  require_final: false
+  require_audio: true
+  validate_pcm: false
+  # 多音色使用 profile ID 作为 pet:speak.voice 的精确值；每个 profile
+  # 可用 roles 声明角色；pet:speak.role 可按单次调用选择角色。
+  # profile 可覆盖 ref_audio_path、prompt_text、prompt_lang、reference_audios 和推理参数。
+  # profiles:
+  #   normal-zh:
+  #     languages: [zh]
+  #     roles: [assistant]
+  #     ref_audio_path: ../resources/GPT-Sovits/normal/zh_normal.wav
+  # routing:
+  #   default_profile: normal-zh
+  #   role_profiles: {assistant: normal-zh}
+asr:
+  # SenseVoice 由桌宠框架启动为常驻 IPC worker；音频只以有界 WAV/PCM
+  # 字节传输，不把用户录音路径交给独立模型进程。
+  enabled: true
+  backend: sensevoice
+  # Python venv 入口由默认配置按当前平台自动发现；如需覆盖，请填写
+  # POSIX 的 `.venv/bin/python` 或 Windows 的 `.venv/Scripts/python.exe`。
+  model_path: ${HOME}/.cache/modelscope/models/iic--SenseVoiceSmall/snapshots/master
+  device: cpu
+  # 中文参考音频在 SenseVoice auto 下实测会误判为 ja；中文桌宠默认锁定 zh。
+  # 需要多语言自动检测时仍可显式改为 auto。
+  language: zh
+  timeout_seconds: 60
+  startup_timeout_seconds: 180
+  max_audio_bytes: 16777216
+  capture:
+    # 只在用户点击“开始录音”后申请权限；识别结果仅填入输入框。
+    enabled: true
+    max_duration_seconds: 15
+    auto_submit: false
+    # 留空使用 Qt 当前默认输入；填写时必须使用 QAudioDevice.id 的精确值。
+    device_id: ''
+rendering:
+  # auto 默认沿用已验收的 Web Live2D；确认原生模型、驱动和外观后可改为 opengl。
+  backend: auto
+  resource_root: ../resources
+  model: ''
+  sprite_scale: 0.6
+  frame_rate: 60
+  geometry_audit_hz: 30
+watcher:
+  enabled: false
+  interval_seconds: 2
+  poll_timeout_seconds: 5
+  emit_initial: false
+config:
+  reload:
+    enabled: true
+    interval_seconds: 0.5
+    debounce_seconds: 0.1
+    stable_checks: 2
+scheduler:
+  enabled: true
+  poll_seconds: 0.5
+  activity:
+    enabled: true
+    idle_seconds: 300
+    poll_seconds: 0.5
+    system_idle_provider: disabled # disabled、x11 或 windows
+    system_idle_threshold_seconds: 300
+  tasks: []
+  triggers: []
+behavior:
+  enabled: true
+  min_interval_seconds: 12
+  max_interval_seconds: 24
+  probability: 0.35
+  interaction_cooldown_seconds: 0.35
+  movement:
+    enabled: true
+    min_distance_px: 96
+    max_distance_px: 240
+    step_pixels: 18
+    step_interval_seconds: 0.12
+    max_speed_px_per_second: 180
+    moving_motion: walk
+    idle_motion: idle
+    movement_identity: pet:autonomous_move
+    flip_facing: true
+    max_steps: 64
+  actions:
+  - identity: pet:play_motion
+    arguments:
+      name: blink
+    weight: 1
+    duration_seconds: 0.8
+proactive:
+  enabled: false
+  hourly_budget: 6
+  daily_budget: 24
+  global_cooldown_seconds: 15
+  dedupe_seconds: 60
+  max_pending_events: 32
+  memory_context_chars: 2400
+  max_tool_rounds: 2
+  rules:
+  - id: editor-focus
+    event: window_active
+    instruction: 用户持续使用编辑器时，结合记忆简短关心；没有帮助就保持安静。
+    debounce_seconds: 300
+    conditions:
+      process_name: {mode: exact, value: code}
+      min_duration_seconds: 600
+      require_user_active: true
+storage:
+  database: ../data/meapet.sqlite3
+ui:
+  always_on_top: true
+  window_locked: false
+  theme:
+    name: MeaPet Fluent Dark
+    mode: dark
+    seed: null
+    roles: {}
+    typography: {}
+    layout:
+      density: 0
+    motion:
+      reduced_motion: false
+    # 可在此追加受控 QSS；普通颜色和尺寸优先使用上方语义令牌。
+    extra_stylesheet: ''
+  qt_platform: auto
+  auto_open_model_setup: true
+  hotkeys:
+    enabled: true
+    bindings:
+    - action: open_input
+      sequence: Ctrl+Return
+      mode: hold
+    - action: open_console
+      sequence: Ctrl+Shift+M
+      mode: press
+    - action: toggle_visibility
+      sequence: Ctrl+Shift+H
+      mode: press
+    - action: toggle_always_on_top
+      sequence: Ctrl+Shift+T
+      mode: press
+    - action: toggle_window_lock
+      sequence: Ctrl+Shift+L
+      mode: press
+    - action: restore_click_through
+      sequence: Ctrl+Alt+Space
+      mode: hold
+  stream:
+    show_reasoning: false
+    show_murmur: true
+    show_tool_status: true
+    max_bubble_chars: 4000

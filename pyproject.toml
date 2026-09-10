@@ -1,0 +1,115 @@
+[project]
+name = "meapet"
+version = "0.1.0"
+description = "A modular desktop pet framework."
+readme = "README.md"
+requires-python = ">=3.11"
+license-files = ["docs/licenses/QWidget-FancyUI-GPL-3.0.txt"]
+dependencies = [
+  "basedpyright>=1.39.10",
+  "black>=26.5.1",
+  "flask>=3.1.3",
+  "httpx[socks]>=0.28.0",
+  "pyside6>=6.11.2",
+  "PyYAML>=6.0.2",
+  "ty>=0.0.78",
+]
+
+[project.scripts]
+meapet = "app.__main__:main"
+meapet-wizard = "wizard.__main__:main"
+
+[project.optional-dependencies]
+desktop = [
+  "PyOpenGL>=3.1.7",
+  "PySide6>=6.8.0",
+]
+live2d = [
+  "live2d-py>=0.5.0; platform_system != 'Linux'",
+]
+webengine = [
+  "PySide6>=6.8.0",
+]
+linux = [
+  "psutil>=6.1.0; platform_system == 'Linux'",
+  "python-xlib>=0.33; platform_system == 'Linux'",
+]
+windows = [
+  "psutil>=6.1.0; platform_system == 'Windows'",
+]
+semantic-memory = [
+  "hnswlib>=0.8.0,<0.9",
+  "sentence-transformers>=6.0.0,<7",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.0",
+  "ruff>=0.16.6",
+]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+  "src/app",
+  "src/config",
+  "src/core",
+  "src/db",
+  "src/gui",
+  "src/logger",
+  "src/services",
+  "src/wizard",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"THIRD_PARTY_NOTICES.md" = "gui/qt6/THIRD_PARTY_NOTICES.md"
+"docs/licenses/QWidget-FancyUI-GPL-3.0.txt" = "gui/qt6/licenses/QWidget-FancyUI-GPL-3.0.txt"
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+  "src",
+  "config",
+  "THIRD_PARTY_NOTICES.md",
+  "pyproject.toml",
+  "resources",
+  "pet.py",
+  "setup_wizard.py",
+  "scripts",
+]
+exclude = [
+  "/.claude",
+  "/.serena",
+  "/.git",
+  "/.venv",
+  "/.pytest_cache",
+  "/.ruff_cache",
+  "/.mypy_cache",
+  "/**/__pycache__",
+  "/temp",
+  "/data",
+  "/dist",
+  "/build",
+  "/resources/README.md"
+]
+
+[tool.hatch.build.targets.sdist.force-include]
+"docs" = "docs"
+"scripts" = "scripts"
+"design-system" = "design-system"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+exclude = ["*.ps1"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

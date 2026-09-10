@@ -1,0 +1,24 @@
+llm:
+  channels:
+    - id: primary
+      protocol: openai_chat
+      base_url: https://example.invalid/v1
+      # 默认使用环境变量引用；也支持 loader 的 metadata-only 写法：
+      # api_key_env: MEAPET_API_KEY
+      # api_key: ""
+      api_key: ${MEAPET_API_KEY}
+      model: example-model
+      capabilities: [streaming, tools, vision, reasoning]
+      priority: 10
+      timeout_seconds: 60
+      retry:
+        max_attempts: 2
+        initial_delay_seconds: 0.5
+        max_delay_seconds: 8
+      enabled: false
+  models: {}
+  routing:
+    dialogue: null
+    tool_routing: null
+    memory: null
+    vision: null
