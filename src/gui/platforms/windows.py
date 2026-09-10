@@ -1025,7 +1025,7 @@ def set_window_click_through(
     user32: object | None = None,
     is_windows: bool | None = None,
 ) -> PlatformCapability:
-    """切换点击穿透；Qt 标志不可用或未保留时使用 Win32 样式兜底。"""
+    """切换点击穿透；优先使用稳定的 Win32 HWND，避免 Qt 标志重建窗口句柄。"""
 
     if not _is_windows(is_windows):
         return _capability(
@@ -1035,6 +1035,31 @@ def set_window_click_through(
         )
     qt_core = _import_optional("PySide6.QtCore")
     flag = _qt_flag(window, "WindowTransparentForInput") if qt_core is not None else None
+    position = _read_qt_position(window)
+    native_api = user32 if user32 is not None else _load_user32()
+    native_hwnd = _window_id(window) if native_api is not None else None
+
+    # Windows Qt 的 setFlag 可能重建原生窗口。存在可用 HWND 时先提交
+    # Win32 扩展样式，避免后续回读继续使用已失效的旧句柄。
+    if native_api is not None and native_hwnd is not None:
+        native_baseline = _read_native_extended_style(native_api, native_hwnd)
+        native_active, native_detail = _set_native_input_transparency(
+            window,
+            bool(enabled),
+            user32=native_api,
+            baseline_style=native_baseline,
+        )
+        if native_active is True:
+            if position is not None and _read_qt_position(window) != position:
+                _restore_qt_position(window, position)
+            return _capability(
+                "click_through",
+                CapabilityState.AVAILABLE,
+                f"{native_detail}；已启用 WS_EX_TRANSPARENT/WS_EX_NOACTIVATE 兜底",
+                "WS_EX_TRANSPARENT",
+                "WS_EX_NOACTIVATE",
+            )
+
     target = _qt_window_target(window)
     setter = getattr(target, "setFlag", None)
     if not callable(setter):
@@ -1046,14 +1071,6 @@ def set_window_click_through(
             was_visible = bool(visible_getter())
         except (AttributeError, RuntimeError, TypeError, ValueError):
             was_visible = None
-    position = _read_qt_position(window)
-    native_api = user32 if user32 is not None else _load_user32()
-    native_hwnd = _window_id(window) if native_api is not None else None
-    native_baseline = (
-        _read_native_extended_style(native_api, native_hwnd)
-        if native_api is not None and native_hwnd is not None
-        else None
-    )
     if flag is not None and callable(setter):
         try:
             setter(flag, bool(enabled))
@@ -1064,7 +1081,7 @@ def set_window_click_through(
             if position is not None and _read_qt_position(window) != position:
                 _restore_qt_position(window, position)
             active = _qt_flag_state(window, flag)
-            if active is bool(enabled) and native_hwnd is None:
+            if active is bool(enabled) and (native_api is None or native_hwnd is None):
                 return _capability(
                     "click_through",
                     CapabilityState.AVAILABLE,
@@ -1074,23 +1091,29 @@ def set_window_click_through(
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
             logger.debug("Windows click-through Qt flag update failed: %s", type(exc).__name__)
 
-    native_active, native_detail = _set_native_input_transparency(
-        window,
-        bool(enabled),
-        user32=native_api,
-        baseline_style=native_baseline,
-    )
-    if native_active is True:
-        if position is not None and _read_qt_position(window) != position:
-            _restore_qt_position(window, position)
-        return _capability(
-            "click_through",
-            CapabilityState.AVAILABLE,
-            f"{native_detail}；已启用 WS_EX_TRANSPARENT/WS_EX_NOACTIVATE 兜底",
-            "WS_EX_TRANSPARENT",
-            "WS_EX_NOACTIVATE",
+    # Qt 可能在 setFlag 后创建新 HWND；重新读取句柄和基线再做 Win32 回退。
+    native_hwnd = _window_id(window) if native_api is not None else None
+    if native_api is not None and native_hwnd is not None:
+        native_baseline = _read_native_extended_style(native_api, native_hwnd)
+        native_active, native_detail = _set_native_input_transparency(
+            window,
+            bool(enabled),
+            user32=native_api,
+            baseline_style=native_baseline,
         )
-    detail = native_detail if native_active is None else "Win32 输入透明样式未保留请求状态"
+        if native_active is True:
+            if position is not None and _read_qt_position(window) != position:
+                _restore_qt_position(window, position)
+            return _capability(
+                "click_through",
+                CapabilityState.AVAILABLE,
+                f"{native_detail}；已启用 WS_EX_TRANSPARENT/WS_EX_NOACTIVATE 兜底",
+                "WS_EX_TRANSPARENT",
+                "WS_EX_NOACTIVATE",
+            )
+        detail = native_detail
+    else:
+        detail = "无法读取有效 Win32 窗口句柄"
     if flag is None:
         detail = "Qt WindowTransparentForInput 不可用；" + detail
     return _capability("click_through", CapabilityState.UNAVAILABLE, detail)

@@ -2477,6 +2477,8 @@ def run(
     tray_resources: list[Any] = []
     click_through_recovery_available = False
     console_recovery_available = False
+    console_close_requested = False
+    web_console_close_requested = False
     tight_layout_pet_hidden = False
     tight_layout_pet_was_visible = False
     console: PetConsoleWindow | None = None
@@ -4158,12 +4160,26 @@ def run(
     def show_web_console() -> object:
         """打开公开网页控制台；没有 WebEngine 时保留 Qt 控制台入口。"""
 
-        nonlocal web_console, console_recovery_available
+        nonlocal web_console, console_recovery_available, web_console_close_requested
+
+        def on_web_console_close_requested() -> None:
+            """记录用户点击网页控制台关闭按钮，区别于程序主动隐藏。"""
+
+            nonlocal web_console_close_requested
+            web_console_close_requested = True
 
         def on_web_console_hidden() -> None:
             """隐藏网页控制台前确保点击穿透仍有恢复入口。"""
 
-            nonlocal console_recovery_available
+            nonlocal console_recovery_available, web_console_close_requested
+            user_close = web_console_close_requested
+            web_console_close_requested = False
+            if user_close:
+                # 用户关闭只隐藏到托盘；保留桌宠当前输入状态，托盘和快捷键仍可恢复。
+                console_recovery_available = True
+                restore_tight_layout_pet()
+                set_ui_interaction_lock(False)
+                return
             if shutting_down:
                 console_recovery_available = False
                 set_ui_interaction_lock(False)
@@ -4193,6 +4209,9 @@ def run(
                 hidden_signal = getattr(web_console, "hidden", None)
                 if hidden_signal is not None and callable(getattr(hidden_signal, "connect", None)):
                     hidden_signal.connect(on_web_console_hidden)
+                close_signal = getattr(web_console, "closeRequested", None)
+                if close_signal is not None and callable(getattr(close_signal, "connect", None)):
+                    close_signal.connect(on_web_console_close_requested)
             console_recovery_available = True
             set_ui_interaction_lock(True)
             web_console.set_state(web_control_state())
@@ -4987,10 +5006,25 @@ def run(
             except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
                 return
 
+    def on_console_close_requested() -> None:
+        """记录用户点击 Qt 控制台关闭按钮，区别于程序主动隐藏。"""
+
+        nonlocal console_close_requested
+        console_close_requested = True
+
     def on_console_hidden() -> None:
         """隐藏控制台时撤销点击穿透，避免留下失去恢复入口的窗口。"""
 
-        nonlocal console_recovery_available
+        nonlocal console_recovery_available, console_close_requested
+        user_close = console_close_requested
+        console_close_requested = False
+        if user_close:
+            # 用户关闭只隐藏到托盘；保留桌宠当前输入状态，托盘的“恢复桌宠点击”
+            # 与 Ctrl+Shift+M 仍可重新取得控制台。隐藏不会停止对话、TTS 或运行时。
+            console_recovery_available = True
+            restore_tight_layout_pet()
+            set_ui_interaction_lock(False)
+            return
         if console is not None and not tight_layout_pet_hidden:
             try:
                 console.set_compact_layout(False)
@@ -5074,6 +5108,28 @@ def run(
                 "visible": False,
                 "reason": "桌宠显示暂时不可用，请重试",
             }
+
+    def hide_pet_to_tray() -> object:
+        """用户关闭桌宠窗口时只隐藏到托盘，保持对话和 TTS 运行。"""
+
+        target = window if window is not None else web_host
+        hide = getattr(target, "hide", None)
+        if not callable(hide):
+            view = getattr(target, "view", None) if target is not None else None
+            hide = getattr(view, "hide", None)
+        if not callable(hide):
+            return {
+                "status": "unavailable",
+                "visible": False,
+                "reason": "pet window is unavailable",
+            }
+        try:
+            hide()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("隐藏桌宠到托盘失败：%s", type(exc).__name__)
+            return {"status": "unavailable", "visible": True, "reason": "桌宠暂时无法隐藏"}
+        set_ui_interaction_lock(False)
+        return {"status": "available", "visible": False, "to_tray": True}
 
     def toggle_pet_visibility() -> object:
         """切换桌宠显示状态，快捷键和控制台共用。"""
@@ -6327,6 +6383,9 @@ def run(
                 except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
                     logger.debug("failed to initialize console topmost status", exc_info=True)
             console.hidden.connect(on_console_hidden)
+            close_signal = getattr(console, "closeRequested", None)
+            if close_signal is not None and callable(getattr(close_signal, "connect", None)):
+                close_signal.connect(on_console_close_requested)
             position = current_pet_position()
             if position is not None:
                 console.set_position(*position)
@@ -6457,6 +6516,9 @@ def run(
         click_setter = getattr(target, "set_click_callback", None)
         if callable(click_setter):
             click_setter(handle_pet_click)
+        close_signal = getattr(target, "closeRequested", None)
+        if close_signal is not None and callable(getattr(close_signal, "connect", None)):
+            close_signal.connect(hide_pet_to_tray)
 
         # 快捷键由 HotkeyManager 统一按 YAML 注册；这里仅连接窗口自身的
         # 双击/右键信号，避免固定组合键与配置覆盖相互重复触发。
@@ -6818,6 +6880,7 @@ def run(
                     show_console,
                     handle_pet_click,
                     enter_callback=prompt_text,
+                    close_callback=hide_pet_to_tray,
                 )
                 web_host.set_model_reload_callback(on_renderer_model_reload)
                 runtime.pet_controller.attach(web_host)

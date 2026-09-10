@@ -462,6 +462,7 @@ if pyside6_available:
         """显示公开状态和点击动作的独立网页控制台。"""
 
         hidden = Signal()
+        closeRequested = Signal()
 
         def __init__(
             self,
@@ -574,6 +575,7 @@ if pyside6_available:
                 event.accept()
                 return
             event.ignore()
+            self.closeRequested.emit()
             self.hide()
 
         def shutdown(self) -> None:

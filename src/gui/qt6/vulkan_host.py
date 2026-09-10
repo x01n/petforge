@@ -243,6 +243,7 @@ if pyside6_vulkan_available:
         textSubmitted = Signal(str)
         consoleRequested = Signal()
         contextMenuRequested = Signal(QPoint)
+        closeRequested = Signal()
 
         def __init__(
             self,
@@ -1234,6 +1235,12 @@ if pyside6_vulkan_available:
             self.shutdown()
 
         def closeEvent(self, event: object) -> None:  # noqa: N802
+            # 用户关闭只隐藏到托盘；应用退出时由 shutdown() 统一释放资源。
+            if not self._shutdown:
+                self.closeRequested.emit()
+                event.ignore()
+                self.hide()
+                return
             self.shutdown()
             event.accept()
 

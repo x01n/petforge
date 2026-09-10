@@ -1690,6 +1690,7 @@ if pyside6_available:
         """可隐藏但不销毁的桌宠控制台窗口。"""
 
         hidden = Signal()
+        closeRequested = Signal()
         commandSubmitted = Signal(str)
         stopRequested = Signal()
         conversationSubmitted = Signal(str)
@@ -7059,6 +7060,7 @@ if pyside6_available:
                 event.accept()
                 return
             event.ignore()
+            self.closeRequested.emit()
             self.hide()
             self.hidden.emit()
 

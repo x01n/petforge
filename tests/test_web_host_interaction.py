@@ -915,6 +915,38 @@ print("web-host-enter-input-ok")
     assert "web-host-enter-input-ok" in result.stdout
 
 
+def test_web_host_close_event_hides_pet_to_tray_callback(tmp_path: Path) -> None:
+    """桌宠窗口关闭按钮只触发隐藏回调，不关闭桌宠运行时。"""
+
+    try:
+        from PySide6.QtCore import QEvent
+        from PySide6.QtWidgets import QApplication, QWidget
+
+        from gui.qt6.web_host import WebPetHost
+    except (ImportError, ModuleNotFoundError, OSError):
+        return
+
+    app = QApplication.instance() or QApplication([])
+    view = QWidget()
+    view.resize(220, 180)
+    closed: list[bool] = []
+    renderer = type("Renderer", (), {"view": view, "shutdown": lambda self: None})()
+    host = WebPetHost(renderer)
+    assert host.install_interaction(close_callback=lambda: (closed.append(True), view.hide()))
+    view.show()
+    app.processEvents()
+
+    event = QEvent(QEvent.Type.Close)
+    app.sendEvent(view, event)
+    app.processEvents()
+
+    assert closed == [True]
+    assert view.isHidden()
+    host.shutdown()
+    view.close()
+    app.processEvents()
+
+
 def test_web_host_rejects_explicit_transparent_press_and_context(tmp_path: Path) -> None:
     """页面几何命中为 false 时不能抢焦点、拖动或弹出右键菜单。"""
 

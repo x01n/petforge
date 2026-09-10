@@ -108,6 +108,7 @@ if pyside6_available:
         consoleRequested = Signal()
         # 右键菜单由上层宿主创建；窗口只负责提供可靠的全局坐标。
         contextMenuRequested = Signal(QPoint)
+        closeRequested = Signal()
 
         def __init__(
             self,
@@ -2601,6 +2602,12 @@ if pyside6_available:
             self._release_renderer(self.renderer)
 
         def closeEvent(self, event) -> None:  # noqa: N802
+            # 用户关闭只隐藏到托盘；应用退出时由 shutdown() 统一释放资源。
+            if not self._shutdown:
+                self.closeRequested.emit()
+                event.ignore()
+                self.hide()
+                return
             self._timer.stop()
             self.shutdown()
             super().closeEvent(event)

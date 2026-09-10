@@ -894,3 +894,84 @@ def test_windows_environment_expansion_replaces_empty_home_with_userprofile(
     )
 
     assert expanded == {"path": "C:/Users/demo/MeaPet"}
+
+
+def test_windows_click_through_refreshes_hwnd_after_qt_flag_rebuild(monkeypatch) -> None:
+    """Qt 标志重建原生窗口后，Win32 回退必须使用新 HWND。"""
+
+    import gui.platforms.windows as windows_module
+
+    class Handle:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def winId(self):  # noqa: N802
+            return self.value
+
+    class View:
+        def __init__(self) -> None:
+            self.handle_calls = 0
+            self.native = Handle(77)
+            self._flag = 0
+            self.visible = True
+
+        def windowHandle(self):  # noqa: N802
+            self.handle_calls += 1
+            if self.handle_calls >= 3:
+                self.native = Handle(88)
+            return self.native
+
+        def isVisible(self):  # noqa: N802
+            return self.visible
+
+        def show(self) -> None:
+            self.visible = True
+
+        def pos(self):
+            return SimpleNamespace(x=lambda: 17, y=lambda: 23)
+
+        def move(self, _x: int, _y: int) -> None:
+            return None
+
+    class User32:
+        def __init__(self) -> None:
+            self.style_by_hwnd = {88: 0x100}
+            self.get_calls: list[int] = []
+            self.set_calls: list[int] = []
+
+        def GetWindowLongPtrW(self, hwnd, _index):  # noqa: N802
+            self.get_calls.append(int(hwnd))
+            if int(hwnd) == 77:
+                raise OSError("old Qt HWND has been destroyed")
+            return self.style_by_hwnd.get(int(hwnd), 0)
+
+        def SetWindowLongPtrW(self, hwnd, _index, value):  # noqa: N802
+            self.set_calls.append(int(hwnd))
+            self.style_by_hwnd[int(hwnd)] = int(value)
+            return int(value)
+
+        def SetWindowPos(self, *_args):  # noqa: N802
+            return 1
+
+    qt_core = SimpleNamespace(
+        Qt=SimpleNamespace(WindowType=SimpleNamespace(WindowTransparentForInput=1))
+    )
+    monkeypatch.setattr(
+        windows_module,
+        "_import_optional",
+        lambda name: qt_core if name == "PySide6.QtCore" else None,
+    )
+    view = View()
+    user32 = User32()
+
+    result = windows_module.set_window_click_through(
+        view,
+        True,
+        user32=user32,
+        is_windows=True,
+    )
+
+    assert result.state is windows_module.CapabilityState.AVAILABLE
+    assert user32.set_calls == [88]
+    assert 77 in user32.get_calls
+    assert 88 in user32.get_calls

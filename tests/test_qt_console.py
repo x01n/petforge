@@ -1443,3 +1443,35 @@ print("qt-console-channel-delete-route-ok")
     )
     assert result.returncode == 0, result.stderr
     assert "qt-console-channel-delete-route-ok" in result.stdout
+
+
+def test_qt_console_user_close_emits_close_request_without_destroying_recovery_window(
+    monkeypatch,
+) -> None:
+    """点击标题栏关闭时发送用户关闭信号，隐藏事件仍只负责生命周期通知。"""
+
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        from gui.qt6.console import PetConsoleWindow
+    except (ImportError, ModuleNotFoundError, OSError):
+        return
+
+    app = QApplication.instance() or QApplication([])
+    window = PetConsoleWindow()
+    close_requests: list[bool] = []
+    hidden_events: list[bool] = []
+    window.closeRequested.connect(lambda: close_requests.append(True))
+    window.hidden.connect(lambda: hidden_events.append(True))
+    window.show()
+    app.processEvents()
+
+    window.close()
+    app.processEvents()
+
+    assert window.isHidden()
+    assert close_requests == [True]
+    assert hidden_events == [True]
+    assert window._allow_close is False
+    window.shutdown()
+    app.processEvents()
