@@ -2,12 +2,6 @@ config/local.yaml
 *.sqlite3
 *.db
 voice_cache/
-models/
-GPT-Sovits/
-vits_models/
-dic/
-sprites/
-live2d/model/
 __pycache__/
 *.py[cod]
 .venv/
@@ -28,7 +22,6 @@ scripts/*
 !scripts/windows_quality_gate.ps1
 mare-live2d-final.png
 mare-final.png
-resources/
 design-system/
 devlog.md
 !THIRD_PARTY_NOTICES.md

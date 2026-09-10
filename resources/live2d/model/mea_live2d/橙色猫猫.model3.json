@@ -1,0 +1,128 @@
+{
+  "Version": 3,
+  "ConfVer": 0,
+  "Type": 0,
+  "FileReferences": {
+    "Moc": "橙色猫猫.moc3",
+    "Textures": [
+      "橙色猫猫.2048/texture_00.png",
+      "橙色猫猫.2048/texture_01.png"
+    ],
+    "Physics": "橙色猫猫.physics3.json",
+    "PhysicsV2": {
+      "File": "橙色猫猫.physics3.json"
+    },
+    "Motions": {
+      "A": [
+        {
+          "File": "A 眯眼.motion3.json"
+        }
+      ],
+      "B": [
+        {
+          "Name": "B",
+          "File": "B 生气.motion3.json"
+        }
+      ]
+    },
+    "DisplayInfo": "橙色猫猫.cdi3.json"
+  },
+  "Controllers": {
+    "ParamHit": {},
+    "ParamLoop": {},
+    "KeyTrigger": {},
+    "ParamTrigger": {},
+    "AreaTrigger": {},
+    "HandTrigger": {},
+    "EyeBlink": {
+      "MinInterval": 500,
+      "MaxInterval": 6000,
+      "Items": [
+        {
+          "Id": "ParamEyeLOpen",
+          "Min": 0.0,
+          "Max": 1.0,
+          "BlendMode": 2,
+          "Input": 0
+        },
+        {
+          "Id": "Param155",
+          "Min": 0.0,
+          "Max": 1.0,
+          "BlendMode": 2,
+          "Input": 0
+        },
+        {
+          "Id": "ParamEyeROpen",
+          "Min": 0.0,
+          "Max": 1.0,
+          "BlendMode": 2,
+          "Input": 0
+        }
+      ],
+      "Enabled": true
+    },
+    "LipSync": {
+      "Gain": 5.0,
+      "Items": [
+        {
+          "Id": "ParamMouthForm",
+          "Min": 0.0,
+          "Max": 1.0,
+          "Input": 0
+        },
+        {
+          "Id": "ParamMouthOpenY",
+          "Min": 0.0,
+          "Max": 1.0,
+          "Input": 0
+        }
+      ],
+      "Enabled": true
+    },
+    "MouseTracking": {
+      "SmoothTime": 0.15,
+      "Enabled": true
+    },
+    "AutoBreath": {
+      "Enabled": true
+    },
+    "ExtraMotion": {
+      "Enabled": true
+    },
+    "Accelerometer": {
+      "Enabled": true
+    },
+    "Microphone": {},
+    "Transform": {},
+    "FaceTracking": {
+      "Enabled": true
+    },
+    "HandTracking": {},
+    "ParamValue": {},
+    "PartOpacity": {},
+    "ArtmeshOpacity": {},
+    "ArtmeshColor": {},
+    "ArtmeshCulling": {
+      "DefaultMode": 0
+    },
+    "IntimacySystem": {}
+  },
+  "HitAreas": [
+    {
+      "Name": "A",
+      "Id": "ArtMesh159",
+      "Motion": "A",
+      "IgnoreVisibility": true
+    },
+    {
+      "Name": "B",
+      "Id": "ArtMesh160",
+      "Motion": "B",
+      "IgnoreVisibility": true
+    }
+  ],
+  "Options": {
+    "TexType": 0
+  }
+}
