@@ -7059,10 +7059,12 @@ if pyside6_available:
             if self._allow_close:
                 event.accept()
                 return
-            event.ignore()
+            event.accept()
             self.closeRequested.emit()
+            was_visible = self.isVisible()
             self.hide()
-            self.hidden.emit()
+            if was_visible:
+                self.hidden.emit()
 
         def shutdown(self) -> None:
             """允许宿主在退出阶段真正销毁窗口。"""

@@ -3,6 +3,8 @@ from __future__ import annotations
 import ctypes
 from types import SimpleNamespace
 
+import pytest
+
 import gui.platforms.windows as windows_module
 from config import loader
 from gui.platforms.windows import WindowsDesktopPlatform
@@ -896,59 +898,50 @@ def test_windows_environment_expansion_replaces_empty_home_with_userprofile(
     assert expanded == {"path": "C:/Users/demo/MeaPet"}
 
 
-def test_windows_click_through_refreshes_hwnd_after_qt_flag_rebuild(monkeypatch) -> None:
-    """Qt 标志重建原生窗口后，Win32 回退必须使用新 HWND。"""
+@pytest.mark.parametrize("rebuild", [False, True])
+@pytest.mark.parametrize("noactivate", [False, True])
+def test_windows_click_through_refreshes_hwnd_after_qt_flag_rebuild(
+    monkeypatch, rebuild: bool, noactivate: bool
+) -> None:
+    """同时验证 Qt 标志、重建后的 HWND 和恢复非激活窗口原有样式。"""
 
-    import gui.platforms.windows as windows_module
+    baseline = 0x100 | (windows_module._WS_EX_NOACTIVATE if noactivate else 0)
+    styles = {77: baseline}
+    writes = []
+    monkeypatch.setattr(windows_module, "_native_input_style_baselines", {})
 
-    class Handle:
-        def __init__(self, value: int) -> None:
-            self.value = value
+    class Window:
+        hwnd = 77
+        qt_flags = 0
 
         def winId(self):  # noqa: N802
-            return self.value
+            return self.hwnd
 
-    class View:
-        def __init__(self) -> None:
-            self.handle_calls = 0
-            self.native = Handle(77)
-            self._flag = 0
-            self.visible = True
+        def flags(self):
+            return self.qt_flags
 
-        def windowHandle(self):  # noqa: N802
-            self.handle_calls += 1
-            if self.handle_calls >= 3:
-                self.native = Handle(88)
-            return self.native
-
-        def isVisible(self):  # noqa: N802
-            return self.visible
-
-        def show(self) -> None:
-            self.visible = True
-
-        def pos(self):
-            return SimpleNamespace(x=lambda: 17, y=lambda: 23)
-
-        def move(self, _x: int, _y: int) -> None:
-            return None
+        def setFlag(self, flag, enabled):  # noqa: N802
+            self.qt_flags = self.qt_flags | flag if enabled else self.qt_flags & ~flag
+            previous_style = styles[self.hwnd]
+            if rebuild:
+                del styles[self.hwnd]
+                self.hwnd += 1
+            styles[self.hwnd] = (
+                previous_style | windows_module._WS_EX_TRANSPARENT
+                if enabled
+                else previous_style & ~windows_module._WS_EX_TRANSPARENT
+            )
 
     class User32:
-        def __init__(self) -> None:
-            self.style_by_hwnd = {88: 0x100}
-            self.get_calls: list[int] = []
-            self.set_calls: list[int] = []
-
         def GetWindowLongPtrW(self, hwnd, _index):  # noqa: N802
-            self.get_calls.append(int(hwnd))
-            if int(hwnd) == 77:
-                raise OSError("old Qt HWND has been destroyed")
-            return self.style_by_hwnd.get(int(hwnd), 0)
+            assert hwnd in styles, "read from destroyed HWND"
+            return styles[hwnd]
 
         def SetWindowLongPtrW(self, hwnd, _index, value):  # noqa: N802
-            self.set_calls.append(int(hwnd))
-            self.style_by_hwnd[int(hwnd)] = int(value)
-            return int(value)
+            assert hwnd in styles, "write to destroyed HWND"
+            writes.append(hwnd)
+            styles[hwnd] = value
+            return value
 
         def SetWindowPos(self, *_args):  # noqa: N802
             return 1
@@ -956,22 +949,24 @@ def test_windows_click_through_refreshes_hwnd_after_qt_flag_rebuild(monkeypatch)
     qt_core = SimpleNamespace(
         Qt=SimpleNamespace(WindowType=SimpleNamespace(WindowTransparentForInput=1))
     )
-    monkeypatch.setattr(
-        windows_module,
-        "_import_optional",
-        lambda name: qt_core if name == "PySide6.QtCore" else None,
-    )
-    view = View()
-    user32 = User32()
+    monkeypatch.setattr(windows_module, "_import_optional", lambda name: qt_core)
+    window, user32 = Window(), User32()
+    platform = WindowsDesktopPlatform(is_windows=True, user32=user32)
 
-    result = windows_module.set_window_click_through(
-        view,
-        True,
-        user32=user32,
-        is_windows=True,
-    )
+    assert platform.set_click_through(window, True).available
+    assert window.qt_flags == 1
+    assert styles[window.hwnd] & windows_module._WS_EX_TRANSPARENT
+    assert platform.set_click_through(window, False).available
+    assert window.qt_flags == 0
+    assert styles[window.hwnd] == baseline
+    assert writes == ([78, 79] if rebuild else [77, 77])
+    assert windows_module._native_input_style_baselines == {}
 
-    assert result.state is windows_module.CapabilityState.AVAILABLE
-    assert user32.set_calls == [88]
-    assert 77 in user32.get_calls
-    assert 88 in user32.get_calls
+
+def test_windows_noactivate_alone_is_not_click_through(monkeypatch) -> None:
+    """桌宠禁止抢焦点不代表禁止点击；关闭恢复不得因此报告失败。"""
+
+    monkeypatch.setattr(windows_module, "_native_input_style_baselines", {})
+    user32 = SimpleNamespace(GetWindowLongPtrW=lambda hwnd, index: windows_module._WS_EX_NOACTIVATE)
+    accepted, _ = windows_module._set_native_input_transparency(77, False, user32=user32)
+    assert accepted is True

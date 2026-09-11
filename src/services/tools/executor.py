@@ -228,6 +228,7 @@ class ToolPlanCheckpoint:
     deadline: float
     parallel_read_only: bool
     stop_on_approval: bool
+    plan_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -1652,6 +1653,7 @@ class ToolExecutionService:
                 if cancellation in done and cancellation.result():
                     execution.cancel()
                     await asyncio.gather(execution, return_exceptions=True)
+                    self._cancel_plan_approvals(plan_id)
                     raise asyncio.CancelledError
                 return await execution
 
@@ -1748,6 +1750,7 @@ class ToolExecutionService:
         initial_parallel_group: int = 0,
         force_stop: bool = False,
         deadline: float | None = None,
+        plan_id: str | None = None,
     ) -> ToolPlanResult:
         """执行已验证计划，并在审批点生成可恢复检查点。"""
 
@@ -1757,9 +1760,10 @@ class ToolExecutionService:
         plan_deadline = loop.time() + timeout_seconds if deadline is None else float(deadline)
         by_id = {step.step_id: step for step in steps}
         declaration_index = {step.step_id: index for index, step in enumerate(steps)}
-        plan_id = event_fingerprint(
+        plan_id = str(plan_id or "").strip() or event_fingerprint(
             "|".join(f"{step.step_id}:{step.call_id}:{step.identity}" for step in steps)
             + context.turn_id
+            + str(time.monotonic_ns())
         )
         outcomes_by_id = dict(initial_outcomes or {})
         audit_by_id = dict(initial_audit or {})
@@ -1831,6 +1835,7 @@ class ToolExecutionService:
 
         while unresolved and not stopped:
             if cancel_event is not None and cancel_event.is_set():
+                self._cancel_plan_approvals(plan_id)
                 raise asyncio.CancelledError
             if remaining_timeout() <= 0:
                 stopped = True
@@ -1919,20 +1924,24 @@ class ToolExecutionService:
                     return False
 
             if len(executable) > 1 and all(is_safe_read(item) for item in executable):
-                step_results = await asyncio.gather(
-                    *(
-                        self._execute_plan_step(
-                            step,
-                            arguments,
-                            context=context,
-                            remaining_timeout_seconds=remaining_timeout(),
-                            cancel_event=cancel_event,
-                            parallel_group=parallel_group,
-                            plan_id=plan_id,
+                try:
+                    step_results = await asyncio.gather(
+                        *(
+                            self._execute_plan_step(
+                                step,
+                                arguments,
+                                context=context,
+                                remaining_timeout_seconds=remaining_timeout(),
+                                cancel_event=cancel_event,
+                                parallel_group=parallel_group,
+                                plan_id=plan_id,
+                            )
+                            for step, arguments in executable
                         )
-                        for step, arguments in executable
                     )
-                )
+                except asyncio.CancelledError:
+                    self._cancel_plan_approvals(plan_id)
+                    raise
                 parallel_approval_seen = False
                 for (step, _arguments), (outcome, attempts) in zip(
                     executable,
@@ -2029,6 +2038,7 @@ class ToolExecutionService:
                     plan_deadline,
                     bool(parallel_read_only),
                     bool(stop_on_approval),
+                    plan_id,
                 )
 
         result_outcomes = dict(outcomes_by_id)
@@ -2373,6 +2383,60 @@ class ToolExecutionService:
             signature_digest=pending.signature.digest,
         )
         return outcome
+
+    def _cancel_plan_approvals(self, plan_id: str) -> None:
+        """取消计划取消时尚未消费的审批，避免留下无法恢复的悬挂请求。"""
+
+        key = str(plan_id or "").strip()
+        if not key:
+            return
+        with self._approval_lock:
+            self._prune_pending_locked()
+            pending_items = tuple(
+                (approval_id, pending)
+                for approval_id, pending in self._pending_approvals.items()
+                if str(pending.audit_metadata.get("plan_id", "")) == key
+            )
+            for approval_id, pending in pending_items:
+                self._pending_approvals.pop(approval_id, None)
+                self._forget_invocation(
+                    context=pending.context,
+                    signature=pending.signature,
+                )
+                try:
+                    self.permissions.deny(approval_id)
+                except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                    error_type = type(exc).__name__
+                else:
+                    error_type = ""
+                outcome = ToolOutcome(
+                    "denied",
+                    pending.spec.identity,
+                    pending.call_id,
+                    {"error": "tool plan cancelled"},
+                    pending.approval,
+                )
+                self._replace_completed_outcome(
+                    context=pending.context,
+                    signature=pending.signature,
+                    outcome=outcome,
+                )
+                self._log_tool_event(
+                    "cancelled",
+                    identity=pending.spec.identity,
+                    signature_digest=pending.signature.digest,
+                    status="plan_cancelled",
+                    call_id=pending.call_id,
+                    risk=pending.spec.risk,
+                    error_type=error_type,
+                    reason_code="plan_cancelled",
+                )
+                self._append_execution_record_sync(
+                    outcome=outcome,
+                    pending=pending,
+                    error_type=error_type,
+                    phase="plan_cancelled",
+                )
 
     def deny_approval(self, approval_id: str) -> ApprovalRequest | None:
         """消费并拒绝一个待审批调用，拒绝后不可再次执行。"""

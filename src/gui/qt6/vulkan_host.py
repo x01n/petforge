@@ -187,6 +187,25 @@ def _finite_dimension(value: object, *, default: int = 1) -> int:
     return max(1, min(16_384, int(round(dimension))))
 
 
+def _fit_display_size_to_area(
+    width: object,
+    height: object,
+    area: object | None,
+) -> tuple[int, int]:
+    """将显示预设限制在屏幕可用区域内，保证 Qt Quick 视口完整可见。"""
+
+    safe_width = _finite_dimension(width)
+    safe_height = _finite_dimension(height)
+    if area is None:
+        return safe_width, safe_height
+    try:
+        area_width = _finite_dimension(area.width())
+        area_height = _finite_dimension(area.height())
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return safe_width, safe_height
+    return min(safe_width, area_width), min(safe_height, area_height)
+
+
 def _visible_snapshot(image: object) -> bool:
     """确认场景图抓帧包含至少一个非透明像素。"""
 
@@ -1093,8 +1112,47 @@ if pyside6_vulkan_available:
             if selected is None:
                 return {"status": "unavailable", "reason": "display size preset is invalid"}
             key, (width, height) = selected
-            self.resize(width, height)
-            return {"status": "available", "preset": key, "width": width, "height": height}
+            try:
+                position = self.position()
+                screen = self.screen() or QGuiApplication.primaryScreen()
+                area = screen.availableGeometry() if screen is not None else None
+                width, height = _fit_display_size_to_area(width, height, area)
+
+                # QQuickView 可能保留之前预设留下的最小尺寸；先降低约束，
+                # 否则小屏幕下 resize 会被静默拒绝，QML 视口与控制台回执不一致。
+                min_width_getter = getattr(self, "minimumWidth", None)
+                min_height_getter = getattr(self, "minimumHeight", None)
+                min_width_setter = getattr(self, "setMinimumWidth", None)
+                min_height_setter = getattr(self, "setMinimumHeight", None)
+                if callable(min_width_getter) and callable(min_width_setter):
+                    if width < int(min_width_getter()):
+                        min_width_setter(width)
+                if callable(min_height_getter) and callable(min_height_setter):
+                    if height < int(min_height_getter()):
+                        min_height_setter(height)
+
+                self.resize(width, height)
+                actual_width = max(1, int(self.width()))
+                actual_height = max(1, int(self.height()))
+                bounds = self.movement_bounds()
+                if position is not None and bounds is not None:
+                    position = QPoint(
+                        max(bounds[0], min(position.x(), bounds[2])),
+                        max(bounds[1], min(position.y(), bounds[3])),
+                    )
+                    self.setPosition(position)
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                logger.debug("Vulkan display size update failed: %s", type(exc).__name__)
+                return {
+                    "status": "unavailable",
+                    "reason": "桌宠大小暂时无法调整，请稍后重试",
+                }
+            return {
+                "status": "available",
+                "preset": key,
+                "width": actual_width,
+                "height": actual_height,
+            }
 
         def _apply_window_flag(self, flag: Qt.WindowType, enabled: bool) -> bool:
             was_visible = self.isVisible()

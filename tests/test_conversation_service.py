@@ -966,7 +966,8 @@ def test_conversation_approval_continuation_returns_to_same_model_turn() -> None
     asyncio.run(scenario())
 
 
-def test_approval_continuation_keeps_tts_profile_snapshot() -> None:
+@pytest.mark.parametrize("initial_role", ("", "assistant"))
+def test_approval_continuation_keeps_tts_profile_snapshot(initial_role: str) -> None:
     class Adapter(ProviderAdapter):
         provider = "approval-tts"
         protocol = "openai_chat"
@@ -1009,29 +1010,35 @@ def test_approval_continuation_keeps_tts_profile_snapshot() -> None:
     profile_router = TTSProfileRouter(
         {
             "first": TTSProfile("first", first, languages=frozenset({"zh"})),
-            "second": TTSProfile("second", second, languages=frozenset({"jp"})),
+            "second": TTSProfile("second", second, languages=frozenset({"zh", "jp"})),
         },
         default_profile="first",
         language_profiles={"ja": "second"},
+        role_profiles={"assistant": "first", "narrator": "second"},
     )
     service = ConversationService(
         _router(Adapter()),
         tools=ToolExecutionService(registry, PermissionService()),
         tts=TTSCoordinator(profile_router),
         tts_language="zh",
+        tts_role=initial_role,
     )
 
     async def scenario() -> None:
         initial = [event async for event in service.stream("需要确认")]
         approval = next(event for event in initial if isinstance(event, ApprovalRequested))
         profile_router.select("second", language="ja")
+        service.tts_language = "ja"
+        service.tts_role = "narrator"
         resumed = [event async for event in service.resume_approval_stream(approval.approval_id)]
         assert any(isinstance(event, TextDelta) for event in resumed)
+        assert not service._tts_role_snapshots
 
     asyncio.run(scenario())
     assert [(request.text, request.language, request.profile_id) for request in first.requests] == [
         ("审批后继续回答。", "zh", "first")
     ]
+    assert [request.role for request in first.requests] == [initial_role]
     assert second.requests == []
 
 
@@ -1061,6 +1068,7 @@ def test_denied_approval_releases_tts_context_snapshot() -> None:
 
     asyncio.run(denial_scenario())
     assert not service._tts_language_snapshots
+    assert not service._tts_role_snapshots
     assert not coordinator._pinned_contexts
     assert not coordinator._context_routes
 
@@ -1403,9 +1411,59 @@ def test_tts_deltas_share_one_bounded_worker_and_keep_first_segment() -> None:
     asyncio.run(scenario())
 
 
+def test_wait_flushed_tts_propagates_outer_cancel_without_cancelling_worker() -> None:
+    async def scenario() -> None:
+        tts = _ProbeTTS(block=True)
+        service = ConversationService(_router(_DialogueAdapter()), tts=tts)
+        context = service.begin_context(turn_id="flush-outer-cancel")
+        service._schedule_tts(context, "待冲刷。", flush=True)
+        await tts.started.wait()
+
+        state = service._tts_turns[context]
+        worker = state.task
+        assert worker is not None
+        waiter = asyncio.create_task(service._await_flushed_tts_turn(context))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        # 外层取消由调用方继续处理，shield 保证 flush worker 不被连带取消。
+        assert not worker.cancelled()
+        assert service._tts_turns.get(context) is state
+
+        tts.release.set()
+        await asyncio.wait_for(worker, timeout=1.0)
+        await asyncio.sleep(0)
+        assert context not in service._tts_turns
+
+    asyncio.run(scenario())
+
+
+def test_wait_flushed_tts_swallows_only_worker_cancel() -> None:
+    async def scenario() -> None:
+        tts = _ProbeTTS(block=True)
+        service = ConversationService(_router(_DialogueAdapter()), tts=tts)
+        context = service.begin_context(turn_id="flush-worker-cancel")
+        service._schedule_tts(context, "取消冲刷。", flush=True)
+        await tts.started.wait()
+
+        state = service._tts_turns[context]
+        worker = state.task
+        assert worker is not None
+        worker.cancel()
+
+        # worker 自身取消属于预期的旧回合收尾，不应伪装成外层回合取消。
+        await service._await_flushed_tts_turn(context)
+        assert worker.cancelled()
+        assert context not in service._tts_turns
+
+    asyncio.run(scenario())
+
+
 def test_tts_backlog_spills_in_order_without_dropping_model_text() -> None:
     async def scenario() -> None:
-        source = "首段。" + ("x" * 5000)
+        source = "首段。" + ("x" * 5000) + "尾段。"
 
         class StreamingAdapter(ProviderAdapter):
             provider = "streaming"
@@ -1420,6 +1478,7 @@ def test_tts_backlog_spills_in_order_without_dropping_model_text() -> None:
                 yield TextDelta(context, "首段。")
                 for _ in range(5000):
                     yield TextDelta(context, "x")
+                yield TextDelta(context, "尾段。")
                 self.finished.set()
                 yield TurnFinished(context)
 
@@ -1439,6 +1498,119 @@ def test_tts_backlog_spills_in_order_without_dropping_model_text() -> None:
         spoken = "".join(text for _context, text, flush in tts.calls if not flush)
         assert spoken == source
         assert result.text == source
+
+    asyncio.run(scenario())
+
+
+def test_tts_backpressure_pauses_stream_and_cancel_wakes_waiter() -> None:
+    async def scenario() -> None:
+        class StreamingAdapter(ProviderAdapter):
+            provider = "backpressure"
+            protocol = "openai_chat"
+            capabilities = frozenset({"streaming"})
+
+            def __init__(self) -> None:
+                self.finished = asyncio.Event()
+
+            async def stream(self, request, *, context=None, cancel_event=None) -> AsyncIterator:
+                del request, cancel_event
+                yield TextDelta(context, "x" * 4096)
+                self.finished.set()
+                yield TurnFinished(context)
+
+        adapter = StreamingAdapter()
+        tts = _ProbeTTS(block=True)
+        service = ConversationService(_router(adapter), tts=tts)
+        # 使用较小的回合上限验证模型流会在 worker 堵塞时暂停，而不是
+        # 继续无限追加；生产环境仍使用默认的有界上限。
+        service._TTS_BACKLOG_CHAR_LIMIT = 128
+        context = service.begin_context(turn_id="tts-backpressure")
+        task = asyncio.create_task(service.complete("限流", context=context))
+
+        await asyncio.wait_for(tts.started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert not adapter.finished.is_set()
+
+        service.cancel(context)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.sleep(0)
+        assert not service._tts_turns
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("delta_size", [73, 4096])
+def test_tts_backpressure_preserves_unicode_text_and_capacity_on_resume(delta_size: int) -> None:
+    async def scenario() -> None:
+        source = ("第一句。第二句🙂。\n" * 400) + "末尾完整保留。"
+        backpressured = asyncio.Event()
+
+        class ObservedService(ConversationService):
+            async def _await_tts_backpressure(self, context):
+                backpressured.set()
+                await super()._await_tts_backpressure(context)
+
+        class Adapter(_DialogueAdapter):
+            async def stream(self, request, *, context=None, cancel_event=None):
+                for start in range(0, len(source), delta_size):
+                    yield TextDelta(context, source[start : start + delta_size])
+                yield TurnFinished(context)
+
+        tts = _ProbeTTS(block=True)
+        service = ObservedService(_router(Adapter()), tts=tts)
+        service._TTS_BACKLOG_CHAR_LIMIT = 512
+        context = service.begin_context(turn_id="bounded-unicode")
+        task = asyncio.create_task(service.complete("开始", context=context))
+        try:
+            await asyncio.wait_for(tts.started.wait(), timeout=1.0)
+            await asyncio.wait_for(backpressured.wait(), timeout=1.0)
+            state = service._tts_turns[context]
+            queued = len(state.pending_text) + sum(map(len, state.pending_chunks))
+            assert 0 < queued == state.backlog_chars <= service._TTS_BACKLOG_CHAR_LIMIT
+            assert not task.done()
+            tts.release.set()
+            result = await asyncio.wait_for(task, timeout=2.0)
+            assert result.text == source
+            assert "".join(text for _, text, flush in tts.calls if not flush) == source
+            assert state.backlog_chars == 0
+            assert not service._tts_tasks
+        finally:
+            await service.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_tts_worker_cancellation_terminates_backpressured_conversation() -> None:
+    """语音消费者退出后，模型不能继续等待永远不会释放的队列容量。"""
+
+    async def scenario() -> None:
+        class Adapter(_DialogueAdapter):
+            async def stream(self, request, *, context=None, cancel_event=None):
+                yield TextDelta(context, "长段。" * 2048)
+                yield TurnFinished(context)
+
+        tts = _ProbeTTS(block=True)
+        service = ConversationService(_router(Adapter()), tts=tts)
+        service._TTS_BACKLOG_CHAR_LIMIT = 512
+        context = service.begin_context(turn_id="worker-exit-backpressure")
+        task = asyncio.create_task(service.complete("开始", context=context))
+        try:
+            await asyncio.wait_for(tts.started.wait(), timeout=1.0)
+            await asyncio.sleep(0)
+            state = service._tts_turns[context]
+            assert state.backlog_chars == service._TTS_BACKLOG_CHAR_LIMIT
+            assert state.task is not None
+            state.task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=1.0)
+            assert task in done, "conversation still waits on a stopped TTS worker"
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not service._tts_turns
+            assert not service._tts_tasks
+            assert context in tts.cancelled
+        finally:
+            await service.aclose()
 
     asyncio.run(scenario())
 
@@ -1796,7 +1968,8 @@ def test_unpunctuated_stream_yields_to_tts_at_segment_limit() -> None:
     asyncio.run(scenario())
 
 
-def test_tts_language_is_snapshotted_when_the_turn_starts() -> None:
+@pytest.mark.parametrize("initial_role", ("", "first-role"))
+def test_tts_language_and_role_are_snapshotted_when_the_turn_starts(initial_role: str) -> None:
     async def scenario() -> None:
         class DelayedAdapter(ProviderAdapter):
             provider = "delayed"
@@ -1817,12 +1990,14 @@ def test_tts_language_is_snapshotted_when_the_turn_starts() -> None:
         class RecordingSpeechBackend:
             def __init__(self) -> None:
                 self.languages: list[str] = []
+                self.roles: list[str] = []
 
             async def health(self) -> EngineHealth:
                 return EngineHealth("recording", True)
 
             async def stream(self, request):
                 self.languages.append(request.language)
+                self.roles.append(request.role)
                 yield SpeechChunk(request.request_id, b"pcm", 24000, 1, is_final=True)
 
         adapter = DelayedAdapter()
@@ -1831,17 +2006,31 @@ def test_tts_language_is_snapshotted_when_the_turn_starts() -> None:
             [ChannelConfig("delayed", base_url="https://delayed.invalid/v1", model="demo")],
             adapter_factory=lambda _channel: adapter,
         )
-        service = ConversationService(router, tts=TTSCoordinator(backend), tts_language="zh")
+        service = ConversationService(
+            router,
+            tts=TTSCoordinator(backend),
+            tts_language="zh",
+            tts_role=initial_role,
+        )
         context = service.begin_context(turn_id="language-snapshot")
         task = asyncio.create_task(service.complete("开始", context=context))
 
         await asyncio.wait_for(adapter.ready.wait(), timeout=1.0)
         service.tts_language = "ja"
+        service.tts_role = "second-role"
         adapter.release.set()
         result = await asyncio.wait_for(task, timeout=1.0)
 
         assert result.text == "当前回合。"
         assert backend.languages == ["zh"]
+        assert backend.roles == [initial_role]
+        assert not service._tts_language_snapshots
+        assert not service._tts_role_snapshots
+
+        await asyncio.wait_for(service.complete("下一回合"), timeout=1.0)
+        assert backend.languages == ["zh", "ja"]
+        assert backend.roles == [initial_role, "second-role"]
+        await service.aclose()
 
     asyncio.run(scenario())
 

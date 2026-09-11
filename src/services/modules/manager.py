@@ -420,7 +420,9 @@ class ModuleManager:
                         await value
                 record.state = ModuleState.RUNNING
                 record.error_type = ""
-                return record.public()
+                result = record.public()
+                result["reload_status"] = "reloaded"
+                return result
             except asyncio.CancelledError:
                 await cleanup_replacement()
                 restored = await restore_old()
@@ -434,7 +436,10 @@ class ModuleManager:
                 record.state = ModuleState.RUNNING if restored else ModuleState.FAILED
                 record.failure_count += 1
                 record.error_type = "" if restored else type(exc).__name__
-                return record.public()
+                result = record.public()
+                result["reload_status"] = "restored" if restored else "failed"
+                result["reload_error"] = type(exc).__name__
+                return result
 
     async def reconfigure(self, configuration: Mapping[str, Any] | None) -> dict[str, object]:
         """提交配置快照，并为支持 reload 的模块执行异步回调。"""
@@ -470,7 +475,10 @@ class ModuleManager:
                         record.descriptor.module_id,
                         replacement=factory,
                     )
-                    if status.get("state") != ModuleState.RUNNING.value:
+                    if (
+                        status.get("state") != ModuleState.RUNNING.value
+                        or status.get("reload_status") != "reloaded"
+                    ):
                         failed.append(record.descriptor.module_id)
                         continue
                 reloaded.append(record.descriptor.module_id)

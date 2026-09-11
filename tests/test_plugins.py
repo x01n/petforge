@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,36 @@ def test_plugin_failure_isolated_and_public_status_hides_exception_text() -> Non
         assert broken_status["error_type"] == "RuntimeError"
         assert healthy_status["state"] == "running"
         assert "secret-endpoint-token" not in repr(manager.status())
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_failed_file_plugin_is_retried_when_dependency_recovers(tmp_path: Path) -> None:
+    directory = tmp_path / "plugins"
+    directory.mkdir()
+    gate = tmp_path / "ready"
+    path = directory / "retry.py"
+    path.write_text(
+        "PLUGIN_ID = 'retry'\n"
+        "def create_plugin(context):\n"
+        "    from pathlib import Path\n"
+        f"    if not Path({str(gate)!r}).exists():\n"
+        "        raise RuntimeError('dependency unavailable')\n"
+        "    class Plugin: pass\n"
+        "    return Plugin()\n",
+        encoding="utf-8",
+    )
+    manager = PluginManager(
+        settings=PluginSettings(directories=(str(directory),), reload_enabled=False)
+    )
+
+    async def scenario() -> None:
+        await manager.start()
+        assert manager.status("retry")["state"] == "failed"
+        gate.write_text("ready", encoding="utf-8")
+        await manager.refresh()
+        assert manager.status("retry")["state"] == "running"
         await manager.close()
 
     asyncio.run(scenario())
@@ -222,6 +253,53 @@ def test_plugin_hot_reload_does_not_reuse_same_size_same_mtime_bytecode(
         assert changed["version"] == "2"
         assert int(changed["generation"]) > first_generation
         await manager.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("second_id", ["stable", "renamed"])
+def test_plugin_source_modules_survive_until_their_instances_unload(
+    tmp_path: Path, second_id: str
+) -> None:
+    path = tmp_path / "stable.py"
+
+    def source(plugin_id: str, version: str) -> str:
+        return (
+            "import sys\n"
+            f"PLUGIN_ID = {plugin_id!r}\n"
+            f"PLUGIN_VERSION = {version!r}\n"
+            "def create_plugin(context):\n"
+            "    assert sys.modules[__name__].PLUGIN_VERSION == PLUGIN_VERSION\n"
+            "    class Plugin:\n"
+            "        async def unload(self):\n"
+            "            assert sys.modules[__name__].PLUGIN_VERSION == PLUGIN_VERSION\n"
+            "    return Plugin()\n"
+        )
+
+    path.write_text(source("stable", "1"), encoding="utf-8")
+    manager = PluginManager(
+        settings=PluginSettings(directories=(str(tmp_path),), reload_enabled=False)
+    )
+
+    async def scenario() -> None:
+        await manager.start()
+        old_module = manager.descriptors()[0].factory.__module__
+        try:
+            assert old_module in sys.modules
+            path.write_text(source(second_id, "2"), encoding="utf-8")
+            await manager.refresh()
+            status = manager.status(second_id)
+            assert status["state"] == "running"
+            assert status["version"] == "2"
+            assert status["failure_count"] == 0
+            assert manager.status()["discovery_error_count"] == 0
+            assert old_module not in sys.modules
+            new_module = manager.descriptors()[0].factory.__module__
+            assert new_module in sys.modules
+        finally:
+            await manager.close()
+        assert manager.status(second_id)["state"] == "unloaded"
+        assert new_module not in sys.modules
 
     asyncio.run(scenario())
 

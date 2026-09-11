@@ -234,6 +234,9 @@ if _QT_AUDIO_AVAILABLE:
             self._write_device: Any | None = None
             self._current_context: object | None = None
             self._cancelled_contexts: set[object] = set()
+            # 取消墓碑必须按插入顺序有界淘汰；set.pop() 是随机的，可能
+            # 误删刚取消的回合，让迟到的 PCM 穿透到新的播放周期。
+            self._cancelled_context_order: deque[object] = deque()
             self._cancelled_lock = Lock()
             self._epoch_lock = Lock()
             self._playback_epoch = 0
@@ -465,8 +468,7 @@ if _QT_AUDIO_AVAILABLE:
                 )
                 self._dropped_streams += max(1, affected)
                 self._last_error = "queue_limit"
-                with self._cancelled_lock:
-                    self._cancelled_contexts.add(chunk.context)
+                self._mark_cancelled(chunk.context)
                 self._cancel_context(chunk.context)
                 log_event(
                     logger,
@@ -499,8 +501,7 @@ if _QT_AUDIO_AVAILABLE:
                     )
                     self._dropped_streams += max(1, affected)
                     self._last_error = "stream_limit"
-                    with self._cancelled_lock:
-                        self._cancelled_contexts.add(chunk.context)
+                    self._mark_cancelled(chunk.context)
                     self._cancel_context(chunk.context)
                     log_event(
                         logger,
@@ -800,8 +801,7 @@ if _QT_AUDIO_AVAILABLE:
                 return
             self._dropped_streams += 1
             self._last_error = str(reason_code or "audio_output_failed")[:64]
-            with self._cancelled_lock:
-                self._cancelled_contexts.add(stream.context)
+            self._mark_cancelled(stream.context)
             log_event(
                 logger,
                 "audio.playback.failed",
@@ -923,11 +923,20 @@ if _QT_AUDIO_AVAILABLE:
 
             if self._closed:
                 return
-            with self._cancelled_lock:
-                self._cancelled_contexts.add(context)
-                if len(self._cancelled_contexts) > 1024:
-                    self._cancelled_contexts.pop()
+            self._mark_cancelled(context)
             self.cancelRequested.emit(context)
+
+        def _mark_cancelled(self, context: object) -> None:
+            """登记取消墓碑并按 FIFO 有界保留。"""
+
+            with self._cancelled_lock:
+                if context in self._cancelled_contexts:
+                    return
+                self._cancelled_contexts.add(context)
+                self._cancelled_context_order.append(context)
+                while len(self._cancelled_contexts) > 1024:
+                    oldest = self._cancelled_context_order.popleft()
+                    self._cancelled_contexts.discard(oldest)
 
         def _is_cancelled(self, context: object) -> bool:
             with self._cancelled_lock:
@@ -936,6 +945,10 @@ if _QT_AUDIO_AVAILABLE:
         def clear_cancelled(self, context: object) -> None:
             with self._cancelled_lock:
                 self._cancelled_contexts.discard(context)
+                if self._cancelled_context_order:
+                    self._cancelled_context_order = deque(
+                        item for item in self._cancelled_context_order if item != context
+                    )
 
         def _cancel_context(self, context: object) -> None:
             retained: deque[_PlaybackStream] = deque()
@@ -1032,6 +1045,7 @@ if _QT_AUDIO_AVAILABLE:
             self._queued_bytes = 0
             with self._cancelled_lock:
                 self._cancelled_contexts.clear()
+                self._cancelled_context_order.clear()
             sink = self._sink
             stream = self._current
             written_bytes = max(0, int(self._written_bytes))

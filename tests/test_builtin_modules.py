@@ -134,6 +134,38 @@ def test_reload_restores_old_instance_when_new_generation_fails() -> None:
     asyncio.run(scenario())
 
 
+
+def test_reconfigure_reports_restored_old_instance_as_failure() -> None:
+    events: list[str] = []
+    manager = ModuleManager()
+
+    class Reloadable(_Module):
+        async def reload(self, _context):
+            return _Module(events, "new")
+
+    class BrokenStart(_Module):
+        async def start(self) -> None:
+            raise RuntimeError("replacement start failed")
+
+    class FactoryModule(_Module):
+        async def reload(self, _context):
+            return BrokenStart(events, "broken")
+
+    manager.register(ModuleDescriptor("tts", lambda context: FactoryModule(events, "old")))
+
+    async def scenario() -> None:
+        await manager.start()
+        result = await manager.reconfigure({"voice": "broken"})
+        assert result["status"] == "degraded"
+        assert result["reloaded"] == ()
+        assert result["failed"] == ("tts",)
+        status = manager.status("tts")
+        assert status["state"] == ModuleState.RUNNING.value
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
 def test_reload_cancellation_restores_old_instance_and_cleans_new_generation() -> None:
     events: list[str] = []
     manager = ModuleManager()

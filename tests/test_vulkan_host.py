@@ -143,3 +143,17 @@ raise SystemExit(0 if ok and QQuickWindow.hasDefaultAlphaBuffer() else 4)
 
     assert completed.returncode == 0, completed.stderr
     assert "True True" in completed.stdout
+
+
+def test_vulkan_display_size_is_clamped_to_available_area() -> None:
+    from gui.qt6.vulkan_host import _fit_display_size_to_area
+
+    class Area:
+        def width(self):
+            return 320
+
+        def height(self):
+            return 240
+
+    assert _fit_display_size_to_area(520, 620, Area()) == (320, 240)
+    assert _fit_display_size_to_area(360, 420, Area()) == (320, 240)

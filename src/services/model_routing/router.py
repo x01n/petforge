@@ -2171,14 +2171,17 @@ class ModelRouter:
     def _mark_failure(self, channel_id: str, error: BaseException) -> None:
         with self._route_lock:
             health = self._health.setdefault(channel_id, _ChannelHealth())
-            health.failures += 1
             category = str(getattr(error, "category", "unknown") or "unknown").strip().lower()
             # 适配器异常通常已经带有 safe_message，但自定义适配器可能错误地
             # 把 URL/令牌放入文本；健康快照只保留固定分类提示。
             health.last_category = category
             health.last_error = _connection_failure_message(error)
             if category == "cancelled":
+                # 用户主动取消不代表渠道故障；保留最近一次取消状态，但不
+                # 增加失败次数，也不改变已有的冷却窗口，避免取消请求污染
+                # 后续视觉回退和主模型重试的健康判断。
                 return
+            health.failures += 1
             retry_after = getattr(error, "retry_after_seconds", None)
             try:
                 requested = max(0.0, float(retry_after)) if retry_after is not None else 0.0

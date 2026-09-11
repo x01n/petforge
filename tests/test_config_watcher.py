@@ -51,6 +51,52 @@ def test_watcher_ignores_initial_content_and_same_content_rewrites(tmp_path: Pat
     asyncio.run(scenario())
 
 
+
+def test_watcher_rechecks_fingerprint_before_callback(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    _write(path, "app:\n  name: first\n")
+    seen: list[str] = []
+
+    def on_reload(configuration: LoadedConfiguration) -> dict[str, str]:
+        seen.append(str(configuration.values["app"]["name"]))
+        return {"status": "reloaded"}
+
+    watcher = ConfigurationWatcher(
+        path,
+        on_reload,
+        defaults=_defaults(tmp_path),
+        environment={},
+        debounce_seconds=0,
+        stable_checks=1,
+    )
+
+    async def scenario() -> None:
+        await watcher.start()
+        original_load = watcher._load
+        changed = False
+
+        def load_and_race() -> LoadedConfiguration:
+            nonlocal changed
+            configuration = original_load()
+            if not changed:
+                changed = True
+                _write(path, "app:\n  name: third\n")
+            return configuration
+
+        watcher._load = load_and_race  # type: ignore[method-assign]
+        _write(path, "app:\n  name: second\n")
+        first = await watcher.poll_once()
+        assert first["status"] == "pending"
+        second = await watcher.poll_once()
+        assert second["status"] == "reloaded"
+        assert seen == ["third"]
+        assert watcher.current_configuration is not None
+        assert watcher.current_configuration.values["app"]["name"] == "third"
+        await watcher.stop()
+
+    asyncio.run(scenario())
+
+
 def test_watcher_rejects_invalid_yaml_and_keeps_last_configuration(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     _write(path, "app:\n  name: stable\n")

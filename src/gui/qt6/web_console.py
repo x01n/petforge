@@ -24,11 +24,11 @@ def _public_control_state(value: Mapping[str, Any] | None) -> dict[str, object]:
 
 
 def _control_surface_html() -> str:
-    """延迟构造页面，Qt 包加载阶段不反向导入自身。"""
+    """读取独立的控制台构建产物，Qt 只负责桥接与窗口生命周期。"""
 
-    from gui.web.control_surface import control_surface_html
+    from gui.web.console import console_html
 
-    return control_surface_html()
+    return console_html()
 
 
 def _state_revision(value: Mapping[str, object] | None) -> int:
@@ -71,6 +71,8 @@ if pyside6_available:
             "channel_id",
             "model",
             "backend",
+            "profile",
+            "language",
             "expressions",
             "weight",
             "duration_seconds",
@@ -87,6 +89,9 @@ if pyside6_available:
         "select_renderer_backend": frozenset({"backend"}),
         "configure_model": frozenset({"target", "mode"}),
         "select_model_channel": frozenset({"channel_id", "model"}),
+        "select_renderer_model": frozenset({"model"}),
+        "select_tts_profile": frozenset({"profile", "language"}),
+        "select_tts_language": frozenset({"language"}),
         "submit_text": frozenset({"text"}),
         "pet_part": frozenset({"part"}),
         "expression": frozenset({"name"}),
@@ -105,6 +110,9 @@ if pyside6_available:
             "select_renderer_backend",
             "configure_model",
             "select_model_channel",
+            "select_renderer_model",
+            "select_tts_profile",
+            "select_tts_language",
             "submit_text",
             "stop",
             "retry",
@@ -442,14 +450,30 @@ if pyside6_available:
                     safe_payload["channel_id"] = channel_id
             if "model" in safe_payload:
                 model = str(safe_payload["model"]).strip()
+                renderer_model = normalized == "select_renderer_model"
                 if (
                     not model
-                    or len(model) > 128
-                    or any(char.isspace() or ord(char) < 0x20 for char in model)
+                    or len(model) > (256 if renderer_model else 128)
+                    or any(
+                        ord(char) < 0x20 or (char.isspace() and not renderer_model)
+                        for char in model
+                    )
                 ):
                     safe_payload.pop("model", None)
                 else:
                     safe_payload["model"] = model
+            for key, maximum in (("profile", 128), ("language", 16)):
+                if key in safe_payload:
+                    item = safe_payload[key]
+                    if (
+                        not isinstance(item, str)
+                        or not item.strip()
+                        or len(item) > maximum
+                        or any(char.isspace() or ord(char) < 0x20 for char in item)
+                    ):
+                        safe_payload.pop(key, None)
+                    else:
+                        safe_payload[key] = item
             try:
                 result = self._action_callback(normalized, safe_payload)
             except Exception:
@@ -472,11 +496,16 @@ if pyside6_available:
             parent: QWidget | None = None,
         ) -> None:
             super().__init__(parent)
-            self.setWindowTitle("MeaPet 网页控制台")
+            self.setWindowTitle("MeaPet · 控制台")
             self.setWindowFlags(
                 Qt.WindowType.Window | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint
             )
-            self.resize(720, 760)
+            screen = self.screen()
+            area = screen.availableGeometry() if screen is not None else None
+            width = min(1120, max(1, area.width() - 24)) if area is not None else 1120
+            height = min(780, max(1, area.height() - 48)) if area is not None else 780
+            self.setMinimumSize(min(320, width), min(360, height))
+            self.resize(width, height)
             self._state_provider = state_provider
             self._page_ready = False
             self._shutdown = False
@@ -574,7 +603,7 @@ if pyside6_available:
             if self._shutdown:
                 event.accept()
                 return
-            event.ignore()
+            event.accept()
             self.closeRequested.emit()
             self.hide()
 

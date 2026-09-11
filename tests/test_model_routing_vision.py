@@ -247,6 +247,37 @@ def test_vision_summary_task_is_cancelled_with_main_stream() -> None:
     asyncio.run(scenario())
 
 
+def test_cancelled_vision_attempt_does_not_count_as_channel_failure() -> None:
+    cancelled = _RecordingAdapter(
+        "不会返回",
+        capabilities=frozenset({"streaming", "vision"}),
+        error=ProviderAdapterError("stopped", category="cancelled"),
+    )
+    main = _RecordingAdapter("不会调用")
+    router = ModelRouter(
+        [
+            _channel("main", "main-model"),
+            _channel(
+                "vision",
+                "vision-model",
+                capabilities=frozenset({"streaming", "vision"}),
+            ),
+        ],
+        routes={"dialogue": {"channel": "main"}, "vision": {"channel": "vision"}},
+        adapter_factory=lambda channel: {"main": main, "vision": cancelled}[channel.id],
+    )
+
+    with pytest.raises(ProviderAdapterError) as raised:
+        asyncio.run(router.complete(_image_request()))
+
+    assert raised.value.category == "cancelled"
+    health = router.health("vision")
+    assert health["failures"] == 0
+    assert health["last_category"] == "cancelled"
+    assert health["cooldown_until"] == 0.0
+    assert main.calls == 0
+
+
 def test_vision_summary_request_removes_image_fields_from_main_extra_body() -> None:
     main = _RecordingAdapter("主模型回答")
     vision = _RecordingAdapter("图像摘要", capabilities=frozenset({"streaming", "vision"}))

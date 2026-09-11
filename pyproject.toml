@@ -71,6 +71,7 @@ packages = [
 [tool.hatch.build.targets.sdist]
 only-include = [
   "src",
+  "frontend/console",
   "config",
   "THIRD_PARTY_NOTICES.md",
   "pyproject.toml",
@@ -92,6 +93,9 @@ exclude = [
   "/data",
   "/dist",
   "/build",
+  "/**/node_modules",
+  "/frontend/console/.vite",
+  "/resources",
   "/resources/README.md"
 ]
 

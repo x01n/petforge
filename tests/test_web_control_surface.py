@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 import time
+from importlib.resources import files
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from gui.qt6.app import _public_model_channels
 from gui.web.control_surface import control_surface_html, friendly_public_text, public_control_state
@@ -529,6 +533,33 @@ def test_control_surface_embedded_state_cannot_close_script_element() -> None:
     )
     assert "</script><script>" not in html
     assert r"\u003c/script\u003e" in html
+
+
+def test_control_surface_loads_packaged_html_independently_of_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    template = files("gui.web").joinpath("templates/control_surface.html")
+    source = template.read_text(encoding="utf-8")
+    assert source.count("__MEAPET_DEFAULT_THEME_CSS__") == 1
+    assert source.count("__MEAPET_INITIAL_STATE_JSON__") == 1
+    assert "function stateRevision(value) {" in source
+    assert "--md3-[a-z0-9-]{1,80}" in source
+
+    expected = control_surface_html({"revision": 12})
+    monkeypatch.chdir(tmp_path)
+    actual = control_surface_html({"revision": 12})
+
+    assert actual == expected
+    assert "__MEAPET_DEFAULT_THEME_CSS__" not in actual
+    assert "__MEAPET_INITIAL_STATE_JSON__" not in actual
+
+
+def test_control_surface_template_does_not_interpolate_state_content() -> None:
+    text = "__MEAPET_DEFAULT_THEME_CSS__ __MEAPET_INITIAL_STATE_JSON__ {state_json}"
+    html = control_surface_html({"interaction": {"text": text}})
+    state_json = html.split("let state = ", 1)[1].split(";\nlet bridge", 1)[0]
+
+    assert json.loads(state_json)["interaction"]["text"] == text
 
 
 def test_control_surface_html_is_click_first_and_contains_no_raw_config_editor() -> None:

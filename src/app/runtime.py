@@ -2824,6 +2824,7 @@ class ApplicationRuntime:
 
             rendering_result: Mapping[str, object] | None = None
             plugins_result: Mapping[str, object] | None = None
+            modules_result: Mapping[str, object] | None = None
             tools_result: Mapping[str, object] | None = None
             mcp_result: Mapping[str, object] | None = None
             cleanup_required = bool(self._reload_cleanup_required)
@@ -3131,7 +3132,14 @@ class ApplicationRuntime:
                     # 全部区段均已提交时保留加载器给出的完整对象与 digest；
                     # 否则必须保留 staged snapshot，让未应用区段下次仍被检测。
                     self.configuration = configuration
-                self.modules.update_configuration(self.configuration.values)
+                # 配置快照提交后通知统一模块中心。此前这里只更新了快照，
+                # 导致实现 ``reload_configuration``/``reload`` 的模块在站点
+                # 配置热更时完全收不到通知；模块管理器自身负责隔离失败并
+                # 在需要时替换实例，因此不能把它并入某个具体区段的 setter。
+                modules_result = await await_hot_section(
+                    self.modules.reconfigure(self.configuration.values),
+                    on_commit=lambda: None,
+                )
                 self._register_optional_modules()
 
                 cleanup_tasks = (
@@ -3209,6 +3217,14 @@ class ApplicationRuntime:
                 )[:512]
             if plugins_result is not None:
                 result["plugins_status"] = str(plugins_result.get("status", ""))[:32]
+            if modules_result is not None:
+                result["modules_status"] = str(modules_result.get("status", ""))[:32]
+                result["modules_reloaded"] = tuple(
+                    str(item)[:128] for item in modules_result.get("reloaded", ())
+                )
+                result["modules_failed"] = tuple(
+                    str(item)[:128] for item in modules_result.get("failed", ())
+                )
             if tools_result is not None:
                 result["tools_status"] = str(tools_result.get("status", ""))[:32]
                 if tools_result.get("unsupported_fields"):

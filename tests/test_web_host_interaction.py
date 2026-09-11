@@ -943,6 +943,72 @@ def test_web_host_close_event_hides_pet_to_tray_callback(tmp_path: Path) -> None
     assert closed == [True]
     assert view.isHidden()
     host.shutdown()
+    assert host._close_filter is None
+    view.close()
+    app.processEvents()
+
+
+def test_web_host_close_filter_is_removed_before_shutdown_close() -> None:
+    """退出阶段移除关闭过滤器，避免宿主销毁时再次触发托盘隐藏。"""
+
+    try:
+        from PySide6.QtCore import QEvent
+        from PySide6.QtWidgets import QApplication, QWidget
+
+        from gui.qt6.web_host import WebPetHost
+    except (ImportError, ModuleNotFoundError, OSError):
+        return
+
+    app = QApplication.instance() or QApplication([])
+    view = QWidget()
+    callbacks: list[bool] = []
+    renderer = type("Renderer", (), {"view": view, "shutdown": lambda self: None})()
+    host = WebPetHost(renderer)
+    assert host.install_interaction(close_callback=lambda: callbacks.append(True))
+    assert host._close_filter is not None
+    host.prepare_shutdown()
+    assert host._close_filter is None
+    view.show()
+    app.processEvents()
+    event = QEvent(QEvent.Type.Close)
+    app.sendEvent(view, event)
+    app.processEvents()
+    assert callbacks == []
+    host.shutdown()
+    view.close()
+    app.processEvents()
+
+
+def test_web_host_close_callback_failure_still_preserves_pet_window() -> None:
+    """托盘回调异常时，关闭事件也不能销毁仍在运行的桌宠宿主。"""
+
+    try:
+        from PySide6.QtCore import QEvent
+        from PySide6.QtWidgets import QApplication, QWidget
+
+        from gui.qt6.web_host import WebPetHost
+    except (ImportError, ModuleNotFoundError, OSError):
+        return
+
+    app = QApplication.instance() or QApplication([])
+    view = QWidget()
+    renderer = type("Renderer", (), {"view": view, "shutdown": lambda self: None})()
+
+    def failing_close_callback() -> None:
+        raise RuntimeError("close callback failed")
+
+    host = WebPetHost(renderer)
+    assert host.install_interaction(close_callback=failing_close_callback)
+    view.show()
+    app.processEvents()
+    event = QEvent(QEvent.Type.Close)
+    app.sendEvent(view, event)
+    app.processEvents()
+
+    assert not event.isAccepted()
+    assert view.isVisible()
+    assert host._close_filter is not None
+    host.shutdown()
     view.close()
     app.processEvents()
 

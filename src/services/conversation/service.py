@@ -74,8 +74,10 @@ class _TTSTurnState:
     language: str = "zh"
     role: str = ""
     wake: asyncio.Event = field(default_factory=asyncio.Event)
+    capacity_wake: asyncio.Event = field(default_factory=asyncio.Event)
     pending_text: str = ""
     pending_chunks: deque[str] = field(default_factory=deque)
+    backlog_chars: int = 0
     flush_requested: bool = False
     cancelled: bool = False
     overflow_logged: bool = False
@@ -130,6 +132,10 @@ class ConversationService:
     # 单回合仅保留有限的待合成文本。语音引擎落后于模型输出时，文本展示继续完整
     # 进行，而语音保留最早尚未处理的片段，避免为每个 delta 堆积协程和任务对象。
     _TTS_PENDING_CHAR_LIMIT = 2_048
+    # 模型生产速度可能暂时高于语音后端；超过这个回合级上限后，流式
+    # 消费者会等待 worker 消费，而不是继续无限增长内存。已经接收的文本
+    # 始终保留在 FIFO 中，取消/关闭时由对应回合统一清理。
+    _TTS_BACKLOG_CHAR_LIMIT = 32 * 1024
     _TTS_DISPATCH_CHAR_LIMIT = 256
     _TTS_DEFAULT_SEGMENT_CHARS = 120
     _TTS_BOUNDARY_CHARS = frozenset("。！？!?…｡．.\n\r")
@@ -218,6 +224,7 @@ class ConversationService:
         self.tts_language = str(tts_language or "zh").strip() or "zh"
         self.tts_role = str(tts_role or "").strip()
         self._tts_language_snapshots: dict[ConversationContext, str] = {}
+        self._tts_role_snapshots: dict[ConversationContext, str] = {}
         self._tts_turns: dict[ConversationContext, _TTSTurnState] = {}
         self._sentence_turns: dict[ConversationContext, _SentenceTurnState] = {}
         self._tts_tasks: set[asyncio.Task[object]] = set()
@@ -896,7 +903,9 @@ class ConversationService:
         language = self._tts_language_snapshots.get(context)
         if not language:
             language = str(self.tts_language or "zh").strip() or "zh"
-        state = _TTSTurnState(context, language=language, role=self.tts_role)
+        role = self._tts_role_snapshots.get(context, self.tts_role)
+        state = _TTSTurnState(context, language=language, role=role)
+        state.capacity_wake.set()
         task = asyncio.create_task(self._run_tts_turn(state))
         state.task = task
         self._tts_turns[context] = state
@@ -910,20 +919,35 @@ class ConversationService:
         state = self._tts_turns.get(context)
         if state is None or not state.flush_requested or state.task is None:
             return
+        worker = state.task
         try:
-            await state.task
+            # 外层 stream 可能在等待上一回合的 flush 时被取消。直接 await
+            # 会把取消传播给 worker，而下面的 CancelledError 处理又会把
+            # 外层取消吞掉，导致调用方误以为回合正常结束。shield 保留
+            # worker 的独立生命周期；只有确认是 worker 自身取消时才吞掉
+            # 该异常，外层任务的取消必须继续向上传递。
+            await asyncio.shield(worker)
         except asyncio.CancelledError:
-            # 上一轮语音被取消时，继续让模型续接；取消墓碑仍由
-            # TTSCoordinator 保留并过滤迟到音频。
-            return
+            current_task = asyncio.current_task()
+            worker_cancelled = worker.cancelled()
+            outer_cancelled = bool(current_task is not None and current_task.cancelling())
+            if worker_cancelled and not outer_cancelled:
+                # 上一轮语音被取消时，继续让模型续接；取消墓碑仍由
+                # TTSCoordinator 保留并过滤迟到音频。
+                return
+            raise
         finally:
-            if self._tts_turns.get(context) is state:
+            # 外层取消时 shield 会让 worker 继续运行，不能提前移除状态；
+            # _finish_tts_turn 会在 worker 结束时完成回收。
+            if worker.done() and self._tts_turns.get(context) is state:
                 self._tts_turns.pop(context, None)
 
     def _finish_tts_turn(self, state: _TTSTurnState, task: asyncio.Task[object]) -> None:
         """回收已结束工作协程及其回合级资源。"""
 
         self._tts_tasks.discard(task)
+        # worker 自身取消或异常结束时，也要唤醒可能正在等待缓冲容量的模型流。
+        state.capacity_wake.set()
         # ``_run_tts_turn`` 已处理预期的后端异常；读取 exception 仍可防止
         # 未预期异常在事件循环关闭时打印 ``Task exception was never retrieved``。
         if not task.cancelled():
@@ -944,15 +968,27 @@ class ConversationService:
         value = str(text or "")
         if not value or state.cancelled or state.flush_requested:
             return
+        # 溢出队列中已经存在更早到达的文本时，后续 delta 必须继续
+        # 追加到队列尾部，不能回填前置缓冲，否则新文本会越过旧文本。
+        if state.pending_chunks:
+            state.pending_chunks.append(value)
+            state.backlog_chars += len(value)
+            if not state.overflow_logged:
+                logger.info("speech backlog spilled to the ordered per-turn queue")
+                state.overflow_logged = True
+            return
         available = self._TTS_PENDING_CHAR_LIMIT - len(state.pending_text)
         if available > 0:
-            state.pending_text += value[:available]
+            prefix = value[:available]
+            state.pending_text += prefix
+            state.backlog_chars += len(prefix)
             value = value[available:]
         if value:
             # 前置缓冲只用于限制单次调度的内存占用；溢出部分进入同一
             # 回合的 FIFO 队列，绝不丢弃模型已经返回的文本。后端慢时
             # 队列会增长，但音频内容仍保持完整且顺序不变。
             state.pending_chunks.append(value)
+            state.backlog_chars += len(value)
             if not state.overflow_logged:
                 logger.info("speech backlog spilled to the ordered per-turn queue")
                 state.overflow_logged = True
@@ -1044,6 +1080,9 @@ class ConversationService:
                     break
                 text = state.pending_text[: self._TTS_DISPATCH_CHAR_LIMIT]
                 state.pending_text = state.pending_text[self._TTS_DISPATCH_CHAR_LIMIT :]
+                state.backlog_chars = max(0, state.backlog_chars - len(text))
+                if state.backlog_chars <= self._TTS_BACKLOG_CHAR_LIMIT:
+                    state.capacity_wake.set()
                 try:
                     await self._enqueue_tts(
                         state.context,
@@ -1071,6 +1110,69 @@ class ConversationService:
                 except Exception as exc:
                     logger.warning("speech flush failed: %s", type(exc).__name__)
                 return
+        # 被取消时也必须唤醒正在等待容量的模型流，避免取消路径遗留挂起任务。
+        state.capacity_wake.set()
+
+    async def _await_tts_backpressure(self, context: ConversationContext) -> None:
+        """在语音待发缓冲达到上限时等待 worker 消费。
+
+        该等待只约束模型流的生产速率；TTS worker 仍独立运行。回合取消或
+        关闭会设置同一个事件，因此不会把取消变成永久等待。
+        """
+
+        state = self._tts_turns.get(context)
+        if state is None:
+            return
+        while (
+            state.backlog_chars >= self._TTS_BACKLOG_CHAR_LIMIT
+            and not state.cancelled
+            and not self._closed
+        ):
+            # 完成回调只唤醒一次；消费者已退出时必须传递其终态，
+            # 不能清掉通知后继续等待永远不会释放的容量。
+            if state.task is not None and state.task.done():
+                await state.task
+                return
+            state.capacity_wake.clear()
+            if (
+                state.backlog_chars < self._TTS_BACKLOG_CHAR_LIMIT
+                or state.cancelled
+                or self._closed
+            ):
+                break
+            await state.capacity_wake.wait()
+
+    async def _schedule_tts_with_backpressure(
+        self, context: ConversationContext, text: str, *, flush: bool = False
+    ) -> bool:
+        """以有界片段提交增量，并在容量耗尽时异步等待 worker。
+
+        ``_schedule_tts`` 保留给旧的同步扩展入口；模型流使用这个异步入口，
+        因而即使供应商一次返回超长 delta，也不会把整段文本一次性压入内存。
+        """
+
+        if self.tts is None or self._closed or not text:
+            return False
+        value = str(text)
+        should_yield = False
+        while value:
+            state = self._tts_turns.get(context)
+            if state is None:
+                state = self._create_tts_turn(context)
+                should_yield = True
+            if state.backlog_chars >= self._TTS_BACKLOG_CHAR_LIMIT:
+                await self._await_tts_backpressure(context)
+                if state.cancelled or self._closed:
+                    return should_yield
+                continue
+            available = max(1, self._TTS_BACKLOG_CHAR_LIMIT - state.backlog_chars)
+            piece, value = value[:available], value[available:]
+            should_yield = self._schedule_tts(context, piece) or should_yield
+        state = self._tts_turns.get(context)
+        if flush and state is not None:
+            state.flush_requested = True
+            state.wake.set()
+        return should_yield
 
     def _schedule_tts(
         self, context: ConversationContext, text: str, *, flush: bool = False
@@ -1130,7 +1232,9 @@ class ConversationService:
             state.cancelled = True
             state.pending_text = ""
             state.pending_chunks.clear()
+            state.backlog_chars = 0
             state.flush_requested = False
+            state.capacity_wake.set()
             state.wake.set()
             if state.task is not None:
                 state.task.cancel()
@@ -1138,9 +1242,10 @@ class ConversationService:
             self.tts.cancel(context)
 
     def _release_tts_context(self, context: ConversationContext) -> None:
-        """释放回合的语言/profile 快照并通知 TTS 协调器回收路由。"""
+        """释放回合的语言、角色和 profile 快照并通知 TTS 协调器回收路由。"""
 
         self._tts_language_snapshots.pop(context, None)
+        self._tts_role_snapshots.pop(context, None)
         if self.tts is None:
             return
         release_context = getattr(self.tts, "release_context", None)
@@ -1451,16 +1556,20 @@ class ConversationService:
         # 等待旧 worker 退出，避免新文本被 flush_requested 状态吞掉。
         await self._await_flushed_tts_turn(current)
         if self.tts is not None:
-            # 在回合真正开始时固定语言；配置面随后切换只影响新回合，
-            # 不会让首个 TTS 请求尚未发出时改变当前回合语种。
+            # 在回合真正开始时固定语言和角色；配置面随后切换只影响新回合，
+            # 不会在首个 TTS 请求尚未发出或审批续接时改变当前回合音色。
             snapshot_language = self._tts_language_snapshots.setdefault(
                 current,
                 str(self.tts_language or "zh").strip() or "zh",
             )
+            snapshot_role = self._tts_role_snapshots.setdefault(
+                current,
+                str(self.tts_role or "").strip(),
+            )
             pin_context = getattr(self.tts, "pin_context", None)
             if callable(pin_context):
                 try:
-                    pin_context(current, language=snapshot_language, role=self.tts_role)
+                    pin_context(current, language=snapshot_language, role=snapshot_role)
                 except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
                     # 路由快照是增强能力；TTS 本身仍须遵循文本降级，
                     # 不能因为 profile 读取失败而中断模型输出。
@@ -1597,7 +1706,9 @@ class ConversationService:
                         # 使用同一套有界分段器，因此半句会继续缓冲，遇到句末、
                         # 段落或长度上限即可开始合成；不必等到本回合终态才把
                         # 首个无标点事件提交给语音链路。
-                        if self._schedule_tts(current, provider_event.delta):
+                        if await self._schedule_tts_with_backpressure(
+                            current, provider_event.delta
+                        ):
                             await asyncio.sleep(0)
                         await self._commit_sentence_events(
                             current,
@@ -1617,7 +1728,9 @@ class ConversationService:
                         # 只有显式开启思考展示时才把思考内容作为碎碎念送入
                         # TTS，默认不泄漏内部推理文本。
                         if self.presentation.show_reasoning:
-                            if self._schedule_tts(current, provider_event.delta):
+                            if await self._schedule_tts_with_backpressure(
+                                current, provider_event.delta
+                            ):
                                 await asyncio.sleep(0)
                         await self._emit(provider_event, consume=False)
                         yield provider_event
@@ -1625,7 +1738,9 @@ class ConversationService:
                         murmur += provider_event.delta
                         segments.append(self._segment("murmur", provider_event.delta))
                         self.presentation.consume(provider_event)
-                        if self._schedule_tts(current, provider_event.delta):
+                        if await self._schedule_tts_with_backpressure(
+                            current, provider_event.delta
+                        ):
                             await asyncio.sleep(0)
                         await self._emit(provider_event, consume=False)
                         yield provider_event
@@ -2030,6 +2145,7 @@ class ConversationService:
             await asyncio.gather(*tts_tasks, return_exceptions=True)
         self._active_cancels.clear()
         self._tts_language_snapshots.clear()
+        self._tts_role_snapshots.clear()
         self._active_task_by_key.clear()
         self._active_tasks.clear()
         self._sentence_turns.clear()

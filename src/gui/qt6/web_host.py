@@ -162,7 +162,6 @@ if _qt_available:
             dragging_callback: Callable[[bool], object] | None = None,
             interaction_started_callback: Callable[[], object] | None = None,
             enter_callback: Callable[[], None] | None = None,
-            close_callback: Callable[[], object] | None = None,
         ) -> None:
             super().__init__(view)
             self._view = view
@@ -174,7 +173,6 @@ if _qt_available:
             self._dragging_callback = dragging_callback
             self._interaction_started_callback = interaction_started_callback
             self._enter_callback = enter_callback
-            self._close_callback = close_callback
             self._drag_origin: QPoint | None = None
             self._window_origin: QPoint | None = None
             self._system_move_active = False
@@ -424,15 +422,6 @@ if _qt_available:
 
         def eventFilter(self, watched: object, event: object) -> bool:  # noqa: N802
             event_type = getattr(event, "type", lambda: None)()
-            close_event = getattr(QEvent.Type, "Close", None)
-            if event_type == close_event:
-                callback = self._close_callback
-                if callable(callback):
-                    try:
-                        callback()
-                    except Exception:
-                        logger.exception("Web Live2D close-to-tray callback failed")
-                    return True
             key_press = getattr(QEvent.Type, "KeyPress", None)
             if event_type == key_press and self._hover_targets:
                 if event.isAutoRepeat() or event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier:
@@ -705,9 +694,17 @@ if _qt_available:
             if event_type != getattr(QEvent.Type, "Close", None):
                 return False
             try:
-                self._callback()
+                if self._callback() is False:
+                    return False
             except Exception:
                 logger.exception("Web Live2D close-to-tray callback failed")
+                # 关闭回调异常时也必须阻止 Qt 销毁宿主；运行时和 TTS
+                # 仍在工作，用户可通过快捷键或托盘再次恢复窗口。
+                try:
+                    event.ignore()
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+                return True
             try:
                 event.ignore()
             except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -717,28 +714,7 @@ if _qt_available:
 
 else:
     _WebInteractionFilter = None  # type: ignore[assignment]
-
-    class _WebCloseEventFilter(QObject):
-        """拦截用户关闭 WebEngine 桌宠窗口并转为托盘隐藏。"""
-
-        def __init__(self, callback: Callable[[], object]) -> None:
-            super().__init__()
-            self._callback = callback
-
-        def eventFilter(self, watched: object, event: object) -> bool:  # noqa: N802
-            del watched
-            event_type = getattr(event, "type", lambda: None)()
-            if event_type != getattr(QEvent.Type, "Close", None):
-                return False
-            try:
-                self._callback()
-            except Exception:
-                logger.exception("Web Live2D close-to-tray callback failed")
-            try:
-                event.ignore()
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                pass
-            return True
+    _WebCloseEventFilter = None  # type: ignore[assignment]
 
 
 class WebPetHost:
@@ -5227,10 +5203,14 @@ class WebPetHost:
             self._click_callback = click_callback
             self._enter_callback = enter_callback
             self._close_callback = close_callback
-            if _WebCloseEventFilter is not None and view is not None and callable(close_callback):
-                self._close_filter = _WebCloseEventFilter(close_callback)
+            if (
+                _WebCloseEventFilter is not None
+                and self._close_filter is None
+                and callable(close_callback)
+            ):
                 installer = getattr(view, "installEventFilter", None)
                 if callable(installer):
+                    self._close_filter = _WebCloseEventFilter(self._handle_close_request)
                     installer(self._close_filter)
             page_bridge_available = callable(callback_setter)
             self._page_bridge_ready_setter = None
@@ -5286,7 +5266,7 @@ class WebPetHost:
             self._click_callback = None
             self._enter_callback = None
             self._close_callback = None
-            self._close_filter = None
+            self._remove_close_filter()
             self._renderer_click_callback_active = False
             self._renderer_model_reload_callback_active = False
             if callable(callback_setter):
@@ -5315,6 +5295,26 @@ class WebPetHost:
                     pass
             return False
 
+    def _handle_close_request(self) -> bool:
+        """仅在宿主运行时处理用户关闭，退出阶段继续交给 Qt。"""
+
+        if self._closing or self._shutdown or not callable(self._close_callback):
+            return False
+        self._clear_page_drag()
+        self._clear_page_hover_state(self.view)
+        self._close_callback()
+        return True
+
+    def _remove_close_filter(self) -> None:
+        close_filter, self._close_filter = self._close_filter, None
+        if close_filter is None:
+            return
+        try:
+            self.view.removeEventFilter(close_filter)
+            close_filter.deleteLater()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+
     def _install_native_interaction_filter(self, filter_type: object, view: object) -> None:
         """在页面桥未握手时挂载 Qt 原生输入回退。"""
 
@@ -5330,7 +5330,6 @@ class WebPetHost:
             self._set_renderer_dragging,
             self._notify_interaction_started,
             self._enter_callback,
-            self._close_callback,
         )
         self._interaction_filter = interaction_filter
         self._refresh_interaction_targets()
@@ -5890,15 +5889,7 @@ class WebPetHost:
         self._context_menu_callback = None
         self._double_click_callback = None
         self._enter_callback = None
-        close_filter = self._close_filter
-        self._close_filter = None
-        if close_filter is not None and view is not None:
-            remover = getattr(view, "removeEventFilter", None)
-            if callable(remover):
-                try:
-                    remover(close_filter)
-                except (AttributeError, RuntimeError, TypeError, ValueError):
-                    pass
+        self._remove_close_filter()
         self._close_callback = None
         self._click_callback = None
         self._renderer_click_callback_active = False
@@ -5940,6 +5931,7 @@ class WebPetHost:
             return
         self._closing = True
         # 退出阶段的 view.close() 必须继续交给 Qt/renderer，不再走用户关闭到托盘回调。
+        self._remove_close_filter()
         self._close_callback = None
         self._surface_mask_enabled = False
         self._surface_mask_view_visible = None

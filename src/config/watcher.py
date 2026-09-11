@@ -59,6 +59,44 @@ _FAILURE_STATUSES = frozenset(
     }
 )
 
+_DETAIL_SECTIONS = frozenset(
+    {
+        "llm",
+        "tts",
+        "asr",
+        "memory",
+        "behavior",
+        "proactive",
+        "watcher",
+        "config",
+        "scheduler",
+        "ui",
+        "logging",
+        "mcp",
+        "plugins",
+        "tools",
+        "rendering",
+        "storage",
+        "app",
+        "web",
+    }
+)
+_DETAIL_STATUSES = frozenset(
+    {
+        "reloaded",
+        "available",
+        "unchanged",
+        "pending",
+        "requested",
+        "busy",
+        "failed",
+        "unavailable",
+        "restart_required",
+        "degraded",
+        "ready",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ConfigurationReload:
@@ -177,6 +215,10 @@ class ConfigurationWatcher:
         self._deferred_until = 0.0
         self._last_result = ConfigurationReload("stopped", 0, self.path)
         self._last_error = ""
+        # 运行时回调的结构化结果不能塞进 ConfigurationReload.error：那会
+        # 把“模块局部失败但整体已应用”误报成配置拒绝。这里仅保存经过白名单
+        # 投影的公开字段，供 Qt/Web 控制面显示最近一次应用细节。
+        self._last_details: dict[str, object] = {}
 
     @property
     def interval_seconds(self) -> float:
@@ -298,6 +340,7 @@ class ConfigurationWatcher:
         result["running"] = self.running
         result["pending"] = self._pending is not None
         result["generation"] = self._generation
+        result.update(self._last_details)
         return result
 
     async def start(self) -> Mapping[str, object]:
@@ -312,6 +355,7 @@ class ConfigurationWatcher:
         self._deferred_digest = ""
         self._deferred_until = 0.0
         self._last_error = ""
+        self._last_details = {}
         snapshot = self._read_snapshot()
         initial_status = "running"
         if snapshot is not None:
@@ -358,6 +402,7 @@ class ConfigurationWatcher:
                 error=self._last_error,
                 configuration=self._current_configuration,
             )
+            self._last_details = {}
             return self.status()
         if task is not None:
             task.cancel()
@@ -377,6 +422,7 @@ class ConfigurationWatcher:
             error=self._last_error,
             configuration=self._current_configuration,
         )
+        self._last_details = {}
         return self.status()
 
     async def poll_once(self) -> Mapping[str, object]:
@@ -399,6 +445,7 @@ class ConfigurationWatcher:
                     self._last_result = ConfigurationReload(
                         "degraded", self._generation, self.path, error=self._last_error
                     )
+                    self._last_details = {}
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=self._interval_seconds)
                 except TimeoutError:
@@ -420,6 +467,7 @@ class ConfigurationWatcher:
             self._last_result = ConfigurationReload(
                 "unavailable", self._generation, self.path, error=error
             )
+            self._last_details = {}
             return self.status()
         if self._observed is not None and snapshot.digest == self._observed.digest:
             if self._last_result.status == "unavailable":
@@ -457,6 +505,7 @@ class ConfigurationWatcher:
             self._last_result = ConfigurationReload(
                 "pending", self._generation, self.path, changed=True
             )
+            self._last_details = {}
             return self.status()
 
         self._pending_seen += 1
@@ -465,6 +514,7 @@ class ConfigurationWatcher:
             self._last_result = ConfigurationReload(
                 "pending", self._generation, self.path, changed=True
             )
+            self._last_details = {}
             return self.status()
 
         # 成功/失败的最终指纹由 ``_reload_snapshot`` 写入；若宿主明确要求
@@ -489,6 +539,7 @@ class ConfigurationWatcher:
                     error=self._last_error,
                     configuration=self._current_configuration,
                 )
+                self._last_details = {}
                 log_event(
                     logger,
                     "config.reload.failed",
@@ -497,6 +548,34 @@ class ConfigurationWatcher:
                     duration_ms=max(0.0, (time.monotonic() - started_at) * 1000.0),
                     reason_code="load_failed",
                 )
+                return self.status()
+
+            # 文件在解析期间可能被编辑器再次替换；解析结果必须与应用前
+            # 的最新指纹一致，否则本次配置不能提交给运行时。
+            current_snapshot = self._read_snapshot()
+            if current_snapshot is None:
+                self._pending = None
+                self._pending_seen = 0
+                self._last_result = ConfigurationReload(
+                    "unavailable",
+                    self._generation,
+                    self.path,
+                    changed=True,
+                    error=self._last_error or "configuration file is unavailable",
+                )
+                self._last_details = {}
+                return self.status()
+            if current_snapshot.digest != snapshot.digest:
+                self._pending = current_snapshot
+                self._pending_seen = 1
+                self._pending_since = self._clock()
+                self._last_result = ConfigurationReload(
+                    "pending",
+                    self._generation,
+                    self.path,
+                    changed=True,
+                )
+                self._last_details = {}
                 return self.status()
 
             try:
@@ -516,6 +595,7 @@ class ConfigurationWatcher:
                     error=self._last_error,
                     configuration=self._current_configuration,
                 )
+                self._last_details = {}
                 log_event(
                     logger,
                     "config.reload.failed",
@@ -527,6 +607,12 @@ class ConfigurationWatcher:
                 return self.status()
 
             callback_status = _callback_status(callback_result)
+            callback_details = _callback_details(callback_result)
+            # ApplicationRuntime 保持整体状态为 ``reloaded``，但模块管理器
+            # 可以在回执中报告局部失败；把这种结果投影为 partial，避免 Web
+            # 控制面显示“运行中”而隐藏实际失败。
+            if callback_status == "reloaded" and callback_details.get("modules_failed"):
+                callback_status = "partial"
             if _callback_requests_retry(callback_result):
                 self._deferred_digest = snapshot.digest
                 self._deferred_until = self._clock() + self._interval_seconds
@@ -538,6 +624,7 @@ class ConfigurationWatcher:
                     error="reload deferred by runtime",
                     configuration=self._current_configuration,
                 )
+                self._last_details = callback_details
                 log_event(
                     logger,
                     "config.reload.deferred",
@@ -557,6 +644,7 @@ class ConfigurationWatcher:
                     error=callback_status,
                     configuration=self._current_configuration,
                 )
+                self._last_details = callback_details
                 log_event(
                     logger,
                     "config.reload.failed",
@@ -571,6 +659,7 @@ class ConfigurationWatcher:
             self._observed = snapshot
             self._current_configuration = configuration
             self._last_error = ""
+            self._last_details = callback_details
             # 对外保持稳定的观察器状态；宿主的 ``ok/applied`` 等细分回执
             # 不应让 UI/调度器需要枚举一整套别名。只有明确的部分应用或
             # 需重启状态保留其语义。
@@ -634,6 +723,53 @@ def _callback_status(value: object) -> str:
                 return status
             return "reloaded"
     return "reloaded"
+
+
+def _callback_details(value: object) -> dict[str, object]:
+    """投影运行时回执的有限字段，避免把配置内容带入控制面。"""
+
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, object] = {}
+    for key in ("changed_sections", "applied_sections", "restart_sections"):
+        raw = value.get(key)
+        if not isinstance(raw, (list, tuple, set, frozenset)):
+            continue
+        sections = tuple(
+            item for item in (str(item).strip() for item in raw) if item in _DETAIL_SECTIONS
+        )
+        if sections:
+            result[key] = sections
+            result[f"{key}_count"] = len(sections)
+    for key in ("modules_failed", "modules_reloaded"):
+        raw = value.get(key)
+        if not isinstance(raw, (list, tuple, set, frozenset)):
+            continue
+        # 模块标识是诊断所需的公开数据；仅保留短、非空字符串，避免回显
+        # 任意对象的 repr 或异常正文。
+        modules = tuple(
+            item[:128]
+            for item in (str(item).strip() for item in raw)
+            if item and len(item) <= 128
+        )
+        if modules:
+            result[key] = modules
+            result[f"{key}_count"] = len(modules)
+    for key in (
+        "rendering_status",
+        "plugins_status",
+        "modules_status",
+        "tools_status",
+        "mcp_status",
+    ):
+        raw = str(value.get(key, "") or "").strip().lower()
+        if raw in _DETAIL_STATUSES:
+            result[key] = raw
+    if value.get("cleanup") == "restart_required":
+        result["cleanup"] = "restart_required"
+    if value.get("retry") is True:
+        result["retry"] = True
+    return result
 
 
 def _callback_requests_retry(value: object) -> bool:

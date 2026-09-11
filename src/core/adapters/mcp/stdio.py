@@ -306,7 +306,6 @@ class StdioMCPClient:
                 self._started = False
                 self._process = None
                 raise MCPTransportError("MCP server process could not be started") from exc
-            self._started = True
             self._reader_task = asyncio.create_task(
                 self._read_loop(), name=f"mcp-reader-{self.server_name}"
             )
@@ -335,6 +334,8 @@ class StdioMCPClient:
                     self._startup_failures = min(self._startup_failures + 1, 8)
                     await self._close_unlocked(mark_closed=False)
                     raise
+            # 握手完成前保持未启动状态，让并发调用等待生命周期锁。
+            self._started = True
             self._startup_failures = 0
             self._notifications.notify_connection("connected")
 

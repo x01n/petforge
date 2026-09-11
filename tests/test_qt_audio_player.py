@@ -772,6 +772,38 @@ def test_player_cancel_and_stop_all_reset_device_without_poisoning_new_stream() 
     player.close()
 
 
+def test_cancel_tombstones_evict_oldest_and_keep_latest_late_audio_blocked() -> None:
+    """有界取消记录不能随机淘汰刚取消的回合。"""
+
+    _app()
+    factory = _SinkFactory()
+    player = QtAudioPlayer(
+        output_device_provider=lambda: _Device(),
+        sink_factory=factory,
+    )
+
+    class _Context(ConversationContext):
+        def __init__(self, label: str, hash_value: int) -> None:
+            super().__init__("profile", "session", label, 1)
+            object.__setattr__(self, "hash_value", hash_value)
+
+        def __hash__(self) -> int:
+            return self.hash_value
+
+    # hash 为 0 的对象会被旧的 set.pop() 优先随机移除；FIFO 实现必须
+    # 保留最后登记的回合，直到明确 clear_cancelled。
+    latest = _Context("latest", 0)
+    for index in range(1, 1025):
+        player.cancel(_Context(f"old-{index}", index))
+    player.cancel(latest)
+
+    assert player._is_cancelled(latest)
+    player(_chunk(latest, b"late", final=True))
+    assert factory.sinks == []
+
+    player.close()
+
+
 def test_stop_all_rejects_audio_signal_queued_from_an_older_epoch() -> None:
     app = _app()
     factory = _SinkFactory()

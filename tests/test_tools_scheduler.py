@@ -682,6 +682,51 @@ def test_execute_plan_retries_only_low_risk_reads_and_bounds_timeout() -> None:
         )
 
 
+def test_execute_plan_cancellation_cleans_plan_approvals() -> None:
+    cancel_event = asyncio.Event()
+
+    class CancellingPermission(PermissionService):
+        def evaluate(self, spec, context, *, call_id, safe_summary):
+            result = super().evaluate(
+                spec,
+                context,
+                call_id=call_id,
+                safe_summary=safe_summary,
+            )
+            cancel_event.set()
+            return result
+
+    async def write(_arguments, _context):
+        raise AssertionError("approval must prevent handler execution")
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            "system:cancelled_plan_write",
+            "write",
+            {"type": "object"},
+            write,
+            RiskLevel.HIGH,
+        )
+    )
+    executor = ToolExecutionService(registry, CancellingPermission())
+
+    async def scenario() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await executor.execute_plan(
+                (
+                    ToolPlanStep("first", "first-call", "system:cancelled_plan_write"),
+                    ToolPlanStep("second", "second-call", "system:cancelled_plan_write"),
+                ),
+                context=ToolCallContext("profile", "session", "cancelled-plan"),
+                stop_on_approval=False,
+                cancel_event=cancel_event,
+            )
+        assert executor.pending_approvals() == ()
+
+    asyncio.run(scenario())
+
+
 def test_execute_plan_honors_cancellation_and_step_timeout() -> None:
     started = asyncio.Event()
     cancelled = asyncio.Event()

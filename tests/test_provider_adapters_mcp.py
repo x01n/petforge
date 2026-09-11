@@ -857,6 +857,66 @@ def test_stdio_mcp_discovers_calls_and_bridges_tools() -> None:
     asyncio.run(run())
 
 
+def test_stdio_concurrent_requests_wait_for_initialization(monkeypatch) -> None:
+    script = textwrap.dedent(
+        """
+        import json, sys
+        initialized = False
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request['method']
+            if method == 'notifications/initialized':
+                initialized = True
+                continue
+            if method == 'initialize':
+                response = {'result': {'protocolVersion': '2025-06-18'}}
+            elif not initialized:
+                response = {'error': {'code': -32002, 'message': 'request before initialized'}}
+            else:
+                response = {'result': {'tools': [{'name': 'ready_tool'}]}}
+            print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], **response}), flush=True)
+        """
+    )
+
+    async def run() -> None:
+        client = StdioMCPClient(
+            StdioMCPServerConfig(
+                name="concurrent-initialize",
+                command=(sys.executable, "-u", "-c", script),
+                request_timeout_seconds=2,
+            )
+        )
+        initializing = asyncio.Event()
+        release = asyncio.Event()
+        initialize = client._initialize
+
+        async def gated_initialize(*, timeout_seconds: float | None = None) -> None:
+            initializing.set()
+            await release.wait()
+            await initialize(timeout_seconds=timeout_seconds)
+
+        monkeypatch.setattr(client, "_initialize", gated_initialize)
+        requests = [asyncio.create_task(client.list_tools())]
+        try:
+            await asyncio.wait_for(initializing.wait(), timeout=2)
+            requests.append(asyncio.create_task(client.list_tools()))
+            await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(*requests), timeout=3)
+            assert [[tool.name for tool in result] for result in results] == [
+                ["ready_tool"],
+                ["ready_tool"],
+            ]
+        finally:
+            release.set()
+            for request in requests:
+                request.cancel()
+            await asyncio.gather(*requests, return_exceptions=True)
+            await client.close()
+
+    asyncio.run(run())
+
+
 def test_mcp_bridge_refresh_replaces_and_removes_stale_registry_tools() -> None:
     """远端 tools/list 变化后，registry 只保留当前桥接集合且刷新幂等。"""
 

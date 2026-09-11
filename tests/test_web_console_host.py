@@ -306,6 +306,15 @@ def test_web_console_html_rejects_late_state_snapshots() -> None:
     assert "applyState(JSON.parse(next||'{}'))" in html
 
 
+def test_web_console_timeline_wraps_long_messages_without_horizontal_overflow() -> None:
+    from gui.web.control_surface import control_surface_html
+
+    html = control_surface_html({"revision": 3})
+    assert "#timeline li > span" in html
+    assert "min-width: 0" in html
+    assert "overflow-wrap: anywhere" in html
+
+
 def test_web_bridge_allows_observation_buttons_without_arguments() -> None:
     try:
         from gui.qt6.web_console import _ControlSurfaceBridge
@@ -337,7 +346,7 @@ def test_web_bridge_allows_observation_buttons_without_arguments() -> None:
     assert seen == [("read_foreground_window", {}), ("read_processes", {})]
 
 
-def test_web_control_surface_host_renders_and_routes_clicks(tmp_path: Path) -> None:
+def test_legacy_web_control_surface_host_renders_and_routes_clicks(tmp_path: Path) -> None:
     if shutil.which("xvfb-run") is None:
         return
     try:
@@ -354,6 +363,9 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import QApplication
 from gui.qt6.app import _configure_qt_webengine_renderer
 from gui.qt6.web_console import WebControlSurfaceWindow
+import gui.qt6.web_console as web_console
+from gui.web.control_surface import control_surface_html
+web_console._control_surface_html = control_surface_html
 _configure_qt_webengine_renderer()
 app = QApplication(sys.argv)
 seen = []

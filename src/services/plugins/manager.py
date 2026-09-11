@@ -169,7 +169,7 @@ class PluginManager:
         self._configuration: dict[str, Any] = deepcopy(dict(configuration or {}))
         self._records: dict[str, _PluginRecord] = {}
         self._source_ids: dict[str, set[str]] = {}
-        self._source_modules: dict[str, str] = {}
+        self._source_modules: dict[tuple[str, str], str] = {}
         self._discovery_errors: dict[str, str] = {}
         self._lock = asyncio.Lock()
         self._watch_task: asyncio.Task[None] | None = None
@@ -346,6 +346,7 @@ class PluginManager:
             except (RuntimeError, TypeError, ValueError) as exc:
                 self._discovery_errors[descriptor.source] = type(exc).__name__
         self._source_ids = source_ids
+        self._prune_source_modules(tuple(discovered))
         return tuple(discovered)
 
     def _discover_file(self, path: Path) -> PluginDescriptor | None:
@@ -362,7 +363,7 @@ class PluginManager:
                 if (
                     record.descriptor.source == source
                     and record.descriptor.fingerprint == fingerprint
-                    and source in self._source_modules
+                    and (source, fingerprint) in self._source_modules
                 ):
                     self._discovery_errors.pop(source, None)
                     return record.descriptor
@@ -397,10 +398,7 @@ class PluginManager:
                 dependencies=tuple(dependencies),
                 fingerprint=fingerprint,
             )
-            previous_module = self._source_modules.get(source)
-            if previous_module and previous_module != module_name:
-                sys.modules.pop(previous_module, None)
-            self._source_modules[source] = module_name
+            self._source_modules[(source, fingerprint)] = module_name
             self._discovery_errors.pop(source, None)
             return descriptor
         except BaseException as exc:
@@ -409,6 +407,18 @@ class PluginManager:
             self._discovery_errors[source] = type(exc).__name__
             logger.warning("插件发现失败：%s (%s)", path.name, type(exc).__name__)
             return None
+
+    def _prune_source_modules(self, discovered: tuple[PluginDescriptor, ...] = ()) -> None:
+        """保留当前实例和待应用源码的模块，释放已退出的源码代次。"""
+
+        retained = (
+            {(item.source, item.fingerprint) for item in (*self.descriptors(), *discovered)}
+            if not self._closed
+            else set()
+        )
+        for key in tuple(self._source_modules):
+            if key not in retained:
+                sys.modules.pop(self._source_modules.pop(key), None)
 
     def _discover_entry_points(self) -> tuple[PluginDescriptor, ...]:
         discovered: list[PluginDescriptor] = []
@@ -717,8 +727,6 @@ class PluginManager:
                 await self.unload(plugin_id)
                 if record.instance is None:
                     self.unregister(plugin_id)
-                    if record.descriptor.source in self._source_modules:
-                        sys.modules.pop(self._source_modules.pop(record.descriptor.source), None)
 
         for descriptor in discovered:
             record = self._records.get(descriptor.plugin_id)
@@ -745,9 +753,11 @@ class PluginManager:
                     PluginState.DISCOVERED,
                     PluginState.UNLOADED,
                     PluginState.DISABLED,
+                    PluginState.FAILED,
                 }
             ):
                 await self.load(descriptor.plugin_id)
+        self._prune_source_modules()
         self._last_refresh_ms = (monotonic() - started) * 1000.0
         return dict(self.status())
 
@@ -893,6 +903,7 @@ class PluginManager:
                     raise
                 except BaseException as exc:
                     self._fail(record, type(exc).__name__)
+            self._prune_source_modules()
         return dict(self.status())
 
     async def _watch_loop(self) -> None:

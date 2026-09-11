@@ -576,14 +576,16 @@ def _set_native_input_transparency(
         else:
             if baseline is None:
                 # 不主动清理非本适配器设置的样式，避免影响其他窗口管理代码。
-                return bool(current & _WINDOW_INPUT_STYLE_BITS) is False, "未发现本适配器的输入样式"
+                return not bool(current & _WS_EX_TRANSPARENT), "未发现本适配器的输入样式"
             desired = (int(current) & ~_WINDOW_INPUT_STYLE_BITS) | (
                 int(baseline) & _WINDOW_INPUT_STYLE_BITS
             )
         actual = _commit_native_extended_style(user32, hwnd, desired)
         if actual is None:
             return None, "Win32 扩展窗口样式写入或回读失败"
-        active = bool(actual & _WINDOW_INPUT_STYLE_BITS) is bool(enabled)
+        active = actual & _WINDOW_INPUT_STYLE_BITS == desired & _WINDOW_INPUT_STYLE_BITS and bool(
+            actual & _WS_EX_TRANSPARENT
+        ) is bool(enabled)
         if active and not bool(enabled):
             _native_input_style_baselines.pop(hwnd, None)
         return active, "Win32 扩展窗口样式已回读"
@@ -1025,7 +1027,7 @@ def set_window_click_through(
     user32: object | None = None,
     is_windows: bool | None = None,
 ) -> PlatformCapability:
-    """切换点击穿透；优先使用稳定的 Win32 HWND，避免 Qt 标志重建窗口句柄。"""
+    """同步 Qt 输入标志与当前 HWND 的 Win32 扩展样式。"""
 
     if not _is_windows(is_windows):
         return _capability(
@@ -1038,27 +1040,13 @@ def set_window_click_through(
     position = _read_qt_position(window)
     native_api = user32 if user32 is not None else _load_user32()
     native_hwnd = _window_id(window) if native_api is not None else None
-
-    # Windows Qt 的 setFlag 可能重建原生窗口。存在可用 HWND 时先提交
-    # Win32 扩展样式，避免后续回读继续使用已失效的旧句柄。
-    if native_api is not None and native_hwnd is not None:
-        native_baseline = _read_native_extended_style(native_api, native_hwnd)
-        native_active, native_detail = _set_native_input_transparency(
-            window,
-            bool(enabled),
-            user32=native_api,
-            baseline_style=native_baseline,
-        )
-        if native_active is True:
-            if position is not None and _read_qt_position(window) != position:
-                _restore_qt_position(window, position)
-            return _capability(
-                "click_through",
-                CapabilityState.AVAILABLE,
-                f"{native_detail}；已启用 WS_EX_TRANSPARENT/WS_EX_NOACTIVATE 兜底",
-                "WS_EX_TRANSPARENT",
-                "WS_EX_NOACTIVATE",
-            )
+    native_baseline = (
+        _read_native_extended_style(native_api, native_hwnd)
+        if native_api is not None and native_hwnd is not None
+        else None
+    )
+    with _native_input_style_lock:
+        owned_baseline = _native_input_style_baselines.get(native_hwnd)
 
     target = _qt_window_target(window)
     setter = getattr(target, "setFlag", None)
@@ -1091,10 +1079,16 @@ def set_window_click_through(
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
             logger.debug("Windows click-through Qt flag update failed: %s", type(exc).__name__)
 
-    # Qt 可能在 setFlag 后创建新 HWND；重新读取句柄和基线再做 Win32 回退。
+    # Qt 的逻辑标志必须更新，Web/OpenGL 宿主会读取它。若 HWND 重建，
+    # 将原有样式基线迁移到新句柄，不能把开启后的样式当成恢复基线。
+    previous_hwnd = native_hwnd
     native_hwnd = _window_id(window) if native_api is not None else None
+    if native_hwnd is not None and previous_hwnd != native_hwnd:
+        with _native_input_style_lock:
+            _native_input_style_baselines.pop(previous_hwnd, None)
+            if owned_baseline is not None:
+                _native_input_style_baselines[native_hwnd] = owned_baseline
     if native_api is not None and native_hwnd is not None:
-        native_baseline = _read_native_extended_style(native_api, native_hwnd)
         native_active, native_detail = _set_native_input_transparency(
             window,
             bool(enabled),

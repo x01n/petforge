@@ -894,7 +894,11 @@ class HttpMCPClient:
                 return
             if self._closed:
                 raise MCPTransportError("MCP client is closed")
+            self._started = False
+            await self._close_sse_stream()
             await self._close_http_event_stream()
+            self._session_id = None
+            self._reset_message_endpoint()
             self._event_stream_supported = None
             self._notifications.set_capabilities(MCPServerCapabilities())
             self._failure = None
@@ -903,11 +907,11 @@ class HttpMCPClient:
             self._sse_ready = asyncio.Event()
             try:
                 await self._open_sse()
-                self._started = True
                 if self.config.initialize:
                     await asyncio.wait_for(
                         self._initialize(), timeout=self.config.startup_timeout_seconds
                     )
+                self._started = True
                 self._start_http_event_stream()
                 self._notifications.notify_connection("connected")
             except asyncio.CancelledError:
@@ -1372,7 +1376,7 @@ class HttpMCPClient:
             # DELETE 会话前先关闭 SSE 读取任务，避免同一连接上的并发读写。
             await self._close_sse_stream()
             await self._close_http_event_stream()
-            if self.config.close_session and self._session_id and self.config.transport == "sse":
+            if self.config.close_session and self._session_id:
                 try:
                     target = self.config.url
                     request = self._client.request(

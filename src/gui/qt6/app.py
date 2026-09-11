@@ -2477,8 +2477,6 @@ def run(
     tray_resources: list[Any] = []
     click_through_recovery_available = False
     console_recovery_available = False
-    console_close_requested = False
-    web_console_close_requested = False
     tight_layout_pet_hidden = False
     tight_layout_pet_was_visible = False
     console: PetConsoleWindow | None = None
@@ -3628,19 +3626,23 @@ def run(
             status = "unavailable"
         elif not watcher_enabled:
             status = "stopped"
-        elif status_snapshot.get("error"):
-            status = "configuration_rejected"
         elif bool(status_snapshot.get("pending", False)):
             status = "deferred"
         elif raw_status in {
             "reloaded",
+            "partial",
             "restart_required",
             "deferred",
             "rejected",
             "configuration_rejected",
             "unavailable",
+            "degraded",
+            "failed",
+            "error",
         }:
             status = "configuration_rejected" if raw_status == "rejected" else raw_status
+        elif status_snapshot.get("error"):
+            status = "configuration_rejected"
         elif watcher_running:
             status = "running"
         else:
@@ -3655,9 +3657,30 @@ def run(
             "deferred": "正在等待文件稳定后自动重载",
             "configuration_rejected": "配置变更未应用，请打开配置中心校验",
             "reloaded": "配置文件已自动重载并应用",
+            "partial": "配置已应用，但部分模块重载失败",
             "restart_required": "配置已读取，部分设置需要重启",
+            "degraded": "自动重载服务暂时降级，请检查日志",
+            "failed": "配置自动重载失败，请打开配置中心校验",
+            "error": "配置自动重载暂时不可用",
             "running": "配置文件已连接，修改后会自动校验并应用",
         }
+        details: dict[str, object] = {}
+        for key in (
+            "changed_sections_count",
+            "applied_sections_count",
+            "restart_sections_count",
+            "modules_failed_count",
+            "modules_reloaded_count",
+        ):
+            try:
+                value = max(0, int(status_snapshot.get(key, 0) or 0))
+            except (TypeError, ValueError, OverflowError):
+                value = 0
+            if value:
+                details[key] = value
+        rendering_status = str(status_snapshot.get("rendering_status", "") or "").strip().lower()
+        if rendering_status:
+            details["rendering_status"] = rendering_status[:32]
         return {
             "connected": connected,
             "watcher_enabled": watcher_enabled,
@@ -3666,6 +3689,7 @@ def run(
             "status": status,
             "generation": generation,
             "message": messages.get(status, "配置文件状态暂不可用"),
+            **details,
         }
 
     def _web_memory_state() -> dict[str, object]:
@@ -3948,6 +3972,8 @@ def run(
                 normalized,
                 select_renderer_backend(payload.get("backend")),
             )
+        if normalized == "select_renderer_model":
+            return _safe_web_result(normalized, select_renderer_model(payload.get("model")))
         if normalized == "configure_model":
             show_console()
             if console is not None:
@@ -4160,42 +4186,7 @@ def run(
     def show_web_console() -> object:
         """打开公开网页控制台；没有 WebEngine 时保留 Qt 控制台入口。"""
 
-        nonlocal web_console, console_recovery_available, web_console_close_requested
-
-        def on_web_console_close_requested() -> None:
-            """记录用户点击网页控制台关闭按钮，区别于程序主动隐藏。"""
-
-            nonlocal web_console_close_requested
-            web_console_close_requested = True
-
-        def on_web_console_hidden() -> None:
-            """隐藏网页控制台前确保点击穿透仍有恢复入口。"""
-
-            nonlocal console_recovery_available, web_console_close_requested
-            user_close = web_console_close_requested
-            web_console_close_requested = False
-            if user_close:
-                # 用户关闭只隐藏到托盘；保留桌宠当前输入状态，托盘和快捷键仍可恢复。
-                console_recovery_available = True
-                restore_tight_layout_pet()
-                set_ui_interaction_lock(False)
-                return
-            if shutting_down:
-                console_recovery_available = False
-                set_ui_interaction_lock(False)
-                return
-            if console is not None and console.isVisible():
-                console_recovery_available = True
-                return
-            result = restore_pet_input()
-            if _click_through_operation_succeeded(result, enabled=False):
-                console_recovery_available = False
-                restore_tight_layout_pet()
-                set_ui_interaction_lock(False)
-                return
-            console_recovery_available = True
-            if web_console is not None:
-                web_console.show_and_focus()
+        nonlocal web_console, console_recovery_available
 
         if not web_console_available:
             show_console()
@@ -4208,10 +4199,7 @@ def run(
                 web_console.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
                 hidden_signal = getattr(web_console, "hidden", None)
                 if hidden_signal is not None and callable(getattr(hidden_signal, "connect", None)):
-                    hidden_signal.connect(on_web_console_hidden)
-                close_signal = getattr(web_console, "closeRequested", None)
-                if close_signal is not None and callable(getattr(close_signal, "connect", None)):
-                    close_signal.connect(on_web_console_close_requested)
+                    hidden_signal.connect(on_console_hidden)
             console_recovery_available = True
             set_ui_interaction_lock(True)
             web_console.set_state(web_control_state())
@@ -4545,12 +4533,18 @@ def run(
             except Exception as exc:
                 reload_status = "unavailable"
                 reload_message = "配置已保存；运行时配置未应用，需重启后生效"
+                module_failures: tuple[str, ...] = ()
                 logger.warning("runtime configuration reload failed: %s", type(exc).__name__)
             else:
                 reload_status = str(
                     reload_result.get("status", "unavailable")
                     if isinstance(reload_result, Mapping)
                     else "unavailable"
+                )
+                module_failures = (
+                    tuple(str(item)[:128] for item in reload_result.get("modules_failed", ()))
+                    if isinstance(reload_result, Mapping)
+                    else ()
                 )
                 if isinstance(reload_result, Mapping) and reload_result.get("rendering_status"):
                     renderer_receipt_status = (
@@ -4566,7 +4560,12 @@ def run(
                     if callable(renderer_result_setter):
                         renderer_result_setter(renderer_receipt)
                 if reload_status == "reloaded":
-                    if (
+                    if module_failures:
+                        reload_message = (
+                            "配置已保存；运行时已更新，但有 "
+                            f"{len(module_failures)} 个模块重载失败，请检查模块状态"
+                        )
+                    elif (
                         isinstance(reload_result, Mapping)
                         and reload_result.get("cleanup") == "restart_required"
                     ):
@@ -4595,6 +4594,10 @@ def run(
                     reload_message = "配置已保存；运行时配置未应用，需重启后生效"
             if console is not None:
                 console.set_status(reload_message)
+                if module_failures:
+                    refresh_modules = getattr(console, "refresh_module_status", None)
+                    if callable(refresh_modules):
+                        QTimer.singleShot(0, refresh_modules)
             else:
                 logger.info("model configuration reload status: %s", reload_status)
 
@@ -5006,59 +5009,18 @@ def run(
             except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
                 return
 
-    def on_console_close_requested() -> None:
-        """记录用户点击 Qt 控制台关闭按钮，区别于程序主动隐藏。"""
-
-        nonlocal console_close_requested
-        console_close_requested = True
-
     def on_console_hidden() -> None:
-        """隐藏控制台时撤销点击穿透，避免留下失去恢复入口的窗口。"""
+        """只同步可见控制面状态，隐藏不改写桌宠输入或中断对话/语音。"""
 
-        nonlocal console_recovery_available, console_close_requested
-        user_close = console_close_requested
-        console_close_requested = False
-        if user_close:
-            # 用户关闭只隐藏到托盘；保留桌宠当前输入状态，托盘的“恢复桌宠点击”
-            # 与 Ctrl+Shift+M 仍可重新取得控制台。隐藏不会停止对话、TTS 或运行时。
-            console_recovery_available = True
+        nonlocal console_recovery_available
+        setup_dialog = getattr(console, "_model_setup_dialog", None)
+        console_recovery_available = not shutting_down and any(
+            panel is not None and panel.isVisible()
+            for panel in (console, web_console, setup_dialog)
+        )
+        if not shutting_down and not console_recovery_available:
             restore_tight_layout_pet()
-            set_ui_interaction_lock(False)
-            return
-        if console is not None and not tight_layout_pet_hidden:
-            try:
-                console.set_compact_layout(False)
-            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-                pass
-        target = window if window is not None else web_host
-        locked_getter = getattr(target, "is_window_locked", None)
-        if callable(locked_getter):
-            try:
-                if bool(locked_getter()):
-                    # 锁定模式本身就是桌面歌词式的无输入状态；隐藏控制台
-                    # 不能自动解锁，否则用户的锁定操作会被关闭窗口悄悄撤销。
-                    if not click_through_recovery_available:
-                        console_recovery_available = True
-                        if console is not None:
-                            console.show_and_focus()
-                        return
-                    console_recovery_available = False
-                    restore_tight_layout_pet()
-                    set_ui_interaction_lock(False)
-                    return
-            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-                pass
-        result = restore_pet_input()
-        if _click_through_operation_succeeded(result, enabled=False):
-            console_recovery_available = False
-            restore_tight_layout_pet()
-            set_ui_interaction_lock(False)
-            return
-        # 清除标志失败时不能让控制台真正消失，否则窗口可能进入不可恢复
-        # 状态；保留控制台作为下一次重试入口。
-        console_recovery_available = True
-        if console is not None:
-            console.show_and_focus()
+        set_ui_interaction_lock(console_recovery_available)
 
     def set_console_click_through(enabled: bool) -> object:
         """由控制台切换点击穿透；开启前保持控制台可见作为恢复入口。"""
@@ -5112,6 +5074,7 @@ def run(
     def hide_pet_to_tray() -> object:
         """用户关闭桌宠窗口时只隐藏到托盘，保持对话和 TTS 运行。"""
 
+        nonlocal tight_layout_pet_hidden, tight_layout_pet_was_visible
         target = window if window is not None else web_host
         hide = getattr(target, "hide", None)
         if not callable(hide):
@@ -5124,17 +5087,43 @@ def run(
                 "reason": "pet window is unavailable",
             }
         try:
-            hide()
+            surface = window if window is not None else getattr(web_host, "view", None)
+            toggle = getattr(target, "toggle_visibility", None)
+            result: object | None = None
+            if surface is not None and surface.isVisible() and callable(toggle):
+                result = toggle()
+                # 窗口标志切换或 WebEngine 重建可能让宿主切换失败；
+                # 关闭请求仍必须尝试直接隐藏，并以实际可见状态生成回执。
+                if isinstance(result, Mapping) and result.get("visible") is False:
+                    tight_layout_pet_hidden = False
+                    tight_layout_pet_was_visible = False
+                    return {**result, "to_tray": True}
+                hide()
+            else:
+                hide()
+            visible_getter = getattr(surface, "isVisible", None) if surface is not None else None
+            visible = bool(visible_getter()) if callable(visible_getter) else False
+            if visible:
+                return {
+                    "status": "unavailable",
+                    "visible": True,
+                    "reason": "桌宠暂时无法隐藏",
+                }
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
             logger.warning("隐藏桌宠到托盘失败：%s", type(exc).__name__)
             return {"status": "unavailable", "visible": True, "reason": "桌宠暂时无法隐藏"}
-        set_ui_interaction_lock(False)
+        # 显式隐藏覆盖临时布局恢复意图；关闭控制台不能把桌宠再次拉回屏幕。
+        tight_layout_pet_hidden = False
+        tight_layout_pet_was_visible = False
         return {"status": "available", "visible": False, "to_tray": True}
 
     def toggle_pet_visibility() -> object:
         """切换桌宠显示状态，快捷键和控制台共用。"""
 
         target = window if window is not None else web_host
+        surface = window if window is not None else getattr(web_host, "view", None)
+        if surface is not None and surface.isVisible():
+            return _console_result("显示桌宠", hide_pet_to_tray())
         handler = getattr(target, "toggle_visibility", None)
         if callable(handler):
             return _console_result("显示桌宠", handler())
@@ -6383,9 +6372,6 @@ def run(
                 except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
                     logger.debug("failed to initialize console topmost status", exc_info=True)
             console.hidden.connect(on_console_hidden)
-            close_signal = getattr(console, "closeRequested", None)
-            if close_signal is not None and callable(getattr(close_signal, "connect", None)):
-                close_signal.connect(on_console_close_requested)
             position = current_pet_position()
             if position is not None:
                 console.set_position(*position)
@@ -6625,6 +6611,10 @@ def run(
             restore_action.triggered.connect(restore_pet_input)
             show_action = menu.addAction("显示桌宠")
             show_action.triggered.connect(show_pet)
+            hide_action = menu.addAction("隐藏桌宠")
+            hide_action.triggered.connect(hide_pet_to_tray)
+            chat_action = menu.addAction("打开对话")
+            chat_action.triggered.connect(prompt_text)
             center_action = menu.addAction("居中桌宠")
             center_action.triggered.connect(center_pet)
             topmost_action = menu.addAction("切换窗口置顶")
@@ -6642,12 +6632,21 @@ def run(
             tray.setIcon(icon)
             tray.setToolTip("MeaPet：点击穿透可在此恢复")
             tray.setContextMenu(menu)
+            tray.activated.connect(
+                lambda reason: (
+                    show_console()
+                    if reason == QSystemTrayIcon.ActivationReason.DoubleClick
+                    else None
+                )
+            )
             tray.show()
             tray_resources.extend(
                 (
                     menu,
                     restore_action,
                     show_action,
+                    hide_action,
+                    chat_action,
                     center_action,
                     topmost_action,
                     lock_action,

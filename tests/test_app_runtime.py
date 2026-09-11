@@ -482,6 +482,51 @@ def test_runtime_wires_and_hot_reloads_memory_policy(tmp_path: Path) -> None:
         asyncio.run(runtime.close())
 
 
+def test_runtime_configuration_reload_notifies_registered_modules(tmp_path: Path) -> None:
+    """站点配置热更必须经过统一模块中心的配置钩子。"""
+
+    initial = LoadedConfiguration(
+        tmp_path / "config.yaml",
+        {
+            "app": {"persona": {"name": "before"}},
+            "config": {"reload": {"enabled": False}},
+        },
+    )
+    runtime = build_runtime(initial, inspect_resources(tmp_path / "resources"))
+    seen: list[dict[str, object]] = []
+
+    class ReloadableModule:
+        def reload_configuration(self, values: Mapping[str, object]) -> None:
+            seen.append(dict(values))
+
+    runtime.modules.adopt("test_reloadable", ReloadableModule())
+
+    async def scenario() -> None:
+        result = await runtime.apply_configuration(
+            LoadedConfiguration(
+                initial.path,
+                {
+                    "app": {"persona": {"name": "after"}},
+                    "config": {"reload": {"enabled": False}},
+                },
+            )
+        )
+        assert result["status"] == "reloaded"
+        assert result["modules_status"] == "reloaded"
+        assert "test_reloadable" in result["modules_reloaded"]
+        assert seen == [
+            {
+                "app": {"persona": {"name": "after"}},
+                "config": {"reload": {"enabled": False}},
+            }
+        ]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(runtime.close())
+
+
 def test_runtime_wires_optional_x11_system_idle_provider_and_hot_reloads(
     tmp_path: Path, monkeypatch
 ) -> None:
