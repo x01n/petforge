@@ -387,7 +387,7 @@ if pyside6_available:
                     self.renderer.draw()
                 except Exception as exc:
                     logger.warning(
-                        "Live2D draw failed; using sprite fallback: %s", type(exc).__name__
+                        "Live2D draw failed; renderer remains unavailable: %s", type(exc).__name__
                     )
                     self._activate_fallback()
             if isinstance(self.renderer, SpriteRenderer):
@@ -938,7 +938,7 @@ if pyside6_available:
                     self.renderer.advance(now - self._last_frame_at)
                 except Exception as exc:
                     logger.warning(
-                        "Live2D update failed; using sprite fallback: %s", type(exc).__name__
+                        "Live2D update failed; renderer remains unavailable: %s", type(exc).__name__
                     )
                     self._activate_fallback()
             self._last_frame_at = now
@@ -1631,9 +1631,8 @@ if pyside6_available:
             """返回拖动、系统移动或鼠标悬停是否正在进行。"""
 
             if isinstance(self.renderer, Live2DRenderer) and self.renderer.model is None:
-                # 原生模型尚未完成初始化时不要让自主行为移动窗口；若宿主
-                # 已切换到精灵回退，renderer 不再是 Live2DRenderer，行为会
-                # 在下一轮正常恢复。
+                # 原生模型尚未完成初始化时不要让自主行为移动窗口；
+                # 默认宿主不会切换到精灵，重载或重启完成后再恢复行为。
                 return True
             if self._window_locked:
                 return False

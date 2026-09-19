@@ -204,9 +204,10 @@ class SenseVoiceWorker:
             return
         cancel.set()
         _emit("cancelled", request_id=request_id, fields={"cancelled": True})
-        # FunASR 的同步 generate 无可中断句柄。确认取消后退出 worker，
-        # 由框架在下次调用时干净重载，绝不让旧推理与新请求并发访问模型。
-        self._stopping = True
+        # FunASR 的同步 generate 无可中断句柄，旧聚合消失运行在别处；
+        # 与 TTS/cancel 对齐：只取消当次任务，worker 进程与已加载的
+        # SenseVoice 模型保留，下一次 transcribe 可立即复用。协议损坏
+        # 或 shutdown 命令才会真正退出 worker 主循环。
 
     def shutdown(self, request_id: str) -> None:
         self._stopping = True

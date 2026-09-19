@@ -357,6 +357,67 @@ def test_execute_batch_parallelizes_safe_reads_and_preserves_order() -> None:
     assert [item.content["value"] for item in outcomes] == [1, 2]
 
 
+def test_execute_batch_cleans_sibling_tasks_when_parallel_call_raises() -> None:
+    """并行批次中的一个工具异常退出时，兄弟调用必须被取消。"""
+
+    class BatchFailure(BaseException):
+        pass
+
+    started = 0
+    both_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+
+    async def handler(arguments, _context):
+        nonlocal started
+        started += 1
+        if started == 2:
+            both_started.set()
+        await both_started.wait()
+        if arguments["name"] == "failing":
+            raise BatchFailure("batch failure")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_cancelled.set()
+
+    async def scenario() -> None:
+        registry = ToolRegistry()
+        for name in ("failing", "sibling"):
+            registry.register(
+                ToolSpec(
+                    f"system:batch_{name}",
+                    name,
+                    {"type": "object", "properties": {"name": {"type": "string"}}},
+                    handler,
+                    RiskLevel.LOW,
+                    read_only=True,
+                )
+            )
+        executor = ToolExecutionService(
+            registry,
+            PermissionService(auto_allow_low_risk=True),
+        )
+        with pytest.raises(BatchFailure, match="batch failure"):
+            await executor.execute_batch(
+                (
+                    {
+                        "call_id": "failing-call",
+                        "identity": "system:batch_failing",
+                        "arguments": {"name": "failing"},
+                    },
+                    {
+                        "call_id": "sibling-call",
+                        "identity": "system:batch_sibling",
+                        "arguments": {"name": "sibling"},
+                    },
+                ),
+                context=ToolCallContext("profile", "session", "batch-cancel"),
+            )
+        assert sibling_cancelled.is_set()
+
+    asyncio.run(scenario())
+
+
 def test_execute_batch_stops_after_approval_and_returns_safe_skips() -> None:
     calls: list[str] = []
 
@@ -450,6 +511,69 @@ def test_execute_plan_resolves_dependency_layers_and_parallelizes_safe_reads() -
     assert calls[2:] == ["c"]
     assert [outcome.call_id for outcome in result.outcomes] == ["call-a", "call-b", "call-c"]
     assert [item.parallel_group for item in result.audit] == [1, 1, 2]
+
+
+def test_execute_plan_cleans_sibling_tasks_when_parallel_step_raises() -> None:
+    """不可恢复的工具异常退出时，并行计划必须清理同层兄弟任务。"""
+
+    class ParallelFailure(BaseException):
+        pass
+
+    started = 0
+    both_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+
+    async def handler(arguments, _context):
+        nonlocal started
+        started += 1
+        if started == 2:
+            both_started.set()
+        await both_started.wait()
+        if arguments["name"] == "failing":
+            raise ParallelFailure("parallel failure")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_cancelled.set()
+
+    async def scenario() -> None:
+        registry = ToolRegistry()
+        for name in ("failing", "sibling"):
+            registry.register(
+                ToolSpec(
+                    f"system:parallel_{name}",
+                    name,
+                    {"type": "object", "properties": {"name": {"type": "string"}}},
+                    handler,
+                    RiskLevel.LOW,
+                    read_only=True,
+                )
+            )
+        executor = ToolExecutionService(
+            registry,
+            PermissionService(auto_allow_low_risk=True),
+        )
+        with pytest.raises(ParallelFailure, match="parallel failure"):
+            await executor.execute_plan(
+                (
+                    ToolPlanStep(
+                        "failing",
+                        "parallel-failing",
+                        "system:parallel_failing",
+                        {"name": "failing"},
+                    ),
+                    ToolPlanStep(
+                        "sibling",
+                        "parallel-sibling",
+                        "system:parallel_sibling",
+                        {"name": "sibling"},
+                    ),
+                ),
+                context=ToolCallContext("profile", "session", "parallel-cleanup"),
+            )
+        assert sibling_cancelled.is_set()
+
+    asyncio.run(scenario())
 
 
 def test_execute_plan_stops_before_unstarted_dependent_steps_on_approval() -> None:
@@ -597,6 +721,12 @@ def test_execute_plan_resolves_result_reference_and_resumes_after_approval() -> 
             approved,
             context=context,
         )
+        assert first.checkpoint.plan_id
+        resumed_records = tuple(
+            item for item in executor.execution_records() if item.step_id in {"ocr", "click"}
+        )
+        assert resumed_records
+        assert {item.plan_id for item in resumed_records} == {first.checkpoint.plan_id}
         return first, second
 
     first, second = asyncio.run(scenario())
@@ -1431,7 +1561,8 @@ def test_scheduler_records_action_error_without_stopping_tick() -> None:
     )
     now[0] = 102.0
     assert asyncio.run(scheduler.tick()) == ("task-1",)
-    assert "transient" in str(scheduler.status()["last_error"])
+    # 第 9 轮起状态接口只回传异常类名，正文不再外泄。
+    assert scheduler.status()["last_error"] == "RuntimeError"
 
 
 def test_builtin_speak_passes_conversation_context_to_tts() -> None:
@@ -3133,7 +3264,7 @@ def test_scheduler_stop_cancels_blocked_action() -> None:
         task_id="blocked",
         name="blocked",
         expression="every:1s",
-        action={"identity": "pet:ping"},
+        action={"identity": "pet:play_motion", "arguments": {"name": "wave"}},
         owner="test",
     )
     now[0] = 2.0

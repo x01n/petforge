@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 import time
 
@@ -59,6 +60,39 @@ def test_watcher_emits_only_on_identity_change_and_supports_initial_snapshot():
 
     asyncio.run(scenario())
     assert [item["window_id"] for item in seen] == ["one", "two"]
+
+
+def test_watcher_logs_window_changes_and_exposes_poll_counters(caplog):
+    snapshot = {
+        "status": "available",
+        "backend": "x11",
+        "window_id": "one",
+        "app_id": "app",
+        "pid": 1,
+        "process_name": "app",
+    }
+    triggers = TriggerService()
+    watcher = DesktopWindowWatcher(
+        platform=FakePlatform([snapshot]),
+        triggers=triggers,
+        emit_initial=True,
+    )
+    caplog.set_level("INFO", logger="services.scheduler.watcher")
+
+    asyncio.run(watcher.poll_once())
+
+    payloads = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "services.scheduler.watcher"
+    ]
+    assert [item["event"] for item in payloads] == ["scheduler.window.changed"]
+    assert payloads[0]["reason_code"] == "initial"
+    status = watcher.status()
+    assert status["poll_count"] == 1
+    assert status["change_count"] == 1
+    assert status["failure_count"] == 0
+    assert status["last_duration_ms"] >= 0
 
 
 def test_watcher_platform_failure_is_reported_without_task_failure():

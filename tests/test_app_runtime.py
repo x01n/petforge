@@ -45,11 +45,29 @@ from gui.qt6.app import (
     _runtime_module_test,
     _schedule_pet_affection,
     _speech_queue_blocked,
+    _web_control_state_signature,
     _write_restart_ready_receipt,
 )
 from gui.qt6.dispatcher import _cancel_pending_futures
 from services.tools.permissions import PermissionDecision
 from services.tools.types import RiskLevel, ToolCallContext, ToolSpec
+
+
+def test_web_control_state_signature_ignores_revision_without_mutating_state() -> None:
+    state = {
+        "revision": 3,
+        "updated_at": 12.5,
+        "interaction": {"phase": "idle", "text": "你好"},
+    }
+    original = dict(state)
+
+    assert _web_control_state_signature(state) == _web_control_state_signature(
+        {**state, "revision": 99}
+    )
+    assert _web_control_state_signature(state) != _web_control_state_signature(
+        {**state, "interaction": {"phase": "busy", "text": "你好"}}
+    )
+    assert state == original
 
 
 def test_missing_api_key_reference_is_the_only_unresolved_secret_case_allowed() -> None:
@@ -720,6 +738,262 @@ def test_runtime_hot_reloads_windows_system_idle_provider(tmp_path: Path) -> Non
         asyncio.run(runtime.close())
 
 
+def test_scheduler_configuration_rolls_back_entries_and_activity_on_failure(
+    tmp_path: Path,
+) -> None:
+    """调度热重载失败时不能留下任务、触发器或活跃参数的半应用状态。"""
+
+    config_path = tmp_path / "scheduler-transaction.yaml"
+    database_path = tmp_path / "scheduler-transaction.sqlite3"
+    baseline_scheduler = {
+        "enabled": False,
+        "activity": {
+            "enabled": True,
+            "idle_seconds": 300,
+            "poll_seconds": 0.5,
+            "system_idle_provider": "disabled",
+        },
+        "tasks": [
+            {
+                "task_id": "baseline-task",
+                "name": "基线任务",
+                "expression": "every:1h",
+                "action": {"identity": "pet:speak", "arguments": {"text": "基线"}},
+            }
+        ],
+        "triggers": [
+            {
+                "trigger_id": "baseline-trigger",
+                "event_name": "startup",
+                "action": {"identity": "pet:speak", "arguments": {"text": "基线触发器"}},
+            }
+        ],
+    }
+    runtime = build_runtime(
+        LoadedConfiguration(
+            config_path,
+            {"storage": {"database": str(database_path)}, "scheduler": baseline_scheduler},
+        ),
+        inspect_resources(tmp_path / "resources"),
+    )
+
+    async def scenario() -> None:
+        assert runtime.activity is not None
+        baseline_tasks = runtime.scheduler.list_tasks()
+        baseline_task_snapshots = tuple(
+            runtime.scheduler._snapshot(task) for task in runtime.scheduler._tasks.values()
+        )
+        baseline_triggers = tuple(
+            runtime.triggers._snapshot(trigger) for trigger in runtime.triggers._triggers.values()
+        )
+        baseline_activity = runtime.activity.status()
+        original_reconfigure = runtime.activity.reconfigure
+        calls = 0
+
+        def fail_once(*args: object, **kwargs: object) -> object:
+            nonlocal calls
+            calls += 1
+            result = original_reconfigure(*args, **kwargs)
+            if calls == 1:
+                raise RuntimeError("injected activity reconfigure failure")
+            return result
+
+        runtime.activity.reconfigure = fail_once  # type: ignore[method-assign]
+        updated_scheduler = {
+            "enabled": False,
+            "activity": {
+                "enabled": False,
+                "idle_seconds": 120,
+                "poll_seconds": 1.0,
+                "system_idle_provider": "disabled",
+            },
+            "tasks": [
+                {
+                    "task_id": "replacement-task",
+                    "name": "替换任务",
+                    "expression": "every:2h",
+                    "action": {"identity": "pet:speak", "arguments": {"text": "替换"}},
+                }
+            ],
+            "triggers": [
+                {
+                    "trigger_id": "replacement-trigger",
+                    "event_name": "idle",
+                    "action": {"identity": "pet:speak", "arguments": {"text": "替换触发器"}},
+                }
+            ],
+        }
+        with pytest.raises(RuntimeError, match="injected activity reconfigure failure"):
+            await runtime._apply_scheduler_configuration({"scheduler": updated_scheduler})
+
+        # 回滚直接恢复锁内快照，不再次调用已失败的 setter。
+        assert calls == 1
+        assert runtime.scheduler.list_tasks() == baseline_tasks
+        assert (
+            tuple(runtime.scheduler._snapshot(task) for task in runtime.scheduler._tasks.values())
+            == baseline_task_snapshots
+        )
+        assert (
+            tuple(
+                runtime.triggers._snapshot(trigger)
+                for trigger in runtime.triggers._triggers.values()
+            )
+            == baseline_triggers
+        )
+        assert runtime.activity.status()["enabled"] == baseline_activity["enabled"]
+        assert runtime.activity.status()["idle_seconds"] == baseline_activity["idle_seconds"]
+        assert runtime.activity.status()["poll_seconds"] == baseline_activity["poll_seconds"]
+        store = runtime.scheduler._state_store
+        assert store is not None
+        assert tuple(item["task_id"] for item in store.load_tasks()) == ("baseline-task",)
+        assert tuple(item["trigger_id"] for item in store.load_triggers()) == ("baseline-trigger",)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(runtime.close())
+
+
+def test_scheduler_configuration_rolls_back_running_state_when_stop_fails(
+    tmp_path: Path,
+) -> None:
+    """scheduler.stop 已部分执行后失败，也必须恢复原来的运行态和条目。"""
+
+    config_path = tmp_path / "scheduler-stop-transaction.yaml"
+    runtime = build_runtime(
+        LoadedConfiguration(
+            config_path,
+            {
+                "storage": {"database": str(tmp_path / "scheduler-stop.sqlite3")},
+                "scheduler": {
+                    "enabled": True,
+                    "tasks": [
+                        {
+                            "task_id": "running-baseline",
+                            "name": "运行基线",
+                            "expression": "every:1h",
+                            "action": {"identity": "pet:speak", "arguments": {"text": "基线"}},
+                        }
+                    ],
+                    "triggers": [],
+                },
+            },
+        ),
+        inspect_resources(tmp_path / "resources"),
+    )
+
+    async def scenario() -> None:
+        runtime._background_started = True
+        await runtime.scheduler.start(poll_seconds=0.25)
+        assert runtime.scheduler.status()["running"] is True
+        baseline = runtime.scheduler.list_tasks()
+        original_stop = runtime.scheduler.stop
+        calls = 0
+
+        async def fail_once() -> None:
+            nonlocal calls
+            calls += 1
+            await original_stop()
+            if calls == 1:
+                raise RuntimeError("injected scheduler stop failure")
+
+        runtime.scheduler.stop = fail_once  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="injected scheduler stop failure"):
+            await runtime._apply_scheduler_configuration(
+                {
+                    "scheduler": {
+                        "enabled": False,
+                        "tasks": [
+                            {
+                                "task_id": "replacement-running",
+                                "name": "替换运行任务",
+                                "expression": "every:2h",
+                                "action": {
+                                    "identity": "pet:speak",
+                                    "arguments": {"text": "替换"},
+                                },
+                            }
+                        ],
+                        "triggers": [],
+                    }
+                }
+            )
+        assert calls == 1
+        assert runtime.scheduler.status()["running"] is True
+        assert runtime.scheduler.list_tasks() == baseline
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(runtime.close())
+
+
+def test_scheduler_configuration_rolls_back_entries_when_start_fails(
+    tmp_path: Path,
+) -> None:
+    """scheduler.start 失败时，配置条目和原停止态都应保持不变。"""
+
+    config_path = tmp_path / "scheduler-start-transaction.yaml"
+    runtime = build_runtime(
+        LoadedConfiguration(
+            config_path,
+            {
+                "storage": {"database": str(tmp_path / "scheduler-start.sqlite3")},
+                "scheduler": {
+                    "enabled": False,
+                    "tasks": [
+                        {
+                            "task_id": "stopped-baseline",
+                            "name": "停止基线",
+                            "expression": "every:1h",
+                            "action": {"identity": "pet:speak", "arguments": {"text": "基线"}},
+                        }
+                    ],
+                    "triggers": [],
+                },
+            },
+        ),
+        inspect_resources(tmp_path / "resources"),
+    )
+
+    async def scenario() -> None:
+        runtime._background_started = True
+        baseline = runtime.scheduler.list_tasks()
+
+        async def fail_start(*, poll_seconds: float = 0.5) -> None:
+            del poll_seconds
+            raise RuntimeError("injected scheduler start failure")
+
+        runtime.scheduler.start = fail_start  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="injected scheduler start failure"):
+            await runtime._apply_scheduler_configuration(
+                {
+                    "scheduler": {
+                        "enabled": True,
+                        "tasks": [
+                            {
+                                "task_id": "replacement-start",
+                                "name": "替换启动任务",
+                                "expression": "every:2h",
+                                "action": {
+                                    "identity": "pet:speak",
+                                    "arguments": {"text": "替换"},
+                                },
+                            }
+                        ],
+                        "triggers": [],
+                    }
+                }
+            )
+        assert runtime.scheduler.status()["running"] is False
+        assert runtime.scheduler.list_tasks() == baseline
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(runtime.close())
+
+
 def test_build_runtime_persists_scheduler_tasks_across_restart(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     database_path = tmp_path / "state.sqlite3"
@@ -929,11 +1203,11 @@ def test_scheduler_and_trigger_reject_orphan_approval_actions(tmp_path: Path) ->
         task.next_run_at = 0.0
         assert await runtime.scheduler.tick(now=1.0) == ("approval-task",)
         assert runtime.tools.pending_approvals() == ()
-        assert "interactive approval" in str(runtime.scheduler.status()["last_error"])
+        assert str(runtime.scheduler.status()["last_error"]) == "PermissionError"
 
         assert await runtime.triggers.emit("startup", {}) == ("approval-trigger",)
         assert runtime.tools.pending_approvals() == ()
-        assert "interactive approval" in str(runtime.triggers.status()["last_error"])
+        assert str(runtime.triggers.status()["last_error"]) == "PermissionError"
 
     try:
         asyncio.run(scenario())
@@ -3202,6 +3476,79 @@ def test_invalid_scheduler_configuration_does_not_create_database(tmp_path: Path
     with pytest.raises(ConfigurationError):
         build_runtime(configuration, inspect_resources(tmp_path / "resources"))
     assert not database_path.exists()
+
+
+def test_scheduler_configuration_rejects_non_config_owner_before_reload_mutation(
+    tmp_path: Path,
+) -> None:
+    """YAML 热重载只能维护 config owner，不能创建或覆盖其他 owner 条目。"""
+
+    config_path = tmp_path / "scheduler-owner.yaml"
+    initial = LoadedConfiguration(
+        config_path,
+        {
+            "scheduler": {
+                "tasks": [
+                    {
+                        "task_id": "config-task",
+                        "name": "保留任务",
+                        "expression": "every:1h",
+                        "action": {"identity": "pet:ping"},
+                    }
+                ],
+                "triggers": [
+                    {
+                        "trigger_id": "config-trigger",
+                        "event_name": "startup",
+                        "action": {"identity": "pet:ping"},
+                    }
+                ],
+            }
+        },
+    )
+    runtime = build_runtime(initial, inspect_resources(tmp_path / "resources"))
+    try:
+        baseline_tasks = runtime.scheduler.list_tasks(owner="config")
+        baseline_triggers = runtime.triggers.list_triggers(owner="config")
+
+        invalid_sections = (
+            {
+                "tasks": [
+                    {
+                        "task_id": "new-profile-task",
+                        "name": "越权任务",
+                        "expression": "every:1h",
+                        "action": {"identity": "pet:ping"},
+                        "owner": "profile:session",
+                    }
+                ],
+                "triggers": [],
+            },
+            {
+                "tasks": [],
+                "triggers": [
+                    {
+                        "trigger_id": "new-profile-trigger",
+                        "event_name": "startup",
+                        "action": {"identity": "pet:ping"},
+                        "owner": "profile:session",
+                    }
+                ],
+            },
+        )
+        for scheduler_values in invalid_sections:
+            result = asyncio.run(
+                runtime.apply_configuration(
+                    LoadedConfiguration(config_path, {"scheduler": scheduler_values})
+                )
+            )
+            assert result["status"] == "unavailable"
+            assert runtime.scheduler.list_tasks(owner="config") == baseline_tasks
+            assert runtime.triggers.list_triggers(owner="config") == baseline_triggers
+            assert runtime.scheduler.list_tasks(owner="profile:session") == ()
+            assert runtime.triggers.list_triggers(owner="profile:session") == ()
+    finally:
+        asyncio.run(runtime.close())
 
 
 def test_cli_validate_rejects_invalid_runtime_without_creating_database(tmp_path: Path) -> None:

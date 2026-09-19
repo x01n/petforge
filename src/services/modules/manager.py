@@ -462,7 +462,9 @@ class ModuleManager:
                 result = callback(argument)
                 if inspect.isawaitable(result):
                     result = await result
-                if callback_with_context and result is not None and result is not record.instance:
+                # reload_configuration 与 reload 都允许先完成配置预检后返回新实例。
+                # 此前只有 reload 分支消费该返回值，导致配置热更看似成功但实际仍运行旧实例。
+                if result is not None and result is not record.instance:
                     replacement = result
 
                     def factory(

@@ -130,6 +130,48 @@ def _safe_device_pixel_ratio(value: object, *, default: float = 1.0) -> float:
     return max(0.1, min(8.0, numeric))
 
 
+def probe_live2d_vulkan_runtime(
+    importer: Callable[[str], Any] | None = None,
+) -> VulkanRuntimeProbe:
+    """探测独立的 Live2D Vulkan 提供者契约。
+
+    Qt Quick 暴露 Vulkan API 只能证明场景图可以创建 Vulkan surface，不能
+    证明它拥有 Cubism Core 的模型更新、网格上传和绘制实现。独立提供者必须
+    暴露完整生命周期入口，缺少任一入口都保持不可用。
+    """
+
+    loader = importer or importlib.import_module
+    try:
+        provider = loader("live2d.vulkan")
+    except (
+        ImportError,
+        ModuleNotFoundError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        SystemError,
+    ) as exc:
+        return VulkanRuntimeProbe(
+            False,
+            "Live2D Vulkan provider is unavailable",
+            ("missing:live2d.vulkan", type(exc).__name__),
+        )
+
+    required = ("create", "load_model", "resize", "render", "shutdown")
+    missing = tuple(name for name in required if not callable(getattr(provider, name, None)))
+    if missing:
+        return VulkanRuntimeProbe(
+            False,
+            "Live2D Vulkan provider contract is incomplete",
+            tuple(f"missing:live2d.vulkan.{name}" for name in missing),
+        )
+    return VulkanRuntimeProbe(
+        True,
+        "Live2D Vulkan provider contract is available",
+        tuple(f"present:live2d.vulkan.{name}" for name in required),
+    )
+
+
 class Reserved3DRenderer:
     """旧 API 的失败关闭对象；默认注册表不再使用该类型。"""
 
@@ -221,4 +263,9 @@ class Reserved3DRenderer:
         )
 
 
-__all__ = ["Reserved3DRenderer", "VulkanRuntimeProbe", "probe_qt_vulkan_runtime"]
+__all__ = [
+    "Reserved3DRenderer",
+    "VulkanRuntimeProbe",
+    "probe_live2d_vulkan_runtime",
+    "probe_qt_vulkan_runtime",
+]

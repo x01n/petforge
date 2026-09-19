@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 import sys
+import warnings
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -182,9 +184,16 @@ def default_configuration_values(
                     "pet:play_motion",
                     "pet:speak",
                     "pet:set_click_through",
+                    "pet:list_models",
+                    "pet:switch_model",
                 ],
                 "pet_diary": ["pet:diary_write", "pet:diary_recall"],
-                "scheduler": ["scheduler:upsert"],
+                "scheduler": [
+                    "scheduler:upsert",
+                    "scheduler:list",
+                    "scheduler:remove",
+                    "scheduler:set_trigger",
+                ],
                 "system": [
                     "system:module_status",
                     "system:transcribe_audio",
@@ -197,6 +206,10 @@ def default_configuration_values(
                 "allow": [],
                 "deny": [],
                 "approval_ttl_seconds": 90,
+                "xml_approve_enabled": False,
+                # XML approve 有界放行窗口：只覆盖当回合被拦截的身份，
+                # 风险不高于 MEDIUM；过期或会话不匹配时审批照旧。
+                "xml_approve_window_seconds": 15,
             },
             "command_allowlist": [],
         },
@@ -395,6 +408,24 @@ def default_configuration_values(
                 "max_steps": 64,
             },
             "actions": [],
+        },
+        # 情绪状态：词汇集统一为 9 值；陈旧心情由模型按人设判断是否更新，
+        # proactive 按心情系数调整背景主动频率。三项均支持运行期热重载。
+        "mood": {
+            "decay_enabled": True,
+            "decay_after_seconds": 14400,
+            "decay_prompt_probability": 0.5,
+            "proactive_mood_gate": {
+                "enabled": True,
+                "multipliers": {
+                    "烦躁": 0.5,
+                    "生气": 0.5,
+                    "难过": 0.5,
+                    "高兴": 1.2,
+                    "期待": 1.2,
+                    "好奇": 1.2,
+                },
+            },
         },
         "proactive": {
             "enabled": False,
@@ -1098,9 +1129,33 @@ def _unique_paths(paths: list[Path]) -> tuple[Path, ...]:
     return tuple(result)
 
 
-def _find_project_root(start: Path) -> Path:
-    """从启动目录向上寻找当前源码项目根；找不到时保留启动目录。"""
+def _cwd_repository_ignored(environment: Mapping[str, str]) -> bool:
+    """解析 ``MEAPET_IGNORE_CWD_REPO`` 开关；缺失或空串保持默认关闭。
 
+    环境键缺失时保持默认关闭；显式出现时才走严格布尔解析，避免空串
+    触发 parse_bool 的类型拒绝。
+    """
+
+    raw_flag = str(environment.get("MEAPET_IGNORE_CWD_REPO", "") or "").strip()
+    return bool(raw_flag) and parse_bool(
+        raw_flag,
+        field_name="MEAPET_IGNORE_CWD_REPO",
+        default=False,
+    )
+
+
+def _find_project_root(start: Path, *, environment: Mapping[str, str] | None = None) -> Path:
+    """从启动目录向上寻找当前源码项目根；找不到时保留启动目录。
+
+    托盘或快捷方式常以无关目录为 cwd 启动；当 ``MEAPET_IGNORE_CWD_REPO=1``
+    时不再从 cwd 向上探测仓库根，避免把错误仓库当作资源与配置基准。显式
+    ``path``、``MEAPET_CONFIG`` 与用户目录的发现不受影响。默认关闭保持
+    既有语义不变。
+    """
+
+    env = os.environ if environment is None else environment
+    if _cwd_repository_ignored(env):
+        return start
     for directory in (start, *start.parents):
         if (directory / "pyproject.toml").is_file() or (
             directory / "vivid-gliding-boot.md"
@@ -1145,18 +1200,66 @@ def _user_configuration_paths(
     return _unique_paths([root / name for root in roots for name in names])
 
 
-def _user_data_directory(*, environment: Mapping[str, str], home: Path) -> Path:
-    """返回首次启动数据库的用户可写目录。"""
+def _directory_usable(path: Path) -> bool:
+    """候选数据目录必须能够实际创建；探测失败按不可用处理。
+
+    首次启动本来就需要创建用户数据目录；把 mkdir 纳入选择探测能让
+    ``Database`` 随后的 exist_ok 创建保持幂等，并让权限失败在选择阶段
+    即被感知，从而回落到备用目录而不是在数据库初始化时才抛错。
+    """
+
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        status = path.stat()
+        return stat.S_ISDIR(status.st_mode)
+    except (NotADirectoryError, OSError):
+        return False
+
+
+def _user_data_directory(
+    *,
+    environment: Mapping[str, str],
+    home: Path,
+    fallback: Path | None = None,
+) -> Path:
+    """返回首次启动数据库的用户可写目录。
+
+    与 ``_user_configuration_paths`` 同层级保持一致：XDG 小写 ``meapet``，
+    APPDATA/macOS 沿用 ``MeaPet``（既有 Windows 平台测试锁定的层级）。
+    候选目录不可用（如同名文件占位或创建失败）时依次回落到 ``fallback``
+    与 ``home/.meapet-data``；仅探测和创建目录本身，不写入配置。
+    """
 
     xdg_root = str(environment.get("XDG_DATA_HOME", "")).strip()
     appdata_root = str(environment.get("APPDATA", "")).strip()
     if xdg_root:
-        return (Path(xdg_root).expanduser() / "meapet").resolve()
-    if appdata_root:
-        return (Path(appdata_root).expanduser() / "MeaPet" / "data").resolve()
-    if sys.platform == "darwin":
-        return (home / "Library" / "Application Support" / "MeaPet" / "data").resolve()
-    return (home / ".local" / "share" / "meapet").resolve()
+        primary = (Path(xdg_root).expanduser() / "meapet").resolve()
+    elif appdata_root:
+        primary = (Path(appdata_root).expanduser() / "MeaPet" / "data").resolve()
+    elif sys.platform == "darwin":
+        primary = (home / "Library" / "Application Support" / "MeaPet" / "data").resolve()
+    else:
+        primary = (home / ".local" / "share" / "meapet").resolve()
+    if _directory_usable(primary):
+        return primary
+    if fallback is not None:
+        fallback = Path(fallback).expanduser().resolve()
+        if _directory_usable(fallback):
+            warnings.warn(
+                f"user data directory '{primary}' is unavailable; falling back to '{fallback}'",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return fallback
+    directory = (home / ".meapet-data").resolve()
+    if _directory_usable(directory) and directory != primary:
+        warnings.warn(
+            f"user data directory '{primary}' is unavailable; falling back to '{directory}'",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return directory
+    return primary
 
 
 def _resource_root_for_project(project_root: Path) -> Path:
@@ -1168,17 +1271,39 @@ def _resource_root_for_project(project_root: Path) -> Path:
 
 
 def _write_default_configuration(path: Path, values: Mapping[str, Any]) -> bool:
-    """尽力写入安全默认配置；权限受限时由调用方使用内存配置。"""
+    """尽力写入安全默认配置；目录创建被拒绝时回落到 ``home/.meapet-data``。
 
+    首次启动的配置与数据库目录不可写不能阻断启动：尝试主目录，失败后
+    用与 ``_user_data_directory`` 同风格的昵称目录兜底；两者都失败时
+    返回 False，由调用方使用等价内存配置。
+    """
+
+    targets = [path]
+    fallback_database = Path(str(values.get("storage", {}).get("database", ""))).expanduser()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            yaml.safe_dump(dict(values), allow_unicode=True, sort_keys=False),
-            encoding="utf-8",
+        home_target = _user_data_directory(
+            environment=dict(os.environ),
+            home=Path.home().expanduser().resolve(),
+            fallback=fallback_database.parent if str(fallback_database) else None,
         )
-    except OSError:
-        return False
-    return True
+    except (OSError, RuntimeError, ValueError):
+        home_target = fallback_database.parent if str(fallback_database) else None
+    if home_target is not None:
+        try:
+            targets.append(home_target.resolve() / "config.yaml")
+        except OSError:
+            pass
+    for target in targets:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                yaml.safe_dump(dict(values), allow_unicode=True, sort_keys=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            continue
+        return True
+    return False
 
 
 def discover_configuration(
@@ -1201,8 +1326,12 @@ def discover_configuration(
     env = dict(os.environ if environment is None else environment)
     start = Path.cwd() if cwd is None else Path(cwd)
     start = start.expanduser().resolve()
-    detected_root = _find_project_root(start)
-    roots = [start, detected_root]
+    detected_root = _find_project_root(start, environment=env)
+    # 开关打开时不把启动目录或仓库探测结果作为仓库根候选，避免托盘/
+    # 快捷方式 cwd 恰好是别的仓库时采纳错误 config；显式 project_root
+    # 与模块根仍然保留，用户目录发现不受影响。默认关闭保持既有语义。
+    ignore_cwd_repository = _cwd_repository_ignored(env)
+    roots: list[Path] = [] if ignore_cwd_repository else [start, detected_root]
     provided_root: Path | None = None
     if project_root is not None:
         provided_root = Path(project_root).expanduser()
@@ -1285,10 +1414,19 @@ def discover_configuration(
     target = user_paths[0]
     if create_default:
         _write_default_configuration(target, defaults)
-    # 生成失败时仍返回同一份安全值；路径保持目标位置，后续数据库和相对资源
+    # 主路径不可写时退回与数据目录同风格的 home/.meapet-data 兜底；
+    # 仍失败则返回同一份安全值，路径保持目标位置，后续数据库和相对资源
     # 解析不会依赖当前进程目录。
     if target.is_file():
         return load_configuration(target, defaults=defaults, environment=env)
+    try:
+        fallback_home = _user_data_directory(environment=env, home=home_path)
+    except (OSError, RuntimeError, ValueError):
+        fallback_home = None
+    if fallback_home is not None:
+        fallback_path = fallback_home / "config.yaml"
+        if fallback_path.is_file():
+            return load_configuration(fallback_path, defaults=defaults, environment=env)
     return LoadedConfiguration(path=target, values=defaults)
 
 

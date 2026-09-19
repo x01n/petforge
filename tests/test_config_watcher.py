@@ -51,7 +51,6 @@ def test_watcher_ignores_initial_content_and_same_content_rewrites(tmp_path: Pat
     asyncio.run(scenario())
 
 
-
 def test_watcher_rechecks_fingerprint_before_callback(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     _write(path, "app:\n  name: first\n")

@@ -608,6 +608,72 @@ def test_bounded_http_sse_allows_multiple_bounded_events() -> None:
     asyncio.run(run())
 
 
+def test_stdio_tools_list_has_page_and_entry_bounds() -> None:
+    class _PagedClient(StdioMCPClient):
+        def __init__(self) -> None:
+            super().__init__({"name": "paged-stdio", "command": ("unused",)})
+            self.calls = 0
+
+        async def request(self, _method: str, _params: dict[str, object]) -> dict[str, object]:
+            self.calls += 1
+            return {
+                "tools": [{"name": f"tool-{self.calls}"}],
+                "nextCursor": str(self.calls),
+            }
+
+    async def run() -> None:
+        client = _PagedClient()
+        with pytest.raises(MCPProtocolError, match="page limit"):
+            await client.list_tools()
+        assert client.calls == 64
+
+    asyncio.run(run())
+
+
+def test_http_tools_list_has_page_and_entry_bounds() -> None:
+    class _PagedClient(HTTPMCPClient):
+        def __init__(self) -> None:
+            super().__init__(
+                {
+                    "name": "paged-http",
+                    "url": "https://example.test/mcp",
+                }
+            )
+            self.calls = 0
+
+        async def request(self, _method: str, _params: dict[str, object]) -> dict[str, object]:
+            self.calls += 1
+            return {
+                "tools": [{"name": f"tool-{self.calls}"}],
+                "nextCursor": str(self.calls),
+            }
+
+    async def run() -> None:
+        client = _PagedClient()
+        with pytest.raises(MCPProtocolError, match="page limit"):
+            await client.list_tools()
+        assert client.calls == 64
+
+    asyncio.run(run())
+
+
+def test_tools_list_rejects_more_than_entry_limit() -> None:
+    class _LargePageClient(StdioMCPClient):
+        def __init__(self) -> None:
+            super().__init__({"name": "large-page", "command": ("unused",)})
+
+        async def request(self, _method: str, _params: dict[str, object]) -> dict[str, object]:
+            return {
+                "tools": [{"name": f"tool-{index}"} for index in range(1025)],
+            }
+
+    async def run() -> None:
+        with pytest.raises(MCPProtocolError, match="entry limit"):
+            await _LargePageClient().list_tools()
+
+    asyncio.run(run())
+
+
 def test_stdio_initialize_requires_supported_protocol_version() -> None:
     script = dedent(
         """

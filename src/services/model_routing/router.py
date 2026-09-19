@@ -56,17 +56,65 @@ from .vision import (
 
 logger = logging.getLogger(__name__)
 
+# 渠道未显式配置超时（timeout_seconds 为 0）时启用的默认总时限。
+# 0 在 ChannelConfig 中的语义是“由客户端决定”，而非零超时；若直接
+# 透传 None，httpx 与 SSE 流可持续挂起，重试回退永不触发。
+_DEFAULT_TOTAL_TIMEOUT_SECONDS = 60.0
+# 审计快照里单条消息文本与原样字段的长度上限，超出截断并标记。
+_AUDIT_MESSAGE_TEXT_LIMIT = 4000
+_AUDIT_RAW_FIELD_LIMIT = 4096
+_AUDIT_TRUNCATED_MARK = "[truncated]"
 
-def _audit_request_payload(request: ChatRequest) -> dict[str, object]:
-    """生成有界请求快照；图片只保存格式和编码长度，不保存原始图像。"""
 
+def _audit_text_limit(channel: ChannelConfig | None) -> int:
+    """读取派生自渠道配置的正文截断阈值，渠道未配置时保持全局默认。"""
+
+    if channel is None:
+        return _AUDIT_MESSAGE_TEXT_LIMIT
+    return max(channel.audit_text_limit, _AUDIT_MESSAGE_TEXT_LIMIT)
+
+
+def _truncate_audit_text(value: object, *, limit: int = _AUDIT_MESSAGE_TEXT_LIMIT) -> str:
+    """把任意值渲染为有界文本；超长时截断并附加明确标记。"""
+
+    rendered = str(value or "")
+    if len(rendered) <= limit:
+        return rendered
+    return rendered[:limit] + _AUDIT_TRUNCATED_MARK
+
+
+def _audit_request_payload(
+    request: ChatRequest, channel: ChannelConfig | None = None
+) -> dict[str, object]:
+    """生成有界请求快照；字符串按上限截断，图片只保存格式和编码长度。"""
+
+    text_limit = _audit_text_limit(channel)
     messages: list[dict[str, object]] = []
     for message in request.messages:
         mapped = message.as_mapping()
-        content = mapped.get("content")
-        if isinstance(content, (list, tuple)):
+        for key, value in tuple(mapped.items()):
+            if isinstance(value, str):
+                mapped[key] = _truncate_audit_text(value, limit=text_limit)
+            elif isinstance(value, (list, tuple)):
+                mapped[key] = [
+                    _truncate_audit_text(item, limit=text_limit) if isinstance(item, str) else item
+                    for item in value
+                ][:32]
+            elif isinstance(value, Mapping):
+                mapped[key] = {
+                    str(nested_key): (
+                        _truncate_audit_text(nested_value, limit=text_limit)
+                        if isinstance(nested_value, str)
+                        else nested_value
+                    )
+                    for nested_key, nested_value in value.items()
+                }
+            if str(key or "").strip().lower() != "content":
+                continue
+            if not isinstance(value, (list, tuple)):
+                continue
             parts: list[object] = []
-            for part in content:
+            for part in value:
                 if isinstance(part, Mapping) and str(part.get("type", "")) == "image":
                     image = dict(part)
                     data = image.get("data")
@@ -75,8 +123,26 @@ def _audit_request_payload(request: ChatRequest) -> dict[str, object]:
                         "length": len(str(data or "")),
                     }
                     parts.append(image)
+                elif isinstance(part, Mapping):
+                    parts.append(
+                        {
+                            str(part_key): (
+                                _truncate_audit_text(part_value, limit=text_limit)
+                                if isinstance(part_value, str)
+                                else part_value
+                            )
+                            for part_key, part_value in part.items()
+                        }
+                    )
                 else:
-                    parts.append(part)
+                    parts.append(
+                        _truncate_audit_text(part, limit=text_limit)
+                        if isinstance(part, str)
+                        else part
+                    )
+            if len(parts) > 32:
+                parts = parts[:32]
+                parts.append(_AUDIT_TRUNCATED_MARK)
             mapped["content"] = parts
         messages.append(mapped)
     payload = {
@@ -88,7 +154,10 @@ def _audit_request_payload(request: ChatRequest) -> dict[str, object]:
         "tool_choice": request.tool_choice,
         "metadata": dict(request.metadata),
     }
-    sanitized = sanitize_audit_value(payload)
+    # 原样字段上限始终不低于正文阈值（默认 4096），截断标记不会被
+    # 二次裁剪；渠道放宽正文阈值时原样字段同步放宽。
+    raw_limit = max(_AUDIT_RAW_FIELD_LIMIT, _audit_text_limit(channel))
+    sanitized = sanitize_audit_value(payload, max_text_length=raw_limit)
     return dict(sanitized) if isinstance(sanitized, Mapping) else {}
 
 
@@ -542,6 +611,35 @@ class ModelRouter:
         if key is not None:
             with self._route_lock:
                 self._audit_handles.pop(key, None)
+
+    def adopt_health(self, source: object, *, channel_ids: object = ()) -> None:
+        """从另一个路由器继承空闲渠道的健康/熔断记忆。
+
+        热重载配置会整体重建 :class:`ModelRouter`。为使同一渠道的熔断
+        记忆不随配置改写丢失，运行时在交换段把来源路由器的冷却状态拷贝
+        到新实例；继承只涉及 ``_health`` 快照，不复制运行时连接。
+        """
+
+        source = source if isinstance(source, ModelRouter) else None
+        raw_ids = sorted(
+            channel_id for channel_id in (channel_ids or ()) if str(channel_id or "").strip()
+        )
+        if source is None:
+            return
+        with self._route_lock:
+            for channel_id, health in source._health.items():
+                only_requested = bool(raw_ids) and channel_id not in raw_ids
+                if only_requested:
+                    continue
+                target_channel = self._channels.get(channel_id)
+                if target_channel is None:
+                    continue
+                # 继承的是数值冷却记忆，密钥不随健康状态进路书。
+                if isinstance(health, _ChannelHealth):
+                    self._health[channel_id] = _ChannelHealth(
+                        failures=health.failures,
+                        cooldown_until=health.cooldown_until,
+                    )
 
     def register(self, channel: ChannelConfig | Mapping[str, Any]) -> ChannelConfig:
         config = channel if isinstance(channel, ChannelConfig) else channel_from_mapping(channel)
@@ -1070,7 +1168,21 @@ class ModelRouter:
             }
         available = tuple(channel for channel in options if cooldowns.get(channel.id, 0.0) <= now)
         if available:
-            return available
+            # 同等优先级按键级冷却记忆动态排序：失败次数更少的健康渠道
+            # 自然浮到前面，让持续出错的渠道逐渐沉底。
+            failures = {
+                channel.id: self._health.get(channel.id, _ChannelHealth()).failures
+                for channel in available
+            }
+            return tuple(
+                sorted(
+                    available,
+                    key=lambda channel: (
+                        channel.priority,
+                        failures.get(channel.id, 0),
+                    ),
+                )
+            )
         # 避免所有渠道同时失败后永久不可用，但在最早冷却窗口结束前不
         # 提前重试；窗口结束后才允许一次半开探测。
         earliest = min(
@@ -1184,7 +1296,11 @@ class ModelRouter:
                 else ProviderAdapterRuntime(
                     produced,
                     retry_policy=channel.retry,
-                    timeout_seconds=channel.timeout_seconds or None,
+                    timeout_seconds=(
+                        channel.timeout_seconds
+                        if channel.timeout_seconds > 0
+                        else _DEFAULT_TOTAL_TIMEOUT_SECONDS
+                    ),
                 )
             )
         return runtime
@@ -1362,6 +1478,23 @@ class ModelRouter:
                 owner_task.add_done_callback(cancel_summary_on_owner_done)
             return task
 
+        async def cancel_pending_vision_summary() -> None:
+            """在主请求结束时停止尚未被消费的视觉摘要任务。
+
+            摘要任务与主模型请求并行启动。主模型可能直接支持图片，或在
+            摘要完成前由备用渠道成功返回；这两条路径都必须主动回收摘要
+            任务，否则会继续占用网络连接并产生重复的视觉调用。
+            """
+
+            nonlocal vision_summary_task
+            pending = vision_summary_task
+            vision_summary_task = None
+            if pending is None or pending.done():
+                return
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await pending
+
         # 视觉摘要是非视觉主模型的必要前置输入；先准备主渠道运行时，
         # 再启动视觉流，让摘要网络等待与后续主请求建立连接重叠。
         # 主模型仍只会收到已完成且有界的摘要，不会收到未完成的占位内容。
@@ -1509,7 +1642,7 @@ class ModelRouter:
                         channel_name=channel.id,
                         channel_info=channel_info,
                         requested_model=attempt_request.model,
-                        input_payload=_audit_request_payload(attempt_request),
+                        input_payload=_audit_request_payload(attempt_request, channel=channel),
                         metadata=audit_metadata,
                     )
                     key = self._audit_context_key(context)
@@ -1763,6 +1896,7 @@ class ModelRouter:
                         "tool_call_count": len(audit_tool_calls),
                     },
                 )
+                await cancel_pending_vision_summary()
                 return
             except asyncio.CancelledError:
                 await fail_audit("cancelled", "model request cancelled", status="cancelled")
@@ -1783,6 +1917,12 @@ class ModelRouter:
                         "channel_id": channel.id,
                     },
                 )
+                await cancel_pending_vision_summary()
+                raise
+            except GeneratorExit:
+                # 调用方直接关闭异步生成器时不会进入 CancelledError；仍需
+                # 回收并行启动的视觉摘要任务，避免后台请求悬挂。
+                await cancel_pending_vision_summary()
                 raise
             except ProviderAdapterError as error:
                 error = classify_exception(
@@ -1797,8 +1937,10 @@ class ModelRouter:
                     or channel_event_emitted
                     or not error.before_first_event
                 ):
+                    await cancel_pending_vision_summary()
                     raise
                 if channel is selection.channels[-1]:
+                    await cancel_pending_vision_summary()
                     raise
                 if not error.retryable and error.category not in {
                     "network",
@@ -1806,6 +1948,7 @@ class ModelRouter:
                     "rate_limit",
                     "server",
                 }:
+                    await cancel_pending_vision_summary()
                     raise
                 continue
             except Exception as raw_error:
@@ -1824,8 +1967,10 @@ class ModelRouter:
                     or channel_event_emitted
                     or not error.before_first_event
                 ):
+                    await cancel_pending_vision_summary()
                     raise error from raw_error
                 if channel is selection.channels[-1]:
+                    await cancel_pending_vision_summary()
                     raise error from raw_error
                 if not error.retryable and error.category not in {
                     "network",
@@ -1833,12 +1978,10 @@ class ModelRouter:
                     "rate_limit",
                     "server",
                 }:
+                    await cancel_pending_vision_summary()
                     raise error from raw_error
                 continue
-        if vision_summary_task is not None:
-            vision_summary_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await vision_summary_task
+        await cancel_pending_vision_summary()
         raise ModelRoutingError(f"all channels failed for task: {selection.task}")
 
     async def test_connection(
@@ -2206,6 +2349,7 @@ class ModelRouter:
                     "last_category": health.last_category,
                     "last_error": health.last_error,
                     "cooldown_until": health.cooldown_until,
+                    "backoff_warmup": min(1.0, health.failures / 3),
                 }
             return {
                 key: {
@@ -2213,6 +2357,7 @@ class ModelRouter:
                     "last_category": value.last_category,
                     "last_error": value.last_error,
                     "cooldown_until": value.cooldown_until,
+                    "backoff_warmup": min(1.0, value.failures / 3),
                 }
                 for key, value in self._health.items()
             }

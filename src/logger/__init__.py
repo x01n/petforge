@@ -35,6 +35,7 @@ __all__ = [
     "event_fingerprint",
     "log_event",
     "recent_log_records",
+    "recent_log_summary",
     "clear_log_records",
     "sanitize_log_text",
 ]
@@ -54,6 +55,8 @@ _LEVEL_COLORS = {
     logging.CRITICAL: "\033[35m",  # 紫色
 }
 _RESET = "\033[0m"
+# 聚合 dims 中计入 warning_plus 的级别名；WARN/FATAL 为 logging 别名。
+_WARNING_PLUS_LEVELS = frozenset({"WARN", "WARNING", "ERROR", "CRITICAL", "FATAL"})
 
 # 即使应用尚未显式调用 ``configure_logging``（例如库级 IPC 测试或嵌入式
 # 宿主），asyncio debug transport 也不应把非 JSON 内部诊断污染到根 sink。
@@ -478,6 +481,60 @@ class MemoryLogHandler(logging.Handler):
                     break
         return tuple(result)
 
+    def recent_log_summary(self, *, limit: int = 200) -> dict[str, object]:
+        """按级别/来源/事件聚合最近记录；只统计维度，不携带任何正文。"""
+
+        if isinstance(limit, bool):
+            raise ValueError("recent log summary limit must be an integer")
+        try:
+            target = int(limit)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("recent log summary limit must be an integer") from None
+        safe_limit = max(0, min(target, self._records.maxlen or 0))
+        total = 0
+        warning_plus = 0
+        by_level: dict[str, int] = {}
+        by_logger: dict[str, int] = {}
+        by_event: dict[str, int] = {}
+        with self.lock:
+            for item in reversed(self._records):
+                if total >= safe_limit:
+                    break
+                level = str(item.get("level") or "").strip()
+                logger_key = str(item.get("logger") or "").strip()
+                event_key = str(item.get("event") or "").strip()
+                if level:
+                    by_level[level] = by_level.get(level, 0) + 1
+                if logger_key:
+                    by_logger[logger_key] = by_logger.get(logger_key, 0) + 1
+                if event_key:
+                    by_event[event_key] = by_event.get(event_key, 0) + 1
+                if level.upper() in _WARNING_PLUS_LEVELS:
+                    warning_plus += 1
+                total += 1
+        return {
+            "total": min(max(0, int(total)), 1_000_000),
+            "warning_plus": min(max(0, int(warning_plus)), 1_000_000),
+            "by_level": {
+                str(key)[:200]: min(max(0, int(count)), 1_000_000)
+                for key, count in sorted(
+                    by_level.items(), key=lambda item: (-int(item[1]), str(item[0]))
+                )
+            },
+            "by_logger": {
+                str(key)[:200]: min(max(0, int(count)), 1_000_000)
+                for key, count in sorted(
+                    by_logger.items(), key=lambda item: (-int(item[1]), str(item[0]))
+                )
+            },
+            "by_event": {
+                str(key)[:200]: min(max(0, int(count)), 1_000_000)
+                for key, count in sorted(
+                    by_event.items(), key=lambda item: (-int(item[1]), str(item[0]))
+                )
+            },
+        }
+
     def clear(self) -> None:
         with self.lock:
             self._records.clear()
@@ -532,6 +589,21 @@ def recent_log_records(
         logger_name=logger_name,
         event=event,
     )
+
+
+def recent_log_summary(*, limit: int = 200) -> dict[str, object]:
+    """返回内存日志环最近条目的分组计数；没有内存 sink 时返回空聚合。"""
+
+    handler = _MEMORY_HANDLER
+    if handler is None:
+        return {
+            "total": 0,
+            "warning_plus": 0,
+            "by_level": {},
+            "by_logger": {},
+            "by_event": {},
+        }
+    return handler.recent_log_summary(limit=limit)
 
 
 def clear_log_records() -> None:

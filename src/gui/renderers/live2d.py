@@ -1053,8 +1053,8 @@ class Live2DRenderer:
         if self._model is None:
             return
         if not self._validate_transform():
-            # QOpenGLWindow 会把异常交给宿主的精灵回退；不要把坏矩阵
-            # 继续提交到 OpenGL，否则会在窗口移动/恢复时留下穿模帧。
+            # 不要把坏矩阵继续提交到 OpenGL；宿主应保持失败状态，
+            # 否则会在窗口移动/恢复时留下穿模帧。
             raise RuntimeError("Live2D MVP transform is not finite")
         draw = getattr(self._model, "Draw", None)
         if callable(draw):

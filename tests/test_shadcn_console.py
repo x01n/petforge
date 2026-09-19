@@ -19,6 +19,12 @@ import pytest
             {"profile": "voice-one", "language": "zh"},
         ),
         ("select_tts_language", {"language": "ja"}, {"language": "ja"}),
+        ("open_config", {"section": "proactive"}, {"section": "proactive"}),
+        ("open_config", {"section": "scheduler"}, {"section": "scheduler"}),
+        ("open_config", {"section": "tts"}, {"section": "tts"}),
+        ("open_config", {"section": "llm"}, {"section": "llm"}),
+        ("read_api_audit", {"ignored": "not-forwarded"}, {}),
+        ("read_log_records", {"ignored": "not-forwarded"}, {}),
         ("select_renderer_model", {"model": "橙色猫猫 model3"}, {"model": "橙色猫猫 model3"}),
         ("select_tts_profile", {"profile": "bad\nvalue", "language": True}, {}),
     ],
@@ -48,7 +54,13 @@ def test_built_console_is_available_as_an_offline_package_resource() -> None:
     assert 'href="https://' not in html
 
 
-def test_shadcn_console_loads_and_invokes_runtime_over_qwebchannel() -> None:
+# 前两个用例为无 GUI 静态断言；第三个用例存在无 Xvfb 即 skip 的
+# Linux 回退分支，故 xvfb/webengine 仅打在真实启动 WebEngine 窗口的该
+# 用例上（其余平台另起 WebEngine 进程），不落模块级。
+@pytest.mark.xvfb
+@pytest.mark.webengine
+@pytest.mark.parametrize("width", [390, 700, 701, 1080, 1081, 1120])
+def test_shadcn_console_loads_and_invokes_runtime_over_qwebchannel(width: int) -> None:
     root = Path(__file__).resolve().parents[1]
     script = (
         r"""
@@ -69,6 +81,7 @@ window = WebControlSurfaceWindow(
     lambda: state,
     lambda kind, payload: calls.append([kind, dict(payload)]) or {"status": "completed"},
 )
+window.resize(__CONSOLE_WIDTH__, 780)
 window.show()
 ticks = 0
 clicked = False
@@ -109,6 +122,10 @@ def poll():
             text: document.body.innerText,
             width: document.documentElement.clientWidth,
             scrollWidth: document.documentElement.scrollWidth,
+            sidebarWidth: document.querySelector('.desktop-sidebar')
+                ?.getBoundingClientRect().width ?? 0,
+            sidebarScrollWidth: document.querySelector('.desktop-sidebar')?.scrollWidth ?? 0,
+            topbarHeight: document.querySelector('.topbar')?.getBoundingClientRect().height ?? 0,
             react: !!document.querySelector('#root [data-slot]')
         })
     """
@@ -122,6 +139,7 @@ app.exec()
 print(json.dumps(report, ensure_ascii=False))
 """
     )
+    script = script.replace("__CONSOLE_WIDTH__", str(width))
     environment = dict(os.environ, PYTHONPATH=str(root / "src"), MEAPET_WEBENGINE_SOFTWARE="1")
     command = [sys.executable, "-c", script]
     if sys.platform.startswith("linux"):
@@ -139,4 +157,9 @@ print(json.dumps(report, ensure_ascii=False))
     assert report["view"]["react"]
     assert "过期回复" not in report["view"]["text"]
     assert report["view"]["scrollWidth"] <= report["view"]["width"]
+    # 第 7 轮 G 模块新增宽度断点契约（frontend/console/src/lib/nav-collapse.ts）：
+    # 360-759px 侧边栏折叠为 56px 图标栏（<360 隐藏），≥760px 还原 208px。
+    assert report["view"]["sidebarWidth"] == (56 if 360 <= width < 760 else 208)
+    assert report["view"]["sidebarScrollWidth"] <= report["view"]["sidebarWidth"]
+    assert report["view"]["topbarHeight"] == 54
     assert report["calls"] == [["configure_model", {}]]

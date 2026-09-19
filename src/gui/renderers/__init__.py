@@ -36,6 +36,7 @@ from .protocol import (
     normalize_renderer_backend,
 )
 from .sprite import SpriteRenderer
+from .threed import probe_live2d_vulkan_runtime, probe_qt_vulkan_runtime
 from .web_live2d import WebLive2DProbe, WebLive2DRenderer, probe_web_live2d
 
 __all__ = [
@@ -66,6 +67,8 @@ __all__ = [
     "WebLive2DProbe",
     "WebLive2DRenderer",
     "probe_live2d_runtime",
+    "probe_live2d_vulkan_runtime",
+    "probe_qt_vulkan_runtime",
     "probe_render_assets",
     "probe_web_live2d_runtime",
     "probe_web_live2d",

@@ -47,6 +47,7 @@ try:  # Qt 依赖保持可选，核心服务仍可在无桌面环境运行。
     from PySide6.QtCore import Qt, QTime, QTimer, Signal
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtWidgets import (
+        QAbstractItemView,
         QCheckBox,
         QComboBox,
         QDoubleSpinBox,
@@ -54,6 +55,7 @@ try:  # Qt 依赖保持可选，核心服务仍可在无桌面环境运行。
         QFrame,
         QGridLayout,
         QHBoxLayout,
+        QHeaderView,
         QLabel,
         QLineEdit,
         QListWidget,
@@ -63,6 +65,8 @@ try:  # Qt 依赖保持可选，核心服务仍可在无桌面环境运行。
         QScrollArea,
         QSizePolicy,
         QSpinBox,
+        QTableWidget,
+        QTableWidgetItem,
         QVBoxLayout,
         QWidget,
     )
@@ -295,7 +299,8 @@ QFrame[consoleModuleCard="true"] {
     );
     border: 1px solid @outline-variant@;
     border-top-color: @outline@;
-    border-radius: 14px;
+    border-radius: 11px;
+    padding: 3px;
 }
 QFrame#consoleHeaderCard {
     background: qlineargradient(
@@ -1118,6 +1123,29 @@ def _safe_result_summary(result: object) -> str:
     if status_label and detail:
         return f"{status_label}：{detail}"
     return status_label or detail or "已收到结果"
+
+
+def _audit_filter_keys(section: object, prefix: str) -> tuple[str, ...]:
+    """从审计聚合分组中提取白名单筛选键，供状态/渠道下拉选择。"""
+
+    if not isinstance(section, (list, tuple)):
+        return ()
+    keys: list[str] = []
+    for row in section:
+        if not isinstance(row, Mapping):
+            continue
+        text = _safe_ui_text(row.get("key"), limit=64)
+        marker = prefix + ":"
+        if text.startswith(marker):
+            text = text[len(marker) :]
+        if not text:
+            continue
+        for existing in keys:
+            if existing == text:
+                break
+        else:
+            keys.append(text)
+    return tuple(keys[:64])
 
 
 def _safe_error_message(error: BaseException) -> str:
@@ -2740,6 +2768,100 @@ if pyside6_available:
             self._diagnostic_output.setMaximumHeight(150)
             diagnostics_layout.addWidget(self._diagnostic_output)
 
+            self._audit_filter_panel = QWidget()
+            self._audit_filter_panel.setObjectName("diagnosticAuditFilters")
+            audit_filter_layout = QHBoxLayout(self._audit_filter_panel)
+            audit_filter_layout.setContentsMargins(0, 4, 0, 0)
+            self._audit_status_filter = QComboBox()
+            self._audit_status_filter.setObjectName("auditStatusFilter")
+            self._audit_status_filter.addItem("全部状态", "")
+            self._audit_channel_filter = QComboBox()
+            self._audit_channel_filter.setObjectName("auditChannelFilter")
+            self._audit_channel_filter.addItem("全部渠道", "")
+            self._audit_refresh_button = button(
+                "刷新审计",
+                "auditRefreshButton",
+                self._refresh_api_audit,
+                "按当前状态与渠道筛选重新读取脱敏调用审计",
+            )
+            audit_filter_layout.addWidget(self._audit_status_filter)
+            audit_filter_layout.addWidget(self._audit_channel_filter)
+            audit_filter_layout.addWidget(self._audit_refresh_button)
+            audit_filter_layout.addStretch(1)
+            diagnostics_layout.addWidget(self._audit_filter_panel)
+
+            self._audit_table = QTableWidget(0, 7)
+            self._audit_table.setObjectName("diagnosticAuditTable")
+            self._audit_table.setHorizontalHeaderLabels(
+                ("状态", "类型", "渠道", "协议", "请求模型", "首字", "总耗时")
+            )
+            self._audit_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self._audit_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self._audit_table.setAlternatingRowColors(True)
+            audit_header = self._audit_table.horizontalHeader()
+            audit_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            audit_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            audit_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            audit_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            audit_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+            audit_header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+            audit_header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+            self._audit_table.setMinimumHeight(110)
+            self._audit_table.setMaximumHeight(240)
+            self._audit_table.setVisible(False)
+            self._audit_filter_panel.setVisible(False)
+            self._audit_status_filter.currentIndexChanged.connect(
+                lambda _index: self._request_audit_reload_from_filters("status")
+            )
+            self._audit_channel_filter.currentIndexChanged.connect(
+                lambda _index: self._request_audit_reload_from_filters("channel_id")
+            )
+            diagnostics_layout.addWidget(self._audit_table)
+
+            self._log_filter_panel = QWidget()
+            self._log_filter_panel.setObjectName("diagnosticLogFilters")
+            log_filter_layout = QHBoxLayout(self._log_filter_panel)
+            log_filter_layout.setContentsMargins(0, 4, 0, 0)
+            self._log_level_filter = QComboBox()
+            self._log_level_filter.setObjectName("logLevelFilter")
+            for level, label in (
+                ("", "全部等级"),
+                ("DEBUG", "DEBUG"),
+                ("INFO", "INFO"),
+                ("WARNING", "WARNING"),
+                ("ERROR", "ERROR"),
+                ("CRITICAL", "CRITICAL"),
+            ):
+                self._log_level_filter.addItem(label, level)
+            self._log_search = QLineEdit()
+            self._log_search.setObjectName("logSearchInput")
+            self._log_search.setPlaceholderText("搜索事件、组件、状态或详情")
+            log_filter_layout.addWidget(self._log_level_filter)
+            log_filter_layout.addWidget(self._log_search, 1)
+            diagnostics_layout.addWidget(self._log_filter_panel)
+
+            self._log_table = QTableWidget(0, 5)
+            self._log_table.setObjectName("diagnosticLogTable")
+            self._log_table.setHorizontalHeaderLabels(("等级", "组件", "事件", "状态", "详情"))
+            self._log_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self._log_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self._log_table.setAlternatingRowColors(True)
+            self._log_table.setWordWrap(True)
+            header = self._log_table.horizontalHeader()
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+            self._log_table.setMinimumHeight(150)
+            self._log_table.setMaximumHeight(320)
+            self._log_table.setVisible(False)
+            self._log_filter_panel.setVisible(False)
+            self._log_records: list[Mapping[str, object]] = []
+            self._log_level_filter.currentIndexChanged.connect(self._refresh_log_table)
+            self._log_search.textChanged.connect(self._refresh_log_table)
+            diagnostics_layout.addWidget(self._log_table)
+
             def scroll_page(
                 object_name: str,
                 title_text: str,
@@ -3020,6 +3142,10 @@ if pyside6_available:
         def _ensure_conversation_input_visible(self) -> None:
             """极小屏进入对话页时优先露出输入和三个操作按钮。"""
 
+            # 本回调可能由 QTimer.singleShot 挂在事件队列里，而关闭确认
+            # 在其取消防护内接受关闭；延迟到达时不得再触碰布局控件。
+            if self._allow_close:
+                return
             scroll = self.findChild(QScrollArea, "consoleControlScroll")
             input_widget = getattr(self, "_input", None)
             if scroll is None or input_widget is None:
@@ -4458,7 +4584,7 @@ if pyside6_available:
             labels = {
                 "opengl": "OpenGL Live2D",
                 "web_live2d": "Web Live2D",
-                "sprite": "精灵回退",
+                "sprite": "精灵（显式）",
                 "vllank": "3D 渲染预留",
                 "unavailable": "不可用",
             }
@@ -4835,7 +4961,7 @@ if pyside6_available:
 
             return tuple(self._motion.itemText(i) for i in range(self._motion.count()))
 
-        def show_settings(self) -> bool:
+        def show_settings(self, section: object | None = None) -> bool:
             """显示配置中心并激活配置页。"""
 
             if self._ensure_configuration_panel() is None:
@@ -4845,6 +4971,13 @@ if pyside6_available:
             self.operationTriggered.emit("configuration")
             self._set_configuration_focus(True)
             self.show_and_focus("配置中心")
+            if section is not None:
+                try:
+                    panel = self._configuration_panel
+                    if panel is not None:
+                        panel.select_section(section)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    self.set_status("配置区段暂不可用")
             return True
 
         def show_model_settings(self) -> bool:
@@ -6242,11 +6375,308 @@ if pyside6_available:
             if hasattr(self, "_position_status"):
                 self._position_status.setText(f"当前坐标：({int(x)}, {int(y)})")
 
+        def _refresh_log_table(self) -> None:
+            """按等级和文本条件刷新结构化日志表。"""
+
+            table = getattr(self, "_log_table", None)
+            level_filter = getattr(self, "_log_level_filter", None)
+            search_input = getattr(self, "_log_search", None)
+            if table is None or level_filter is None or search_input is None:
+                return
+            selected_level = str(level_filter.currentData() or "").strip().upper()
+            query = str(search_input.text() or "").strip().casefold()
+            rows: list[Mapping[str, object]] = []
+            for row in getattr(self, "_log_records", ()):
+                level = _safe_ui_text(row.get("level"), limit=16).upper()
+                logger_name = _safe_ui_text(row.get("logger"), limit=80)
+                event = _safe_ui_text(row.get("event"), limit=96)
+                status = _safe_ui_text(row.get("status"), limit=32)
+                reason = _safe_ui_text(row.get("reason"), limit=64)
+                detail = _safe_ui_text(row.get("detail", row.get("message")), limit=320)
+                searchable = " ".join(
+                    value for value in (level, logger_name, event, status, reason, detail) if value
+                ).casefold()
+                if selected_level and level != selected_level:
+                    continue
+                if query and query not in searchable:
+                    continue
+                rows.append(
+                    {
+                        "level": level or "INFO",
+                        "logger": logger_name or "app",
+                        "event": event or "运行事件",
+                        "status": status,
+                        "reason": reason,
+                        "detail": detail or reason or "已记录",
+                    }
+                )
+            table.setRowCount(len(rows))
+            for row_index, row in enumerate(rows):
+                values = (
+                    row["level"],
+                    row["logger"],
+                    row["event"],
+                    row["status"],
+                    row["detail"],
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value or ""))
+                    item.setToolTip(str(value or ""))
+                    table.setItem(row_index, column, item)
+                table.resizeRowToContents(row_index)
+
+        def _set_log_table_visibility(self, visible: bool) -> None:
+            """只切换日志筛选面板、日志表和诊断文本的显示边界。"""
+
+            panel = getattr(self, "_log_filter_panel", None)
+            table = getattr(self, "_log_table", None)
+            if panel is not None:
+                panel.setVisible(bool(visible))
+            if table is not None:
+                table.setVisible(bool(visible))
+            output = getattr(self, "_diagnostic_output", None)
+            if output is not None:
+                output.setVisible(not bool(visible))
+
+        def _set_audit_table_visibility(self, visible: bool) -> None:
+            """只切换审计筛选面板、审计表和照看诊断文本的显示边界。"""
+
+            panel = getattr(self, "_audit_filter_panel", None)
+            table = getattr(self, "_audit_table", None)
+            if panel is not None:
+                panel.setVisible(bool(visible))
+            if table is not None:
+                table.setVisible(bool(not visible))
+            output = getattr(self, "_diagnostic_output", None)
+            if output is not None:
+                output.setVisible(not bool(visible))
+
+        def _audit_summary_lines(self, summary: Mapping[str, object]) -> list[str]:
+            """把白名单的审计聚合摘要渲染成诊断区的几行文本。"""
+
+            lines: list[str] = []
+            status_parts = []
+            status_rows = summary.get("by_status")
+            if isinstance(status_rows, (list, tuple)):
+                for row in status_rows:
+                    if not isinstance(row, Mapping):
+                        continue
+                    item_key = _safe_ui_text(row.get("key"), limit=32)
+                    count = row.get("count")
+                    if not item_key or not isinstance(count, int):
+                        continue
+                    status_parts.append(item_key + " x " + str(count))
+            channel_parts = []
+            channel_rows = summary.get("by_channel")
+            if isinstance(channel_rows, (list, tuple)):
+                for row in channel_rows:
+                    if not isinstance(row, Mapping):
+                        continue
+                    item_key = _safe_ui_text(row.get("key"), limit=32)
+                    count = row.get("count")
+                    if item_key and isinstance(count, int):
+                        channel_parts.append(item_key + " x " + str(count))
+            latency = summary.get("latency_ms")
+            latency = latency if isinstance(latency, Mapping) else {}
+            latency_parts = []
+            for key, label in (
+                ("avg_first", "平均首字"),
+                ("avg_total", "平均总计"),
+                ("max_total", "最长"),
+            ):
+                value = latency.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    latency_parts.append(f"{label} {float(value):.0f}ms")
+            if status_parts:
+                lines.append("状态：" + " ".join(status_parts))
+            if channel_parts:
+                lines.append("渠道：" + " ".join(channel_parts))
+            if latency_parts:
+                lines.append("耗时：" + " ".join(latency_parts))
+            return lines
+
+        def _sync_audit_filter_choices(
+            self,
+            *,
+            statuses: object,
+            channels: object,
+            status_value: str,
+            channel_value: str,
+        ) -> None:
+            """把白名单聚合分组同步进状态/渠道下拉，并复选当前筛选值。"""
+
+            status_combo = getattr(self, "_audit_status_filter", None)
+            channel_combo = getattr(self, "_audit_channel_filter", None)
+            if status_combo is None or channel_combo is None:
+                return
+            status_keys = _audit_filter_keys(statuses, "status")
+            channel_keys = _audit_filter_keys(channels, "channel")
+
+            def rebuild(
+                combo: QComboBox,
+                keys: tuple[str, ...],
+                value: str,
+                all_label: str,
+            ) -> None:
+                selected_data = value if value in keys else ""
+                combo.blockSignals(True)
+                try:
+                    combo.clear()
+                    combo.addItem(all_label, "")
+                    for key in keys:
+                        combo.addItem(key, key)
+                    index = combo.findData(selected_data)
+                    combo.setCurrentIndex(max(0, index))
+                finally:
+                    combo.blockSignals(False)
+
+            rebuild(status_combo, status_keys, status_value, "全部状态")
+            rebuild(channel_combo, channel_keys, channel_value, "全部渠道")
+
+        def _current_audit_filters(self) -> dict[str, str]:
+            """读取当前下拉选择；空值一律归一为无筛选，不把显示项当数据。"""
+
+            status_combo = getattr(self, "_audit_status_filter", None)
+            channel_combo = getattr(self, "_audit_channel_filter", None)
+            status_value = str(status_combo.currentData() or "").strip() if status_combo else ""
+            channel_value = str(channel_combo.currentData() or "").strip() if channel_combo else ""
+            return {"status": status_value, "channel_id": channel_value}
+
+        def _request_audit_reload_from_filters(self, changed_key: str) -> None:
+            """远端刷新：把当前筛选交给宿主 audit_refresh 重新查询。"""
+
+            del changed_key
+            filters = self._current_audit_filters()
+            cleaned_filters = {key: value for key, value in filters.items() if value}
+            callback = self._callbacks.get("audit_refresh")
+            if callable(callback):
+                result = callback(cleaned_filters)
+                if isinstance(result, Mapping):
+                    self._refresh_audit_table(result)
+                    return
+            self.set_status("审计筛选刷新回调不可用；请点击“调用审计”重读。")
+
+        def _refresh_api_audit(self) -> None:
+            """“刷新审计”按钮：优先走宿主 audit_refresh，否则复用 api_audit。"""
+
+            filters = self._current_audit_filters()
+            cleaned_filters = {key: value for key, value in filters.items() if value}
+            callback = self._callbacks.get("audit_refresh")
+            if callable(callback):
+                result = callback(cleaned_filters)
+                if isinstance(result, Mapping):
+                    self._refresh_audit_table(result)
+                    return
+            self._run_control_action("api_audit")
+
+        def _audit_table_rows(self, rows: object) -> tuple[tuple[dict[str, object], ...], int]:
+            """把审计记录投影为表格行；只保留白名单展示列，跳过非映射行。"""
+
+            projected: list[dict[str, object]] = []
+            for row_value in rows:
+                if not isinstance(row_value, Mapping):
+                    continue
+                status = _safe_ui_text(row_value.get("status"), limit=24) or "unknown"
+                kind = _safe_ui_text(row_value.get("kind"), limit=24)
+                channel_id = _safe_ui_text(row_value.get("channel_id"), limit=64)
+                channel_name = _safe_ui_text(row_value.get("channel_name"), limit=64)
+                channel = channel_id or channel_name or "local"
+                provider = _safe_ui_text(row_value.get("provider"), limit=48)
+                protocol = _safe_ui_text(row_value.get("protocol"), limit=48)
+                requested = _safe_ui_text(row_value.get("requested_model"), limit=96)
+                served = _safe_ui_text(row_value.get("response_model"), limit=96)
+                model_text = requested or "未指定"
+                if served and served != requested:
+                    model_text += f"→{served}"
+                ttft = row_value.get("time_to_first_token_ms")
+                total = row_value.get("total_duration_ms")
+                ttft_text = ""
+                if isinstance(ttft, (int, float)) and not isinstance(ttft, bool):
+                    ttft_text = f"{float(ttft):.0f} ms"
+                total_text = ""
+                if isinstance(total, (int, float)) and not isinstance(total, bool):
+                    total_text = f"{float(total):.0f} ms"
+                channel_text = channel
+                if provider:
+                    channel_text += f" / {provider}"
+                projected.append(
+                    {
+                        "status": status,
+                        "kind": kind or "model",
+                        "channel": channel_text,
+                        "protocol": protocol,
+                        "model": model_text,
+                        "ttft": ttft_text,
+                        "total": total_text,
+                    }
+                )
+            return tuple(projected), len(rows)
+
+        def _refresh_audit_table(self, result: object) -> None:
+            """按回执渲染审计分组表并同步筛选下拉；同时刷新置顶摘要行。"""
+
+            table = getattr(self, "_audit_table", None)
+            status_combo = getattr(self, "_audit_status_filter", None)
+            channel_combo = getattr(self, "_audit_channel_filter", None)
+            panel = getattr(self, "_audit_filter_panel", None)
+            if table is None or status_combo is None or channel_combo is None:
+                return
+            if not isinstance(result, Mapping):
+                if panel is not None:
+                    panel.setVisible(False)
+                table.setVisible(False)
+                return
+            rows = result.get("records")
+            rows = rows if isinstance(rows, (list, tuple)) else ()
+            summary = result.get("summary")
+            summary = summary if isinstance(summary, Mapping) else {}
+            echo = result.get("filters")
+            echo = echo if isinstance(echo, Mapping) else {}
+            self._sync_audit_filter_choices(
+                statuses=summary.get("by_status"),
+                channels=summary.get("by_channel"),
+                status_value=_safe_ui_text(echo.get("status"), limit=64),
+                channel_value=_safe_ui_text(echo.get("channel_id"), limit=64),
+            )
+            projected, _row_hint = self._audit_table_rows(rows)
+            table.setRowCount(len(projected))
+            for row_index, row in enumerate(projected):
+                values = (
+                    row["status"],
+                    row["kind"],
+                    row["channel"],
+                    row["protocol"],
+                    row["model"],
+                    row["ttft"],
+                    row["total"],
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value or ""))
+                    item.setToolTip(str(value or ""))
+                    table.setItem(row_index, column, item)
+                table.resizeRowToContents(row_index)
+            count_value = result.get("count", len(projected))
+            observed_count = (
+                max(0, int(count_value))
+                if isinstance(count_value, (int, float))
+                else len(projected)
+            )
+            observation_status = getattr(self, "_observation_status", None)
+            if observation_status is not None:
+                observation_status.setText(
+                    f"API 审计（当前筛选 {observed_count} 行）已更新；详情见诊断分组表。"
+                )
+            records_visible = bool(rows)
+            if panel is not None:
+                panel.setVisible(bool(summary) or records_visible)
+            table.setVisible(records_visible)
+
         def set_diagnostic_result(self, name: str, result: object) -> None:
             """在诊断卡片中展示脱敏的前台窗口/进程摘要。"""
 
             if not hasattr(self, "_diagnostic_output"):
                 return
+            self._set_log_table_visibility(False)
             observation_status = getattr(self, "_observation_status", None)
             label = str(name or "").strip()
             if isinstance(result, Mapping) and label in {"前台窗口", "foreground_window"}:
@@ -6328,6 +6758,12 @@ if pyside6_available:
                 rows = result.get("records")
                 rows = rows if isinstance(rows, (list, tuple)) else ()
                 lines = [f"API 调用审计：{max(0, int(result.get('count', len(rows)) or 0))} 条"]
+                summary = result.get("summary")
+                summary = summary if isinstance(summary, Mapping) else {}
+                summary_lines = self._audit_summary_lines(summary)
+                if summary_lines:
+                    lines.append("聚合摘要（状态×数量 ｜ 渠道×数量 ｜ 平均首字/总耗时/最长）")
+                    lines.extend(summary_lines)
                 for row in rows[:20]:
                     if not isinstance(row, Mapping):
                         continue
@@ -6503,6 +6939,7 @@ if pyside6_available:
                                 lines.append(f"  工具错误：{error}")
                 summary = "\n".join(lines)
                 self._diagnostic_output.setPlainText(summary)
+                self._refresh_audit_table(result)
                 if observation_status is not None:
                     observation_status.setText("API 审计已更新；详情见诊断面板。")
                 return
@@ -6522,8 +6959,11 @@ if pyside6_available:
                         prefix += f" / {event}"
                     lines.append(f"{prefix}\n  {message}")
                 self._diagnostic_output.setPlainText("\n".join(lines))
+                self._log_records = tuple(dict(row) for row in rows if isinstance(row, Mapping))
+                self._set_log_table_visibility(True)
+                self._refresh_log_table()
                 if observation_status is not None:
-                    observation_status.setText("运行日志已更新；内容来自本地脱敏日志环。")
+                    observation_status.setText("运行日志已更新；可按等级和文本筛选。")
                 return
             summary = _safe_result_summary(result)
             self._diagnostic_output.setPlainText(summary)

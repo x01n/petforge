@@ -819,7 +819,8 @@ class PluginManager:
                     PluginState.STOPPED,
                 }:
                     continue
-                reload_hook = getattr(record.instance, "reload", None)
+                previous_instance = record.instance
+                reload_hook = getattr(previous_instance, "reload", None)
                 if not callable(reload_hook):
                     unloaded = await self._unload_locked(record)
                     if unloaded.state is PluginState.FAILED:
@@ -835,20 +836,59 @@ class PluginManager:
                 record.generation = self._generation
                 record.generation_gate = _PluginGenerationGate()
                 context = self._context(record)
+                replacement_instance: object | None = None
+                teardown_attempted = False
                 try:
-                    await self._call(record.instance, "reload", context)
+                    replacement = await self._call(previous_instance, "reload", context)
+                    # reload 钩子可以返回新实例；先完成新实例的生命周期，再切断旧代次。
+                    # 返回 None 或原实例表示原地重载，保持原有兼容语义。
+                    if replacement is not None and replacement is not previous_instance:
+                        replacement_instance = replacement
+                        await self._call(replacement_instance, "load", context)
+                        if previous_state is PluginState.RUNNING:
+                            await self._call(replacement_instance, "start")
+                        teardown_attempted = True
+                        if previous_state is PluginState.RUNNING:
+                            await self._call(previous_instance, "stop")
+                        await self._call(previous_instance, "unload")
+                        record.instance = replacement_instance
+                        record.state = previous_state
                 except asyncio.CancelledError:
+                    if (
+                        replacement_instance is not None
+                        and replacement_instance is not record.instance
+                    ):
+                        await self._cleanup_replacement_instance(replacement_instance)
                     if record.generation_gate is not None:
                         record.generation_gate.deactivate()
                     record.generation = previous_generation
                     record.generation_gate = previous_gate
+                    record.instance = previous_instance
                     record.state = previous_state
+                    if teardown_attempted:
+                        await self._restore_plugin_instance(
+                            previous_instance,
+                            previous_state,
+                            self._context(record),
+                        )
                     raise
                 except BaseException as exc:
+                    if (
+                        replacement_instance is not None
+                        and replacement_instance is not record.instance
+                    ):
+                        await self._cleanup_replacement_instance(replacement_instance)
                     if record.generation_gate is not None:
                         record.generation_gate.deactivate()
                     record.generation = previous_generation
                     record.generation_gate = previous_gate
+                    record.instance = previous_instance
+                    if teardown_attempted:
+                        await self._restore_plugin_instance(
+                            previous_instance,
+                            previous_state,
+                            self._context(record),
+                        )
                     # 保留仍可工作的旧实例，避免后续 load_all 覆盖实例并遗漏
                     # 其异步资源；失败信息留在状态供诊断。
                     record.state = previous_state
@@ -860,6 +900,87 @@ class PluginManager:
                         previous_gate.deactivate()
                     record.health = "unknown"
                     record.error_type = ""
+
+    @staticmethod
+    async def _restore_plugin_instance(
+        instance: object,
+        state: PluginState,
+        context: PluginContext,
+    ) -> None:
+        """在替换实例接管失败后尽力恢复旧实例。"""
+
+        try:
+            await PluginManager._call(instance, "load", context)
+            if state is PluginState.RUNNING:
+                await PluginManager._call(instance, "start")
+        except BaseException:
+            logger.debug("插件旧实例恢复异常", exc_info=True)
+
+    @staticmethod
+    async def _cleanup_replacement_instance(instance: object) -> None:
+        """释放 reload 钩子返回但未能接管的替换实例。"""
+
+        if instance is None:
+            return
+        for method in ("stop", "unload"):
+            try:
+                value = getattr(instance, method, None)
+                if not callable(value):
+                    continue
+                result = value()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException:
+                logger.debug("插件替换实例清理异常", exc_info=True)
+
+    @staticmethod
+    async def _restore_plugin_instance(
+        instance: object,
+        state: PluginState,
+        context: PluginContext,
+    ) -> None:
+        """在替换实例接管失败后尽力恢复旧实例。"""
+
+        try:
+            await PluginManager._call(instance, "load", context)
+            if state is PluginState.RUNNING:
+                await PluginManager._call(instance, "start")
+        except BaseException:
+            logger.debug("插件旧实例恢复异常", exc_info=True)
+
+    @staticmethod
+    async def _cleanup_replacement_instance(instance: object) -> None:
+        """释放 reload 钩子返回但未能接管的替换实例。"""
+
+        if instance is None:
+            return
+        for method in ("stop", "unload"):
+            try:
+                value = getattr(instance, method, None)
+                if not callable(value):
+                    continue
+                result = value()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException:
+                logger.debug("插件替换实例清理异常", exc_info=True)
+
+    @staticmethod
+    async def _cleanup_replacement_instance(instance: object) -> None:
+        """释放 reload 钩子返回但未能接管的替换实例。"""
+
+        if instance is None:
+            return
+        for method in ("stop", "unload"):
+            try:
+                value = getattr(instance, method, None)
+                if not callable(value):
+                    continue
+                result = value()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException:
+                logger.debug("插件替换实例清理异常", exc_info=True)
 
     async def health(self) -> tuple[Mapping[str, object], ...]:
         """逐插件读取可选健康钩子；失败只更新该插件状态。"""

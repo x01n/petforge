@@ -11,7 +11,26 @@ from services.asr import ASRService
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _ASR_PYTHON = _PROJECT_ROOT / "temp/third_party/GPT-SoVITS/.venv/bin/python"
-_MODEL_PATH = Path("/home/clfchen/.cache/modelscope/models/iic--SenseVoiceSmall/snapshots/master")
+_MODEL_PATH = Path(
+    os.environ.get(
+        "MEAPET_ASR_MODEL_DIR",
+        "/home/clfchen/.cache/modelscope/models/iic--SenseVoiceSmall/snapshots/master",
+    )
+)
+
+
+@pytest.mark.skipif(
+    os.environ.get("MEAPET_ASR_MODEL_DIR") is not None,
+    reason="MEAPET_ASR_MODEL_DIR 由交付安装覆盖；本地默认位置测试仅适用默认环境",
+)
+def test_local_model_path_matches_bundled_default() -> None:
+    """默认未覆盖时 _MODEL_PATH 必须保持本机交付的默认 modelscope 位置。"""
+
+    assert str(_MODEL_PATH) == (
+        "/home/clfchen/.cache/modelscope/models/iic--SenseVoiceSmall/snapshots/master"
+    )
+
+
 _REFERENCE_WAV = _PROJECT_ROOT / "resources/GPT-Sovits/soft/zh_soft.wav"
 _REFERENCE_TEXT = _PROJECT_ROOT / "resources/GPT-Sovits/soft/zh_soft.txt"
 

@@ -748,9 +748,7 @@ def _callback_details(value: object) -> dict[str, object]:
         # 模块标识是诊断所需的公开数据；仅保留短、非空字符串，避免回显
         # 任意对象的 repr 或异常正文。
         modules = tuple(
-            item[:128]
-            for item in (str(item).strip() for item in raw)
-            if item and len(item) <= 128
+            item[:128] for item in (str(item).strip() for item in raw) if item and len(item) <= 128
         )
         if modules:
             result[key] = modules

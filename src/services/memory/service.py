@@ -12,7 +12,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -262,6 +262,13 @@ class MemorySettings:
     extract_default_priority: int = AUTO_EXTRACT_DEFAULT_PRIORITY
     recall_min_similarity: float = RECALL_MIN_SIMILARITY
     always_recall_priority: int = ALWAYS_RECALL_PRIORITY
+    # 召回评分权重（0~1）：相关性、精确命中、标签、持久化优先级、新鲜度、
+    # 访问频次。未配置时使用编译期默认；配置值按 proportion 归一。
+    recall_weights: Mapping[str, float] = field(default_factory=dict)
+    # 把窗口命中率映射为相关性权重增益的有界校准：calibration_gain *
+    # (1 - hit_rate)。仅服务轻微倾斜，不会覆盖其它权重维度。
+    recall_calibration_gain: float = 0.06
+    recall_calibration_limit: int = 4
     semantic: SemanticMemorySettings = SemanticMemorySettings()
 
     @classmethod
@@ -354,11 +361,49 @@ class MemorySettings:
             ),
             recall_min_similarity=number("recall_min_similarity", RECALL_MIN_SIMILARITY, 0.0, 1.0),
             always_recall_priority=integer("always_recall_priority", ALWAYS_RECALL_PRIORITY, 0, 10),
+            recall_weights=_recall_weights(value.get("recall_weights")),
+            recall_calibration_gain=number("recall_calibration_gain", 0.06, 0.0, 0.25),
+            recall_calibration_limit=integer("recall_calibration_limit", 4, 1, 256),
             semantic=SemanticMemorySettings.from_mapping(
                 value.get("semantic"),
                 base_directory=base_directory,
             ),
         )
+
+
+def _recall_weights(value: object) -> dict[str, float]:
+    """把配置权重转为严格键名下的有限比例集合。"""
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("memory.recall_weights must be a mapping")
+    allowed = {
+        "relevance",
+        "exact",
+        "tag",
+        "importance",
+        "recency",
+        "access",
+    }
+    unsupported = tuple(key for key in value if str(key).strip() not in allowed)
+    if unsupported:
+        raise ValueError("memory.recall_weights contains unsupported fields")
+    result: dict[str, float] = {}
+    for key in allowed:
+        raw = value.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, bool):
+            raise ValueError(f"memory.recall_weights.{key} must be a number")
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"memory.recall_weights.{key} must be a number") from exc
+        if not math.isfinite(parsed) or parsed < 0.0:
+            raise ValueError(f"memory.recall_weights.{key} is outside the allowed range")
+        result[key] = parsed
+    return result
 
 
 def _compute_embedding(text: str | None) -> list[tuple[int, float]]:
@@ -449,6 +494,32 @@ def _normalize_priority(value: object, field_name: str = "importance") -> int:
     return max(0, min(10, parsed))
 
 
+def _memory_timeframe(item: Mapping[str, object]) -> str:
+    """把记忆条目时间前景转成提示词中的时间段标签。
+
+    优先读取 ``created``/``updated`` 的 Unix 秒级时间戳（3 天窗口），
+    其次读取 ``last_recalled``；解析失败或超窗返回空串，调用方跳过。
+    只输出稳定短标签，不把时间戳或来源字段带入提示词。
+    """
+
+    for key in ("created", "updated"):
+        raw = item.get(key)
+        try:
+            value = float(cast(float | int | str | bytes, raw))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and value > 0 and time.time() - value <= 3 * 86400:
+            return "近期"
+    recalled = item.get("last_recalled")
+    if recalled is not None:
+        try:
+            if math.isfinite(float(recalled)) and time.time() - float(recalled) <= 3 * 86400:
+                return "近期想起"
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return ""
+
+
 @dataclass(frozen=True)
 class Memory:
     """不向调用方暴露 SQLite 行对象的记忆值对象。
@@ -515,6 +586,10 @@ class MemoryService:
         self._semantic_context_threads: set[threading.Thread] = set()
         self._semantic_context_cancellations: set[threading.Event] = set()
         self._semantic_context_closing = False
+        # 调用窗口召回统计：记录最近 32 次的(命中, 首项分数)。
+        self._recall_stats_lock = threading.Lock()
+        self._recall_stats_window: list[tuple[bool, float]] = []
+        self._recall_stats_max_entries = 32
 
     @property
     def settings(self) -> MemorySettings:
@@ -553,6 +628,7 @@ class MemoryService:
 
         value = self._settings
         semantic = self._semantic.status()
+        recall = self.recall_statistics()
         return {
             "enabled": value.enabled,
             "recall_limit": value.recall_limit,
@@ -592,6 +668,32 @@ class MemoryService:
             "semantic_active_model_id": semantic["active_model_id"],
             "semantic_active_model_revision": semantic["active_model_revision"],
             "semantic_active_package_version": semantic["active_package_version"],
+            "recall_total": recall["total"],
+            "recall_hit_rate": recall["hit_rate"],
+            "recall_top_mean_score": recall["top_mean_score"],
+            "recall_calibration": self.recall_calibration(),
+        }
+
+    def recall_statistics(self) -> dict[str, float | int]:
+        """返回最近调用窗口的召回命中率与首项平均分。
+
+        统计在每次召回时经简单有环窗口更新，命中定义为“返回至少一条
+        similarity/exact/tag 任一非零的记忆”；窗口大小固定为 32 次，
+        避免跨日累积拖慢旧统计快照。
+        """
+
+        with self._recall_stats_lock:
+            outcomes = list(self._recall_stats_window)
+        total = len(outcomes)
+        if not total:
+            return {"total": 0, "hit_rate": 0.0, "top_mean_score": 0.0}
+        hits = sum(1 for outcome in outcomes if outcome[0])
+        scores = [outcome[1] for outcome in outcomes if math.isfinite(outcome[1])]
+        mean = sum(scores) / len(scores) if scores else 0.0
+        return {
+            "total": int(total),
+            "hit_rate": round(hits / total, 4),
+            "top_mean_score": round(max(0.0, min(1.0, mean)), 4),
         }
 
     def _rebuild_vector_index(self) -> None:
@@ -1316,9 +1418,32 @@ class MemoryService:
         exact: float,
         tag_match: float,
         now: float,
+        weights: Mapping[str, float] | None = None,
+        calibration: float = 0.0,
     ) -> float:
-        """按相关性、持久化优先级和记忆新鲜度计算确定性召回分。"""
 
+        configured = dict(weights or {})
+        total_configured = sum(configured.values())
+        proportion = {
+            "relevance": configured.get("relevance", RECALL_RELEVANCE_WEIGHT),
+            "exact": configured.get("exact", RECALL_EXACT_WEIGHT),
+            "tag": configured.get("tag", RECALL_TAG_WEIGHT),
+            "importance": configured.get("importance", RECALL_IMPORTANCE_WEIGHT),
+            "recency": configured.get("recency", RECALL_RECENCY_WEIGHT),
+            "access": configured.get("access", RECALL_ACCESS_WEIGHT),
+        }
+        if total_configured > 0 and math.isfinite(total_configured):
+            scale = 1.0 / total_configured
+            proportion = {key: value * scale for key, value in proportion.items()}
+        boost = max(0.0, min(0.4, float(calibration or 0.0)))
+        if boost > 0:
+            moved = proportion["relevance"] * boost
+            keep_ratio = 1.0 - min(
+                1.0, moved / max(proportion["importance"] + proportion["access"], 1e-9)
+            )
+            proportion["relevance"] += moved
+            proportion["importance"] *= keep_ratio
+            proportion["access"] *= keep_ratio
         priority = max(0.0, min(10.0, _safe_float(memory.importance, 0.0))) / 10.0
         # ``updated`` 也会在衰减维护时写入，不能把维护动作误当成近期使用。
         anchor = max(_safe_float(memory.created), _safe_float(memory.last_recalled))
@@ -1330,14 +1455,29 @@ class MemoryService:
         access_count = max(0.0, _safe_float(memory.access_count, 0.0))
         access = min(1.0, math.log1p(access_count) / math.log1p(RECALL_ACCESS_SATURATION))
         score = (
-            max(0.0, min(1.0, similarity)) * RECALL_RELEVANCE_WEIGHT
-            + max(0.0, min(1.0, exact)) * RECALL_EXACT_WEIGHT
-            + max(0.0, min(1.0, tag_match)) * RECALL_TAG_WEIGHT
-            + priority * RECALL_IMPORTANCE_WEIGHT
-            + recency * RECALL_RECENCY_WEIGHT
-            + access * RECALL_ACCESS_WEIGHT
+            max(0.0, min(1.0, similarity)) * proportion["relevance"]
+            + max(0.0, min(1.0, exact)) * proportion["exact"]
+            + max(0.0, min(1.0, tag_match)) * proportion["tag"]
+            + priority * proportion["importance"]
+            + recency * proportion["recency"]
+            + access * proportion["access"]
         )
         return score if math.isfinite(score) else 0.0
+
+    def recall_calibration(self) -> float:
+        """把窗口命中率映射为 0~1 的相关性校准增益。"""
+
+        stats = self.recall_statistics()
+        total = int(stats.get("total", 0) or 0)
+        if total < self._settings.recall_calibration_limit:
+            return 0.0
+        hit_rate = float(stats.get("hit_rate", 0.0) or 0.0)
+        if not math.isfinite(hit_rate):
+            return 0.0
+        return min(
+            self._settings.recall_calibration_gain,
+            max(0.0, self._settings.recall_calibration_gain * (1.0 - hit_rate)),
+        )
 
     def _fts_candidate_ids(self, query: str, limit: int) -> tuple[int, ...]:
         """读取 FTS5 候选；扩展缺失或运行时失效时返回空集合。"""
@@ -1400,6 +1540,44 @@ class MemoryService:
             result.extend(self._from_row(row) for row in rows)
         return tuple(result)
 
+    def _high_priority_memory_ids(
+        self,
+        *,
+        memory_type: str | None,
+        tags: Sequence[str] | None,
+    ) -> tuple[int, ...]:
+        """读取所有达到必召回阈值的候选编号，不受普通候选窗口截断。"""
+
+        threshold = int(self._settings.always_recall_priority)
+        conditions = ["importance >= ?"]
+        parameters: list[object] = [threshold]
+        if memory_type:
+            conditions.append("memory_type = ?")
+            parameters.append(self._safe_memory_type(memory_type))
+        filter_tags = tuple(tags or ())
+        if filter_tags:
+            conditions.append(
+                "("
+                + " OR ".join(
+                    "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(memories.tags) "
+                    "THEN memories.tags ELSE '[]' END) "
+                    "WHERE json_each.type = 'text' AND json_each.value = ?)"
+                    for _ in filter_tags
+                )
+                + ")"
+            )
+            parameters.extend(str(tag) for tag in filter_tags)
+        # max_memories 是数据库硬上限，结果有界且足以覆盖每一条合法的高优先级记忆。
+        parameters.append(self._settings.max_memories)
+        with self._database._lock:
+            rows = self._database.connection.execute(
+                "SELECT id FROM memories WHERE "
+                + " AND ".join(conditions)
+                + " ORDER BY importance DESC, updated DESC, id DESC LIMIT ?",
+                parameters,
+            ).fetchall()
+        return tuple(int(row["id"]) for row in rows)
+
     def search(
         self,
         query: str,
@@ -1456,6 +1634,12 @@ class MemoryService:
             )
             memories_by_id = {item.id: item for item in priority_memories}
             for item in self._fetch_memories_by_ids(
+                self._high_priority_memory_ids(memory_type=memory_type, tags=tags),
+                memory_type=memory_type,
+                tags=tags,
+            ):
+                memories_by_id[item.id] = item
+            for item in self._fetch_memories_by_ids(
                 (*semantic_ids, *indexed_ids, *lexical_ids),
                 memory_type=memory_type,
                 tags=tags,
@@ -1503,6 +1687,8 @@ class MemoryService:
                 exact=exact,
                 tag_match=tag_match,
                 now=now,
+                weights=self._settings.recall_weights,
+                calibration=self.recall_calibration(),
             )
             scored.append((score, memory))
         scored.sort(
@@ -1518,7 +1704,26 @@ class MemoryService:
         selected = tuple(memory for _, memory in scored[:safe_limit])
         if _mark_recalled and not (_cancel_event is not None and _cancel_event.is_set()):
             self._mark_recalled(memory.id for memory in selected)
+        # 召回质量快照：命中按“相关性/精确/标签任一非零”判定，只记录
+        # 首项分；单调递增、有界窗口，失败关闭不进 SQLite。
+        self._record_recall_sample(scored, selected, similarity if query_text else 0.0)
         return selected
+
+    def _record_recall_sample(
+        self,
+        scored: Sequence[tuple[float, Memory]],
+        selected: Sequence[Memory],
+        query_similarity: float,
+    ) -> None:
+        """把本次召回的快照追加到有环窗口，供状态层计算命中率。"""
+
+        del query_similarity  # 保留参数位兼容扩展；命中只看返回集。
+        hit = bool(selected) and any(score > 0.0 for score, _ in scored[:1])
+        top = scored[0][0] if scored else 0.0
+        with self._recall_stats_lock:
+            if len(self._recall_stats_window) >= self._recall_stats_max_entries:
+                self._recall_stats_window.pop(0)
+            self._recall_stats_window.append((hit, float(top)))
 
     def search_memories(
         self,
@@ -2370,8 +2575,10 @@ class MemoryService:
                 priority = _normalize_priority(
                     item.get("priority", item.get("importance", 1)), "priority"
                 )
+                timeframe = _memory_timeframe(item)
+                timeframe_prefix = f"[{timeframe}] " if timeframe else ""
                 tag_prefix = f"[{', '.join(str(tag) for tag in tags)}] " if tags else ""
-                prefix = f"[优先级:{priority}] {tag_prefix}"
+                prefix = f"[优先级:{priority}] {timeframe_prefix}{tag_prefix}"
                 content = str(item["content"])[: self._settings.context_memory_item_chars]
                 lines.append(f"- {prefix}{content}")
         if _cancel_event is not None and _cancel_event.is_set():

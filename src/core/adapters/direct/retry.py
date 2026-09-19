@@ -26,6 +26,13 @@ class RetryPolicy:
     retryable_categories: frozenset[str] = field(default_factory=lambda: _DEFAULT_CATEGORIES)
     retryable_status_codes: frozenset[int] = field(default_factory=lambda: _DEFAULT_STATUS_CODES)
     respect_retry_after: bool = True
+    # 渠道级优雅降级缩放：热度内突发错误时，在 1.0~1.8 之间放大退避，
+    # 避免多个并发回合在同一个故障窗口内同步重试同一渠道。
+    backoff_scale_warmup: float = 1.0
+    backoff_scale_max: float = 1.8
+    fr2_allow_after_first_event: bool = False
+    """首事件后发生网络错误时是否允许在同渠道内重试；默认保持首事件前
+    重试语义，流中出现网络错误由调用方决定继续消费还是换渠道。"""
 
     def __post_init__(self) -> None:
         raw_attempts = self.max_attempts
@@ -58,6 +65,14 @@ class RetryPolicy:
         statuses = frozenset(raw_statuses)
         if not isinstance(self.respect_retry_after, bool):
             raise ValueError("respect_retry_after must be a boolean")
+        if not isinstance(self.fr2_allow_after_first_event, bool):
+            raise ValueError("fr2_allow_after_first_event must be a boolean")
+        warmup = float(self.backoff_scale_warmup)
+        ceiling = float(self.backoff_scale_max)
+        if not all(math.isfinite(value) for value in (warmup, ceiling)):
+            raise ValueError("retry backoff scale values must be finite")
+        if not 1.0 <= warmup <= ceiling <= 5.0:
+            raise ValueError("retry backoff scale values are invalid")
         object.__setattr__(self, "max_attempts", attempts)
         object.__setattr__(self, "initial_delay_seconds", initial)
         object.__setattr__(self, "max_delay_seconds", maximum)
@@ -66,6 +81,9 @@ class RetryPolicy:
         object.__setattr__(self, "retryable_categories", categories)
         object.__setattr__(self, "retryable_status_codes", statuses)
         object.__setattr__(self, "respect_retry_after", self.respect_retry_after)
+        object.__setattr__(self, "fr2_allow_after_first_event", self.fr2_allow_after_first_event)
+        object.__setattr__(self, "backoff_scale_warmup", warmup)
+        object.__setattr__(self, "backoff_scale_max", ceiling)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> RetryPolicy:
@@ -92,6 +110,9 @@ class RetryPolicy:
             "retryable_categories",
             "retryable_status_codes",
             "respect_retry_after",
+            "backoff_scale_warmup",
+            "backoff_scale_max",
+            "fr2_allow_after_first_event",
         }
         values: dict[str, Any] = {}
         for raw_key, raw_value in value.items():
@@ -109,7 +130,9 @@ class RetryPolicy:
     def should_retry(
         self, error: BaseException, *, attempt: int, before_first_event: bool = True
     ) -> bool:
-        if not before_first_event or int(attempt) < 1 or int(attempt) >= self.max_attempts:
+        if not before_first_event and not self.fr2_allow_after_first_event:
+            return False
+        if int(attempt) < 1 or int(attempt) >= self.max_attempts:
             return False
         classified = (
             error
@@ -128,12 +151,35 @@ class RetryPolicy:
             return False
         return True
 
-    def delay_for(self, attempt: int, *, retry_after_seconds: float | None = None) -> float:
+    def delay_for(
+        self,
+        attempt: int,
+        *,
+        retry_after_seconds: float | None = None,
+        warmup_ratio: float = 0.0,
+    ) -> float:
+        """计算第 ``attempt`` 次重试前的退避时长。
+
+        ``warmup_ratio`` 在 0~1 之间时按热度在 ``backoff_scale_warmup`` 与
+        ``backoff_scale_max`` 之间线性放大基础退避，用来在短时间突发错误时
+        给渠道散热；为 0 时行为与旧版本完全一致。
+        """
+
         number = max(1, int(attempt))
-        delay = min(
-            self.max_delay_seconds,
-            self.initial_delay_seconds * self.backoff_multiplier ** (number - 1),
-        )
+        try:
+            scaled = self.initial_delay_seconds * self.backoff_multiplier ** (number - 1)
+        except OverflowError:
+            # 极端参数组合（如 multiplier 接近 1e300）下指数先溢出，
+            # 直接按上限钳制而不是向上抛。
+            scaled = self.max_delay_seconds
+        delay = min(self.max_delay_seconds, scaled)
+        ratio = min(1.0, max(0.0, float(warmup_ratio or 0.0)))
+        if ratio > 0:
+            scale = (
+                self.backoff_scale_warmup
+                + (self.backoff_scale_max - self.backoff_scale_warmup) * ratio
+            )
+            delay = min(self.max_delay_seconds, delay * scale)
         if self.respect_retry_after and retry_after_seconds is not None:
             delay = max(delay, min(self.max_delay_seconds, max(0.0, float(retry_after_seconds))))
         if self.jitter_ratio:

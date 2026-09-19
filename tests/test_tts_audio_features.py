@@ -216,3 +216,43 @@ def test_pcm_audio_feature_analyzer_dispatches_through_tts_coordinator() -> None
     assert len(features) == 1
     assert features[0].viseme == "Open"
     assert features[0].request_id.startswith("speech-")
+
+
+def test_pcm_audio_feature_analyzer_sequences_chunks_and_releases_request_state() -> None:
+    analyzer = PcmAudioFeatureAnalyzer()
+    context = _context("sequence")
+    first = _pcm_chunk(context, "speech-sequence", 20000, frames=800, sample_rate=8000)
+    second = _pcm_chunk(context, "speech-sequence", 0, frames=400, sample_rate=8000)
+    object.__setattr__(second, "is_final", True)
+
+    first_feature = tuple(analyzer.analyze(first) or ())[0]
+    second_feature = tuple(analyzer.analyze(second) or ())[0]
+
+    assert (first_feature.start_ms, first_feature.duration_ms) == (0, 100)
+    assert (second_feature.start_ms, second_feature.duration_ms) == (100, 50)
+    assert analyzer._offsets == {}
+
+
+def test_tts_coordinator_resets_feature_state_when_stream_ends_without_final() -> None:
+    class BrokenBackend:
+        async def stream(self, request):
+            yield SpeechChunk(
+                request.request_id,
+                struct.pack("<800h", *([20000] * 800)),
+                8000,
+                1,
+                is_final=False,
+            )
+            raise RuntimeError("stream interrupted")
+
+    analyzer = PcmAudioFeatureAnalyzer()
+    context = _context("interrupted")
+    coordinator = TTSCoordinator(
+        BrokenBackend(),
+        feature_analyzer=analyzer,
+        feature_sink=lambda _feature: None,
+    )
+
+    asyncio.run(coordinator.enqueue_text(context, "中断。", flush=True))
+
+    assert analyzer._offsets == {}

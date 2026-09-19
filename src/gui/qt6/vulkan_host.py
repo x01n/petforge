@@ -255,7 +255,7 @@ if pyside6_vulkan_available:
         return True, "Qt Quick Vulkan graphics API and alpha buffer requested"
 
     class VulkanPetHost(QQuickView):
-        """使用 Vulkan QRhi 场景图绘制精灵、气泡和互动反馈。"""
+        """兼容宿主；没有 Live2D Vulkan 提供者时拒绝初始化。"""
 
         expressionChanged = Signal(str)
         motionChanged = Signal(str)
@@ -274,10 +274,9 @@ if pyside6_vulkan_available:
             always_on_top: bool = True,
             compatibility_alias: str = "",
         ) -> None:
-            if not isinstance(sprite_renderer, SpriteRenderer):
-                raise TypeError("sprite_renderer must be a SpriteRenderer")
-            if not sprite_renderer.capabilities.available:
-                raise RuntimeError("Vulkan sprite renderer has no valid WebP frame")
+            if isinstance(sprite_renderer, SpriteRenderer):
+                raise RuntimeError("Vulkan Live2D host does not accept a sprite renderer")
+            raise TypeError("VulkanPetHost requires a Live2D Vulkan provider")
             prepared, reason = prepare_vulkan_scenegraph()
             if not prepared:
                 raise RuntimeError(reason)
@@ -566,9 +565,7 @@ if pyside6_vulkan_available:
                     or "Vulkan initialization timed out"
                 )
                 if self._scenegraph_initialized and self._lifecycle.actual_api == _VULKAN_API_NAME:
-                    reason = (
-                        "Vulkan scenegraph did not produce a visible sprite frame before timeout"
-                    )
+                    reason = "Vulkan Live2D provider did not produce a visible frame before timeout"
                 self._set_lifecycle(
                     RendererLifecycleState.FAILED,
                     actual_api=self._lifecycle.actual_api,
@@ -1303,20 +1300,16 @@ if pyside6_vulkan_available:
             event.accept()
 
     def create_vulkan_host(selection: object, **kwargs: object) -> VulkanPetHost:
-        """从统一选择结果创建真实 Vulkan 精灵宿主。"""
+        """从统一选择结果创建 Live2D Vulkan 宿主。"""
 
+        del kwargs
         backend = normalize_renderer_backend(getattr(selection, "backend", ""))
         if backend != RendererBackend.VULKAN.value:
             raise ValueError("Vulkan host factory requires a Vulkan renderer selection")
-        inventory = getattr(selection, "inventory", None)
-        resource_root = getattr(inventory, "root", None)
-        if resource_root is None:
-            raise ValueError("Vulkan renderer selection has no resource inventory")
-        renderer = SpriteRenderer(Path(resource_root) / "sprites")
-        if not renderer.capabilities.available:
-            raise RuntimeError("Vulkan scenegraph requires valid sprite resources")
-        alias = str(getattr(selection, "compatibility_alias", "") or "")
-        return VulkanPetHost(renderer, compatibility_alias=alias, **kwargs)
+        raise RuntimeError(
+            "Vulkan Live2D renderer provider is unavailable; "
+            "Qt Quick Vulkan alone cannot render Cubism models"
+        )
 
 
 else:

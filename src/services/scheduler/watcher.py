@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from threading import Event, Lock, Thread
 
 from gui.platforms.protocol import DesktopPlatform
+from logger.events import log_event
 
 from .triggers import TriggerService
 
@@ -17,6 +19,8 @@ MIN_POLL_TIMEOUT_SECONDS = 0.1
 MAX_POLL_TIMEOUT_SECONDS = 60.0
 SYNC_READ_WAIT_SECONDS = 0.01
 MAX_STALE_READS = 2
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -78,6 +82,11 @@ class DesktopWindowWatcher:
         self._last_identity_at: float | None = None
         self._last_snapshot: dict[str, object] | None = None
         self._status: dict[str, object] = {"status": "stopped", "error": ""}
+        self._poll_count = 0
+        self._change_count = 0
+        self._failure_count = 0
+        self._timeout_count = 0
+        self._last_duration_ms: float | None = None
 
     @property
     def poll_seconds(self) -> float:
@@ -155,6 +164,11 @@ class DesktopWindowWatcher:
             read_status = "stale_in_flight"
         else:
             read_status = "idle"
+        result["poll_count"] = self._poll_count
+        result["change_count"] = self._change_count
+        result["failure_count"] = self._failure_count
+        result["timeout_count"] = self._timeout_count
+        result["last_duration_ms"] = self._last_duration_ms
         result["foreground_window_read"] = {
             "status": read_status,
             "in_flight": in_flight,
@@ -230,6 +244,15 @@ class DesktopWindowWatcher:
                     "status": "degraded",
                     "error": f"{type(exc).__name__}: {exc}",
                 }
+                log_event(
+                    logger,
+                    "scheduler.window.loop_failed",
+                    component="scheduler.window",
+                    status="degraded",
+                    level=logging.WARNING,
+                    reason_code="poll_loop_failed",
+                    fields={"error_type": type(exc).__name__},
+                )
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self._poll_seconds)
             except TimeoutError:
@@ -246,20 +269,43 @@ class DesktopWindowWatcher:
     async def _poll_once(self) -> Mapping[str, object]:
         """串行完成一次读取，避免并发轮询重复消费同一结果。"""
 
+        started = time.monotonic()
+        self._poll_count += 1
+
+        def failed(status: str, error: str, reason: str) -> Mapping[str, object]:
+            self._failure_count += 1
+            self._last_duration_ms = max(0.0, (time.monotonic() - started) * 1000.0)
+            self._status = {"status": status, "error": error}
+            log_event(
+                logger,
+                "scheduler.window.poll.failed",
+                component="scheduler.window",
+                status=status,
+                level=logging.WARNING,
+                duration_ms=self._last_duration_ms,
+                reason_code=reason,
+                fields={"poll_count": self._poll_count},
+            )
+            return self.status()
+
         read = self._get_sync_read()
         if read is None:
+            self._last_duration_ms = max(0.0, (time.monotonic() - started) * 1000.0)
             return self.status()
         if not await self._wait_for_sync_read(read):
             if self._read_is_stale(read):
+                self._last_duration_ms = max(0.0, (time.monotonic() - started) * 1000.0)
                 return self.status()
-            self._status = {
-                "status": "degraded",
-                "error": "foreground_window timed out; synchronous call remains in flight",
-            }
+            self._timeout_count += 1
             self._last_identity_at = None
-            return self.status()
+            return failed(
+                "degraded",
+                "foreground_window timed out; synchronous call remains in flight",
+                "timeout",
+            )
         if self._read_is_stale(read):
             self._clear_sync_read(read)
+            self._last_duration_ms = max(0.0, (time.monotonic() - started) * 1000.0)
             return self.status()
         try:
             if read.error is not None:
@@ -268,26 +314,29 @@ class DesktopWindowWatcher:
             if inspect.isawaitable(result):
                 result = await asyncio.wait_for(result, timeout=self._poll_timeout_seconds)
         except Exception as exc:  # 平台不可用不应终止后台观察任务
-            self._status = {"status": "unavailable", "error": str(exc)}
             self._last_identity_at = None
-            return self.status()
+            return failed("unavailable", str(exc), "platform_read_failed")
         finally:
             self._clear_sync_read(read)
         if self._read_is_stale(read):
+            self._last_duration_ms = max(0.0, (time.monotonic() - started) * 1000.0)
             return self.status()
         if not isinstance(result, Mapping):
-            self._status = {
-                "status": "unavailable",
-                "error": "foreground_window returned non-mapping",
-            }
             self._last_identity_at = None
-            return self.status()
+            return failed(
+                "unavailable",
+                "foreground_window returned non-mapping",
+                "invalid_result",
+            )
         snapshot = dict(result)
         self._last_snapshot = snapshot
         if str(snapshot.get("status", "")).strip().lower() != "available":
-            self._status = {"status": "unavailable", "error": str(snapshot.get("reason", ""))}
             self._last_identity_at = None
-            return self.status()
+            return failed(
+                "unavailable",
+                str(snapshot.get("reason", "")),
+                "platform_unavailable",
+            )
         identity = self._identity(snapshot)
         changed = self._last_identity is not None and identity != self._last_identity
         initial = self._last_identity is None
@@ -309,7 +358,22 @@ class DesktopWindowWatcher:
             snapshot["user_active"] = False
         self._last_snapshot = snapshot
         self._status = {"status": "running", "error": ""}
+        self._last_duration_ms = max(0.0, (time.monotonic() - started) * 1000.0)
         if changed or (initial and self._emit_initial):
+            self._change_count += 1
+            log_event(
+                logger,
+                "scheduler.window.changed",
+                component="scheduler.window",
+                status="changed",
+                duration_ms=self._last_duration_ms,
+                reason_code="initial" if initial else "identity_changed",
+                fields={
+                    "poll_count": self._poll_count,
+                    "payload_fields": len(snapshot),
+                    "user_active": snapshot.get("user_active", False),
+                },
+            )
             await self._triggers.emit("window_changed", snapshot)
         await self._triggers.emit("window_active", snapshot)
         return self.status()

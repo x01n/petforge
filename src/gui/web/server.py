@@ -13,6 +13,7 @@ from math import isfinite
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .action_contract import PUBLIC_ACTION_KINDS
 from .control_surface import friendly_public_text, public_control_state, safe_public_text
 
 __all__ = [
@@ -25,36 +26,6 @@ __all__ = [
 
 LOCAL_CAPABILITY_HEADER = "X-MeaPet-Capability"
 """本地控制面 capability token 的请求头名称。"""
-
-
-PUBLIC_ACTION_KINDS = frozenset(
-    {
-        "open_input",
-        "open_config",
-        "configure_model",
-        "select_model_channel",
-        "submit_text",
-        "stop",
-        "retry",
-        "approve",
-        "grant_session",
-        "deny",
-        "pet_part",
-        "expression",
-        "motion",
-        "show_pet",
-        "toggle_visibility",
-        "center_pet",
-        "nudge_pet",
-        "set_display_size",
-        "toggle_window_lock",
-        "toggle_always_on_top",
-        "toggle_click_through",
-        "restore_click_through",
-        "read_foreground_window",
-        "read_processes",
-    }
-)
 
 _ACTION_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "open_input": frozenset(),

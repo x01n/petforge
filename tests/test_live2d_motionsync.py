@@ -77,6 +77,8 @@ def test_web_html_injects_current_motionsync_profile_and_safe_api() -> None:
     assert renderer.set_mouth_viseme("A") is False
 
 
+@pytest.mark.xvfb
+@pytest.mark.webengine
 @pytest.mark.skipif(shutil.which("xvfb-run") is None, reason="requires Xvfb")
 def test_current_motionsync_visemes_render_with_geometry_guard() -> None:
     project_root = Path(__file__).resolve().parents[1]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import sqlite3
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -25,12 +26,16 @@ class SchedulerRepository:
     """
 
     _MAX_RUN_ROWS = 2048
+    # 每次写入都执行 DELETE NOT IN 是全表 O(n) 修剪；改为每满
+    # _PRUNE_INTERVAL 次写抽样修剪一次，失败不阻断 record_run 主写。
+    _PRUNE_INTERVAL = 32
 
     def __init__(self, database: Database, *, max_run_rows: int = _MAX_RUN_ROWS) -> None:
         if not isinstance(database, Database):
             raise TypeError("database must be a Database")
         self._database = database
         self._max_run_rows = max(1, min(int(max_run_rows), 100_000))
+        self._write_count = 0
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
@@ -377,15 +382,45 @@ class SchedulerRepository:
                     payload_json,
                 ),
             )
-            connection.execute(
-                """
-                DELETE FROM scheduler_runs
-                WHERE id NOT IN (
-                    SELECT id FROM scheduler_runs ORDER BY id DESC LIMIT ?
-                )
-                """,
-                (self._max_run_rows,),
+        self._maybe_prune()
+
+    def _trim_runs(self, connection: Any) -> None:
+        """把执行记录收敛到配置上限，仅由 _maybe_prune 在独立事务内调用。"""
+
+        connection.execute(
+            """
+            DELETE FROM scheduler_runs
+            WHERE id NOT IN (
+                SELECT id FROM scheduler_runs ORDER BY id DESC LIMIT ?
             )
+            """,
+            (self._max_run_rows,),
+        )
+
+    def _maybe_prune(self) -> None:
+        """按写入次数抽样修剪，把修剪失败与 record_run 主写路径隔离。
+
+        计数未满 _PRUNE_INTERVAL 时只做主键索引偏移探测（OFFSET 查询
+        有无超限行），有超限行才修剪，保证小上限场景立即收敛且常规
+        场景不产生全表 DELETE；计数满窗口时必定修剪一次。record_run
+        在主事务提交后调用，使修剪与主写相互独立。
+        """
+
+        self._write_count += 1
+        overdue = self._write_count >= self._PRUNE_INTERVAL
+        try:
+            with self._database.transaction() as connection:
+                if not overdue:
+                    row = connection.execute(
+                        "SELECT id FROM scheduler_runs ORDER BY id DESC LIMIT 1 OFFSET ?",
+                        (self._max_run_rows,),
+                    ).fetchone()
+                    if row is None:
+                        return
+                self._write_count = 0
+                self._trim_runs(connection)
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, RuntimeError, ValueError):
+            pass
 
     def list_runs(
         self,

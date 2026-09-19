@@ -419,6 +419,27 @@ def test_memory_priority_alias_and_recall_order(tmp_path):
     )
 
 
+def test_memory_always_recall_priority_is_not_limited_to_top_candidate_window(
+    tmp_path, monkeypatch
+):
+    """高优先级事实在普通优先级窗口之外也必须参与召回。"""
+
+    service = MemoryService(Database(tmp_path / "always-recall.sqlite3"))
+    for index in range(20):
+        service.create(f"无关高优先级记录 {index}", priority=10)
+    target = service.create("主人明确要求记住的安全偏好", priority=9)
+    monkeypatch.setattr(service._vector_index, "search", lambda _embedding, *, limit: ())
+    service._fts_available = False
+
+    result = service.search(
+        "主人明确要求记住的安全偏好",
+        limit=1,
+        _use_semantic=False,
+    )
+
+    assert result and result[0].id == target.id
+
+
 def test_memory_update_honors_importance_alias_and_explicit_priority(tmp_path):
     service = MemoryService(Database(tmp_path / "priority-update.sqlite3"))
     item = service.create("可更新优先级", importance=2)

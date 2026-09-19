@@ -194,6 +194,35 @@ def test_window_active_duration_condition_queues_one_proactive_turn() -> None:
     asyncio.run(scenario())
 
 
+def test_window_active_dedupe_separates_same_title_process_by_window_id() -> None:
+    conversation = _Conversation()
+    coordinator = _coordinator(
+        conversation,
+        _settings(
+            {"id": "window", "event": "window_active", "instruction": "观察。"},
+            dedupe_seconds=300,
+        ),
+    )
+
+    async def scenario() -> None:
+        common = {
+            "process_name": "code",
+            "app_id": "org.code.Editor",
+            "title": "project",
+            "active_for_seconds": 10,
+            "user_active": True,
+        }
+        first = await coordinator.notify("window_active", {**common, "window_id": "0x1"})
+        second = await coordinator.notify("window_active", {**common, "window_id": "0x2"})
+        await coordinator.wait_idle()
+        assert first["status"] == "queued"
+        assert second["status"] == "queued"
+        assert len(conversation.calls) == 2
+        await coordinator.close()
+
+    asyncio.run(scenario())
+
+
 def test_proactive_queue_recovers_if_turn_finished_wake_arrives_too_early() -> None:
     class BusyConversation:
         def __init__(self) -> None:

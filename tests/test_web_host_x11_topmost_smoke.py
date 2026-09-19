@@ -7,10 +7,17 @@ from time import monotonic
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("MEAPET_X11_TOPMOST_SMOKE") != "1",
-    reason="仅在隔离 X11/窗口管理器冒烟环境中运行",
-)
+# 本文件唯一用例真实构造 QWebEngineView + WebPetHost 并在隔离 X11/
+# 窗口管理器环境（非离屏）中验证 EWMH 置顶终态：属真实 X 服务器用例
+# 且真实启动 WebEngine 子进程，两个标记同时成立。
+pytestmark = [
+    pytest.mark.skipif(
+        os.environ.get("MEAPET_X11_TOPMOST_SMOKE") != "1",
+        reason="仅在隔离 X11/窗口管理器冒烟环境中运行",
+    ),
+    pytest.mark.xvfb,
+    pytest.mark.webengine,
+]
 
 
 def test_webengine_topmost_keeps_xid_and_confirms_ewmh() -> None:

@@ -2021,6 +2021,23 @@ if pyside6_available:
             for key, _label, _section_path, _hint in _SECTIONS:
                 self._ensure_section_page(key)
 
+        def select_section(self, key: object) -> bool:
+            """选择一个公开配置区段，供桌面/网页控制台精准跳转。"""
+
+            normalized = str(key or "").strip().lower()
+            index = next(
+                (
+                    position
+                    for position, (section, *_rest) in enumerate(_SECTIONS)
+                    if section == normalized
+                ),
+                -1,
+            )
+            if index < 0 or not self._ensure_section_page(normalized):
+                return False
+            self._navigation.setCurrentRow(index)
+            return True
+
         def _on_navigation_row_changed(self, row: int) -> None:
             """同步列表、窄屏选择器和页面堆栈。"""
 

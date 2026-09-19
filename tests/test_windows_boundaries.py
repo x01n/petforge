@@ -278,6 +278,61 @@ def test_windows_process_listing_excludes_invalid_pid(monkeypatch) -> None:
     ]
 
 
+def test_windows_process_listing_fails_closed_when_username_is_unavailable(monkeypatch) -> None:
+    """当前用户可知但进程身份缺失时，不能把未知进程列入桌面上下文。"""
+
+    class Process:
+        def __init__(self, info: dict[str, object]) -> None:
+            self.info = info
+
+    class Psutil:
+        @staticmethod
+        def process_iter(_fields):
+            return iter(
+                [
+                    Process(
+                        {
+                            "pid": 41,
+                            "name": "hidden.exe",
+                            "exe": "C:/hidden.exe",
+                            "username": None,
+                        }
+                    ),
+                    Process(
+                        {
+                            "pid": 42,
+                            "name": "empty.exe",
+                            "exe": "C:/empty.exe",
+                            "username": "",
+                        }
+                    ),
+                    Process(
+                        {
+                            "pid": 43,
+                            "name": "owned.exe",
+                            "exe": "C:/owned.exe",
+                            "username": "Alice",
+                        }
+                    ),
+                ]
+            )
+
+    class Getpass:
+        @staticmethod
+        def getuser():
+            return "Alice"
+
+    monkeypatch.setattr(
+        windows_module,
+        "_import_optional",
+        lambda name: {"psutil": Psutil, "getpass": Getpass}.get(name),
+    )
+
+    assert windows_module._psutil_processes(10) == [
+        {"pid": 43, "name": "owned.exe", "executable": "C:/owned.exe"}
+    ]
+
+
 def test_windows_process_listing_rejects_implicit_limit_conversion() -> None:
     """平台边界不能把布尔值或字符串进程数量转换成整数。"""
 

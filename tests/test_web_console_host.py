@@ -7,6 +7,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+# 前十几个 web_bridge 用例为纯 Python 静态断言；只有下面两个控制台宿主
+# 用例在子进程内经 xvfb-run 真实展示 WebEngine 页面，故标记仅打在这两
+# 个用例上，不落模块级。
+
 
 def test_web_bridge_sanitizes_operation_results() -> None:
     try:
@@ -346,6 +352,8 @@ def test_web_bridge_allows_observation_buttons_without_arguments() -> None:
     assert seen == [("read_foreground_window", {}), ("read_processes", {})]
 
 
+@pytest.mark.xvfb
+@pytest.mark.webengine
 def test_legacy_web_control_surface_host_renders_and_routes_clicks(tmp_path: Path) -> None:
     if shutil.which("xvfb-run") is None:
         return
@@ -473,3 +481,91 @@ app.exec()
         ["pet_part", {"part": "head"}],
         ["read_foreground_window", {}],
     ]
+
+
+@pytest.mark.xvfb
+@pytest.mark.webengine
+def test_web_console_reloads_discarded_page_and_keeps_latest_state(tmp_path: Path) -> None:
+    """Qt 丢弃控制台页面后，恢复时必须重载并保留最新公开状态。"""
+
+    if shutil.which("xvfb-run") is None:
+        return
+    try:
+        import PySide6  # noqa: F401
+    except (ImportError, ModuleNotFoundError, OSError):
+        return
+
+    project_root = Path(__file__).resolve().parents[1]
+    source_root = project_root / "src"
+    script = r"""
+import json
+import sys
+from PySide6.QtCore import QTimer
+from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWidgets import QApplication
+from gui.qt6.app import _configure_qt_webengine_renderer
+from gui.qt6.web_console import WebControlSurfaceWindow
+
+_configure_qt_webengine_renderer()
+app = QApplication([])
+state = {
+    "revision": 7,
+    "interaction": {"phase": "idle", "text": "丢弃前的状态"},
+}
+window = WebControlSurfaceWindow(lambda: state, lambda *_args: {"status": "completed"})
+window.resize(640, 480)
+window.show()
+report = {"ready_before": False, "ready_after": False, "pending_text": ""}
+
+def finish(raw):
+    report["ready_after"] = bool(window.page_ready)
+    report["page_text"] = str(raw or "")
+    print(json.dumps(report, ensure_ascii=False))
+    window.shutdown()
+    app.quit()
+
+def poll(attempt=0):
+    if not window.page_ready:
+        if attempt >= 100:
+            print(json.dumps({"error": "initial page timeout"}, ensure_ascii=False))
+            window.shutdown()
+            app.quit()
+            return
+        QTimer.singleShot(50, lambda: poll(attempt + 1))
+        return
+    if not report["ready_before"]:
+        report["ready_before"] = True
+        state["revision"] = 8
+        state["interaction"]["text"] = "丢弃后的最新状态"
+        window._on_lifecycle_state_changed(QWebEnginePage.LifecycleState.Discarded)
+        QTimer.singleShot(50, lambda: poll(attempt + 1))
+        return
+    window.view.page().runJavaScript(
+        "JSON.stringify({text:document.body.innerText, ready:!!window.meapetControlSurface})",
+        finish,
+    )
+
+QTimer.singleShot(50, poll)
+app.exec()
+"""
+    environment = dict(os.environ, PYTHONPATH=str(source_root), MEAPET_WEBENGINE_SOFTWARE="1")
+    command = [sys.executable, "-c", script]
+    if sys.platform.startswith("linux"):
+        command = ["xvfb-run", "-a", "-s", "-screen 0 1280x900x24", *command]
+        environment.update(QT_QPA_PLATFORM="xcb", QT_QUICK_BACKEND="software")
+        environment.pop("WAYLAND_DISPLAY", None)
+    result = subprocess.run(
+        command,
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["ready_before"] is True, payload
+    assert payload["ready_after"] is True, payload
+    assert "丢弃后的最新状态" in payload["page_text"]
+    assert payload["page_text"].find("丢弃后的最新状态") >= 0

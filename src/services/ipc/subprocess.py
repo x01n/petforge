@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from time import monotonic
@@ -186,7 +187,7 @@ class JSONLSubprocessClient:
         self.shutdown_command = shutdown_command
         self.shutdown_event = shutdown_event
         self.startup_passthrough_events = frozenset(startup_passthrough_events)
-        self.startup_events: list[JSONLMessage] = []
+        self.startup_events: deque[JSONLMessage] = deque(maxlen=64)
         self._process: asyncio.subprocess.Process | None = None
         self._wait_task: asyncio.Task[int] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -200,6 +201,11 @@ class JSONLSubprocessClient:
         self._disposing = False
         self._poisoned = False
         self._closed = False
+        # 崩溃重启退避：连续启动失败时按 2 的幂次延长等待，封顶 8s。
+        # 成功启动（ready 握手完成）后清零。start 失败路径本身仍抛错，
+        # 这里只记录下一次启动前必须等待的时长。
+        self._backoff_remaining: float = 0.0
+        self._start_failure_count = 0
 
     @property
     def process(self) -> asyncio.subprocess.Process | None:
@@ -233,6 +239,7 @@ class JSONLSubprocessClient:
         async with self._process_lock:
             if self._closed:
                 raise IPCProcessError("client_closed")
+            await self._wait_start_backoff()
             if self.running:
                 return JSONLMessage(
                     self.ready_event,
@@ -267,6 +274,7 @@ class JSONLSubprocessClient:
                     **process_group_spawn_kwargs(),
                 )
             except (OSError, RuntimeError) as exc:
+                self._note_start_failure()
                 log_event(
                     logger,
                     "ipc.worker.start",
@@ -304,6 +312,7 @@ class JSONLSubprocessClient:
                     passthrough=self.startup_passthrough_events,
                 )
             except asyncio.CancelledError:
+                self._note_start_failure()
                 log_event(
                     logger,
                     "ipc.worker.start",
@@ -317,6 +326,7 @@ class JSONLSubprocessClient:
                 await self._dispose()
                 raise
             except BaseException as exc:
+                self._note_start_failure()
                 reason_code = (
                     exc.reason_code if isinstance(exc, IPCProcessError) else "startup_failed"
                 )
@@ -332,6 +342,8 @@ class JSONLSubprocessClient:
                 )
                 await self._dispose()
                 raise
+            self._start_failure_count = 0
+            self._backoff_remaining = 0.0
             log_event(
                 logger,
                 "ipc.worker.start",
@@ -341,6 +353,22 @@ class JSONLSubprocessClient:
                 fields={"backend": self.backend, "pid": process.pid},
             )
             return ready
+
+    def _note_start_failure(self) -> None:
+        """记录一次连续启动失败，并计算下一次启动前的指数退避等待。"""
+
+        self._start_failure_count += 1
+        backoff = 2.0 ** min(self._start_failure_count, 7)
+        self._backoff_remaining = min(8.0, backoff)
+
+    async def _wait_start_backoff(self) -> None:
+        """在崩溃/启动失败后延迟下一次 spawn，避免无界重启动。"""
+
+        remaining = self._backoff_remaining
+        if remaining <= 0:
+            return
+        await asyncio.sleep(remaining)
+        self._backoff_remaining = 0.0
 
     async def request(
         self,
@@ -708,6 +736,15 @@ class JSONLSubprocessClient:
                 if process.stdin is not None and not process.stdin.is_closing():
                     try:
                         process.stdin.close()
+                        wait_closed = getattr(process.stdin, "wait_closed", None)
+                        if callable(wait_closed):
+                            try:
+                                await asyncio.wait_for(
+                                    wait_closed(),
+                                    timeout=min(self.shutdown_timeout_seconds, 0.5),
+                                )
+                            except (BrokenPipeError, ConnectionError, TimeoutError):
+                                pass
                     except (BrokenPipeError, ConnectionError, OSError, RuntimeError):
                         pass
                 if graceful and process.returncode is None:

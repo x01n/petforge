@@ -264,7 +264,9 @@ class SentenceTransformerProcess:
                     timeout_seconds=self._settings.timeout_seconds,
                     cancel_event=cancel_event,
                 )
-            except BaseException:
+            except (SemanticMemoryError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+                # 协议损坏、轮询超时或对端退出：进程状态不可信，回收后由
+                # 下次调用重新拉进程。
                 self._terminate()
                 raise
         values = response.get("vectors")

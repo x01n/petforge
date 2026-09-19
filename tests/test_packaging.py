@@ -58,7 +58,9 @@ def test_sdist_has_an_explicit_local_artifact_boundary() -> None:
     only_include = set(sdist.get("only-include", ()))
     exclude = set(sdist["exclude"])
 
-    roots = include or only_include
+    # Hatch 还会纳入 force-include 文件及项目元数据引用的 README。
+    roots = (include or only_include) | set(sdist.get("force-include", {}))
+    roots.add(_pyproject()["project"]["readme"])
     assert roots >= {
         "src",
         "docs",

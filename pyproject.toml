@@ -108,6 +108,14 @@ exclude = [
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra"
+markers = [
+  "unit: 轻量无 GUI 单元测试",
+  "gui: 需要 QApplication/离屏 Qt 的用例",
+  "xvfb: 需要真实 Xvfb/WebEngine 子进程的用例",
+  "webengine: 需要真实 WebEngine 子进程的用例",
+  "integration: 跨服务集成用例",
+  "e2e: 端到端截图像素验收，单独一层运行",
+]
 
 [tool.ruff]
 target-version = "py311"

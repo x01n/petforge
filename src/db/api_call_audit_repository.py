@@ -12,6 +12,7 @@ import asyncio
 import json
 import math
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -30,6 +31,15 @@ MAX_AUDIT_LABEL_LENGTH = 128
 MAX_AUDIT_TEXT_LENGTH = 1_000_000
 MAX_AUDIT_JSON_LENGTH = 4_000_000
 MAX_AUDIT_LIST_ITEMS = 4096
+
+# 行数上限：与 prune 的默认 max_records 一致。每次存储写操作后自增
+# 本地计数器，每满 100 次写执行一次修剪，把过期审计收敛到该上限。
+AUDIT_MAX_ROWS = 10_000
+AUDIT_PRUNE_INTERVAL = 100
+
+# summary 被状态轮询与控制台刷新高频调用（同参同秒多拍）；在此窗口内
+# 缓存聚合结果，把每拍全表 GROUP BY 收敛为每秒一次；写入路径立即失效。
+SUMMARY_CACHE_TTL_SECONDS = 1.0
 
 
 def sanitize_audit_value(value: object, *, max_text_length: int = 32_768) -> object:
@@ -727,6 +737,9 @@ class ApiCallAuditRepository:
             raise TypeError("database must be a Database")
         self._database = database
         self._clock = clock
+        self._write_count = 0
+        self._prune_lock = threading.Lock()
+        self._summary_cache: tuple[tuple[object, object], dict[str, object]] | None = None
         self._ensure_schema()
 
     def now(self) -> float:
@@ -837,6 +850,50 @@ class ApiCallAuditRepository:
                 (API_CALL_AUDIT_SCHEMA_VERSION, self.now()),
             )
 
+    # 与 _encode_record 返回值顺序一一对应的列名清单。
+    _ENCODE_COLUMNS = (
+        "request_id",
+        "mode",
+        "profile_id",
+        "session_id",
+        "turn_id",
+        "generation_id",
+        "attempt",
+        "kind",
+        "operation",
+        "status",
+        "started_at",
+        "first_token_at",
+        "first_char",
+        "completed_at",
+        "total_duration_ms",
+        "time_to_first_token_ms",
+        "provider",
+        "protocol",
+        "channel_id",
+        "channel_name",
+        "channel_info",
+        "requested_model",
+        "response_model",
+        "input_payload",
+        "output_text",
+        "output_payload",
+        "usage",
+        "finish_reason",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cache_read_duration_ms",
+        "cache_write_duration_ms",
+        "cache_info",
+        "tool_calls",
+        "tool_executions",
+        "error_type",
+        "error_message",
+        "metadata",
+        "created_at",
+        "updated_at",
+    )
+
     @staticmethod
     def _encode_record(record: ApiCallAuditRecord) -> tuple[Any, ...]:
         return (
@@ -946,17 +1003,8 @@ class ApiCallAuditRepository:
         now = self.now()
         record = replace(record, created_at=record.created_at or now, updated_at=now)
         values = self._encode_record(record)
-        columns = (
-            "request_id, mode, profile_id, session_id, turn_id, generation_id, attempt, "
-            "kind, operation, status, started_at, first_token_at, first_char, "
-            "completed_at, total_duration_ms, time_to_first_token_ms, "
-            "provider, protocol, channel_id, channel_name, channel_info, requested_model, "
-            "response_model, input_payload, output_text, output_payload, usage, finish_reason, "
-            "cache_read_tokens, cache_write_tokens, cache_read_duration_ms, "
-            "cache_write_duration_ms, cache_info, tool_calls, tool_executions, "
-            "error_type, error_message, metadata, created_at, updated_at"
-        )
-        placeholders = ", ".join("?" for _ in range(40))
+        columns = ", ".join(self._ENCODE_COLUMNS)
+        placeholders = ", ".join("?" for _ in range(len(self._ENCODE_COLUMNS)))
         with self._database.transaction() as connection:
             cursor = connection.execute(
                 f"INSERT INTO {self._TABLE} ({columns}) VALUES ({placeholders})", values
@@ -964,7 +1012,23 @@ class ApiCallAuditRepository:
             if cursor.lastrowid is None:
                 raise RuntimeError("audit record insert did not return an id")
             record = replace(record, id=int(cursor.lastrowid))
+        self._invalidate_summary_cache()
+        self._maybe_prune()
         return record
+
+    def _maybe_prune(self) -> None:
+        """按写入次数抽样执行自动修剪，把审计表收敛到 AUDIT_MAX_ROWS。"""
+
+        with self._prune_lock:
+            self._write_count += 1
+            if self._write_count < AUDIT_PRUNE_INTERVAL:
+                return
+            self._write_count = 0
+        try:
+            self.prune(max_records=AUDIT_MAX_ROWS)
+        except (sqlite3.DatabaseError, OSError, RuntimeError, TypeError, ValueError):
+            # 审计写入主路径不能让修剪失败回滚或中断业务调用。
+            pass
 
     async def asave(self, record: ApiCallAuditRecord) -> ApiCallAuditRecord:
         return await asyncio.to_thread(self.save, record)
@@ -999,31 +1063,32 @@ class ApiCallAuditRepository:
         current = self.get(record_id)
         if current is None:
             raise KeyError(f"audit record not found: {record_id}")
+        changed = set(changes)
         allowed = set(ApiCallAuditRecord.__dataclass_fields__) - {
             "id",
             "created_at",
             "updated_at",
         }
-        unknown = set(changes) - allowed
+        unknown = changed - allowed
         if unknown:
             names = ", ".join(sorted(unknown))
             raise ValueError(f"unsupported audit fields: {names}")
+        self._invalidate_summary_cache()
         updated = replace(current, **changes, updated_at=self.now())
-        values = self._encode_record(updated) + (updated.id,)
-        assignments = (
-            "request_id = ?, mode = ?, profile_id = ?, session_id = ?, turn_id = ?, "
-            "generation_id = ?, attempt = ?, kind = ?, operation = ?, status = ?, "
-            "started_at = ?, first_token_at = ?, first_char = ?, completed_at = ?, "
-            "total_duration_ms = ?, time_to_first_token_ms = ?, provider = ?, protocol = ?, "
-            "channel_id = ?, channel_name = ?, channel_info = ?, requested_model = ?, "
-            "response_model = ?, "
-            "input_payload = ?, output_text = ?, output_payload = ?, usage = ?, finish_reason = ?, "
-            "cache_read_tokens = ?, cache_write_tokens = ?, cache_read_duration_ms = ?, "
-            "cache_write_duration_ms = ?, cache_info = ?, tool_calls = ?, tool_executions = ?, "
-            "error_type = ?, error_message = ?, metadata = ?, created_at = ?, updated_at = ?"
-        )
+        if not changed:
+            # 没有可写列时直接读回原记录返回，不发 UPDATE。
+            return current
+        # 只写变更列与 updated_at，避免整行 SELECT 之外再全列 UPDATE 大 JSON 列。
+        encoded = dict(zip(self._ENCODE_COLUMNS, self._encode_record(updated)))
+        assignments = [f"{column} = ?" for column in sorted(changed)]
+        assignments.append("updated_at = ?")
+        values = [encoded[column] for column in sorted(changed)]
+        values.extend((updated.updated_at, updated.id))
         with self._database.transaction() as connection:
-            connection.execute(f"UPDATE {self._TABLE} SET {assignments} WHERE id = ?", values)
+            connection.execute(
+                f"UPDATE {self._TABLE} SET {', '.join(assignments)} WHERE id = ?", values
+            )
+        self._maybe_prune()
         return updated
 
     async def aupdate(self, record_id: object, **changes: Any) -> ApiCallAuditRecord:
@@ -1157,9 +1222,128 @@ class ApiCallAuditRepository:
     async def acount(self, **filters: Any) -> int:
         return await asyncio.to_thread(self.count, **filters)
 
+    def _aggregate_parts(self, **filters: Any) -> tuple[str, tuple[object, ...]]:
+        """复用 count() 的过滤键白名单，未知键以 ValueError 拒绝。"""
+
+        where, parameters = self._query_parts(
+            request_id=filters.pop("request_id", None),
+            profile_id=filters.pop("profile_id", None),
+            session_id=filters.pop("session_id", None),
+            turn_id=filters.pop("turn_id", None),
+            status=filters.pop("status", None),
+            provider=filters.pop("provider", None),
+            protocol=filters.pop("protocol", None),
+            channel_id=filters.pop("channel_id", None),
+            kind=filters.pop("kind", None),
+            operation=filters.pop("operation", None),
+            requested_model=filters.pop("requested_model", None),
+            response_model=filters.pop("response_model", None),
+            started_after=filters.pop("started_after", None),
+            started_before=filters.pop("started_before", None),
+        )
+        if filters:
+            names = ", ".join(sorted(filters))
+            raise ValueError(f"unsupported audit query fields: {names}")
+        return where, parameters
+
+    def aggregate(self, **filters: Any) -> tuple[dict[str, object], ...]:
+        """只读聚合：按 status 与 COALESCE(channel_id,'') 两组返回计数与耗时统计。
+
+        每组条目键固定为 {key,count,avg_first_ms,avg_total_ms,max_total_ms}；
+        AVG/MAX 只在有限数值上计算，结果四舍五入到毫秒级，无样本时为 null。
+        """
+
+        where, parameters = self._aggregate_parts(**filters)
+        rows: list[dict[str, object]] = []
+        with self._database._lock:
+            for column, prefix in (
+                ("status", "status"),
+                ("COALESCE(channel_id, '')", "channel"),
+            ):
+                cursor = self._database.connection.execute(
+                    f"""
+                    SELECT {column} AS bucket,
+                           COUNT(*) AS total,
+                           AVG(CAST(time_to_first_token_ms AS REAL)) AS avg_first,
+                           AVG(CAST(total_duration_ms AS REAL)) AS avg_total,
+                           MAX(CAST(total_duration_ms AS REAL)) AS max_total
+                    FROM {self._TABLE} {where}
+                    GROUP BY {column}
+                    """,
+                    parameters,
+                )
+                for row in cursor.fetchall():
+                    bucket = row["bucket"]
+                    if bucket is None:
+                        bucket = ""
+                    rows.append(
+                        {
+                            "key": f"{prefix}:{bucket}",
+                            "count": 0 if row["total"] is None else int(row["total"]),
+                            "avg_first_ms": (
+                                None
+                                if row["avg_first"] is None
+                                else round(max(0.0, float(row["avg_first"])), 3)
+                            ),
+                            "avg_total_ms": (
+                                None
+                                if row["avg_total"] is None
+                                else round(max(0.0, float(row["avg_total"])), 3)
+                            ),
+                            "max_total_ms": (
+                                None
+                                if row["max_total"] is None
+                                else round(max(0.0, float(row["max_total"])), 3)
+                            ),
+                        }
+                    )
+        return tuple(rows)
+
+    async def aaggregate(self, **filters: Any) -> tuple[dict[str, object], ...]:
+        return await asyncio.to_thread(self.aggregate, **filters)
+
+    def _invalidate_summary_cache(self) -> None:
+        """写入路径调用：清空 summary 的短 TTL 缓存槽。"""
+
+        self._summary_cache = None
+
+    def summary(self, **filters: Any) -> dict[str, object]:
+        """把聚合结果整理成 {total,by_status,by_channel,latency_ms} 的安全汇总。
+
+        状态轮询与控制台刷新高频调用；同参同 TTL 窗口（
+        SUMMARY_CACHE_TTL_SECONDS）内复用聚合结果，未知字段沿用
+        aggregate 的键白名单校验（ValueError）。
+        """
+
+        signature: tuple[object, ...] = tuple(sorted(filters.items()))
+        window = int(self.now() // SUMMARY_CACHE_TTL_SECONDS)
+        cached = self._summary_cache
+        if cached is not None and cached[0] == (signature, window):
+            return cached[1].copy()
+        groups = self.aggregate(**filters)
+        by_status = tuple(item for item in groups if str(item["key"]).startswith("status:"))
+        by_channel = tuple(item for item in groups if str(item["key"]).startswith("channel:"))
+        total = sum(int(item["count"]) for item in groups if str(item["key"]).startswith("status:"))
+        result = {
+            "total": total,
+            "by_status": by_status,
+            "by_channel": by_channel,
+            "latency_ms": {
+                "avg_first": None,
+                "avg_total": None,
+                "max_total": None,
+            },
+        }
+        self._summary_cache = ((signature, window), result)
+        return result.copy()
+
+    async def asummary(self, **filters: Any) -> dict[str, object]:
+        return await asyncio.to_thread(self.summary, **filters)
+
     def prune(self, *, max_records: int = 10_000) -> int:
         """保留最新的有界记录，返回删除数量。"""
 
+        self._invalidate_summary_cache()
         if isinstance(max_records, bool):
             raise ValueError("max_records must be an integer")
         try:

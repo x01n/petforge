@@ -21,7 +21,7 @@ from .protocol import (
     normalize_renderer_backend,
     renderer_backend_compatibility_alias,
 )
-from .threed import probe_qt_vulkan_runtime
+from .threed import probe_live2d_vulkan_runtime, probe_qt_vulkan_runtime
 
 
 class RuntimeCapabilityState(StrEnum):
@@ -118,7 +118,9 @@ def probe_render_assets(root: str | Path) -> RenderAssetInventory:
     if invalid_models:
         warnings.append(f"{invalid_models} Live2D .model3.json descriptor(s) are invalid")
     if not models:
-        warnings.append("no usable Live2D model3 descriptor was found; sprite fallback is required")
+        warnings.append(
+            "no usable Live2D model3 descriptor was found; Live2D rendering is unavailable"
+        )
 
     sprite_root = resource_root / "sprites"
     sprite_paths = _unique_sorted(sprite_root.glob("*.webp")) if sprite_root.is_dir() else ()
@@ -126,7 +128,7 @@ def probe_render_assets(root: str | Path) -> RenderAssetInventory:
     if len(sprites) != len(sprite_paths):
         warnings.append("invalid WebP sprite files were ignored")
     if not sprites:
-        warnings.append("no WebP sprite fallback was found")
+        warnings.append("no valid WebP sprite resource was found for explicit sprite rendering")
 
     return RenderAssetInventory(
         root=resource_root,
@@ -240,13 +242,14 @@ class RendererSelection:
 
     @property
     def allows_runtime_fallback(self) -> bool:
-        """仅自动选择允许运行期降级到精灵。
+        """返回是否允许运行期替换渲染后端。
 
-        显式后端是用户的可验证选择；即使运行期加载失败，也不能静默把
-        另一种渲染器当成已经启用的结果。
+        MeaPet 不再把精灵作为任何 Live2D 后端的默认降级路径。精灵仍可由
+        用户显式选择，但 Live2D 页面、原生 OpenGL 或 Vulkan Live2D 失败时
+        必须保留失败状态，避免控制台显示的后端与实际画面不一致。
         """
 
-        return self.requested_backend == RendererBackend.AUTO.value
+        return False
 
     @property
     def model_path(self) -> Path | None:
@@ -357,29 +360,39 @@ def _default_vulkan_factory(selection: RendererSelection, **host_options: Any) -
 
 
 def _default_vulkan_probe(inventory: RenderAssetInventory) -> RuntimeCapability:
-    """探测 Qt Vulkan 场景图入口及当前后端所需精灵资源。"""
+    """探测 Qt Vulkan 和真实 Live2D Vulkan 提供者。"""
 
-    if not inventory.sprite_available:
+    if not inventory.live2d_available:
         return RuntimeCapability(
-            name="vulkan_qt_runtime",
+            name="vulkan_live2d_runtime",
             state=RuntimeCapabilityState.UNAVAILABLE,
-            detail=(
-                "Vulkan rendering is unavailable: scenegraph requires at least one valid "
-                "WebP sprite frame"
-            ),
-            evidence=("missing:sprite_frame",),
+            detail=("Vulkan rendering is unavailable: Live2D requires a valid model3 descriptor"),
+            evidence=("missing:live2d_model",),
         )
 
     probe = probe_qt_vulkan_runtime()
+    if not probe.available:
+        return RuntimeCapability(
+            name="vulkan_live2d_runtime",
+            state=RuntimeCapabilityState.UNAVAILABLE,
+            detail="Vulkan rendering is unavailable: " + probe.detail,
+            evidence=probe.evidence,
+        )
+
+    provider = probe_live2d_vulkan_runtime()
+    if not provider.available:
+        return RuntimeCapability(
+            name="vulkan_live2d_runtime",
+            state=RuntimeCapabilityState.UNAVAILABLE,
+            detail="Vulkan rendering is unavailable: " + provider.detail,
+            evidence=probe.evidence + provider.evidence,
+        )
+
     return RuntimeCapability(
-        name="vulkan_qt_runtime",
-        state=(
-            RuntimeCapabilityState.AVAILABLE
-            if probe.available
-            else RuntimeCapabilityState.UNAVAILABLE
-        ),
-        detail=probe.detail,
-        evidence=probe.evidence,
+        name="vulkan_live2d_runtime",
+        state=RuntimeCapabilityState.AVAILABLE,
+        detail="Qt Quick Vulkan and the Live2D Vulkan provider are available",
+        evidence=probe.evidence + provider.evidence,
     )
 
 
@@ -433,8 +446,7 @@ class RendererRegistry:
 
     选择阶段只回答“哪个后端具备实际能力”；初始化阶段再验证工厂和实例
     生命周期。显式后端初始化失败始终返回 ``FAILED``，不会在注册表内部
-    偷换为精灵。只有 ``requested_backend=auto`` 的调用方才可以根据选择
-    结果自行执行既有回退策略。
+    偷换为精灵。精灵只有在用户明确请求 ``sprite`` 时才会进入选择结果。
     """
 
     def __init__(self, registrations: Iterable[RendererRegistration] = ()) -> None:
@@ -446,8 +458,8 @@ class RendererRegistry:
     def default(cls) -> RendererRegistry:
         """返回当前发行版的默认后端注册表。
 
-        ``vulkan`` 工厂创建真实 Qt Quick 场景图宿主；选择阶段只验证
-        入口和资源，实例仍须通过场景图 API 回读及可见帧验证。
+        ``vulkan`` 注册项只在 Qt Quick Vulkan 和真实 Live2D Vulkan 提供者
+        都通过探测时可用；选择阶段不会把精灵场景图当作 Live2D。
         """
 
         return cls(
@@ -695,9 +707,7 @@ class RendererRegistry:
                 RendererBackend.OPENGL,
                 "auto selected the native OpenGL Live2D backend because Web Live2D is unavailable",
             )
-        if inventory.sprite_available:
-            return selected(RendererBackend.SPRITE, "auto selected the sprite fallback backend")
-        return unavailable("auto found no usable rendering backend")
+        return unavailable("auto found no usable Live2D rendering backend")
 
     def initialize(
         self,

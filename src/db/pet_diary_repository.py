@@ -22,6 +22,12 @@ MAX_DIARY_CONTENT_LENGTH = 10_000
 MAX_DIARY_TAGS = 16
 MAX_DIARY_TAG_LENGTH = 64
 
+# 每次写入都执行 DELETE NOT IN 全表修剪是 O(n) 的每写开销（第 10 轮
+# 诊断）。改为按本地写计数抽样：每满 AUDIT_PRUNE_INTERVAL 次写执行
+# 一次修剪；修剪与主写相互独立，失败不阻断审计（与 api_call_audit_
+# repository 的 _maybe_prune 采用同一思路）。
+AUDIT_PRUNE_INTERVAL = 32
+
 
 @dataclass(frozen=True)
 class PetDiaryEntry:
@@ -130,6 +136,8 @@ class PetDiaryRepository:
         self._clock = clock or time.time
         self._max_audit_rows = max(1, min(int(max_audit_rows), 100_000))
         self._access_key = object()
+        self._write_count = 0
+        self._prune_interval = max(1, int(AUDIT_PRUNE_INTERVAL))
         self._ensure_schema()
 
     @staticmethod
@@ -243,6 +251,7 @@ class PetDiaryRepository:
                 connection.execute(statement)
 
     def _now(self) -> float:
+        """返回由注入时钟给出的有限非负时间戳。"""
         try:
             value = float(self._clock())
         except (TypeError, ValueError, OverflowError) as exc:
@@ -429,6 +438,10 @@ class PetDiaryRepository:
                 payload,
             ),
         )
+
+    def _trim_audit(self, connection: Any) -> None:
+        """把审计行收敛到配置上限，仅由 _maybe_prune 在独立事务内调用。"""
+
         connection.execute(
             """
             DELETE FROM pet_diary_audit
@@ -438,6 +451,31 @@ class PetDiaryRepository:
             """,
             (self._max_audit_rows,),
         )
+
+    def _maybe_prune(self) -> None:
+        """按写入次数抽样修剪，把修剪失败与审计主写路径隔离。
+
+        计数未满 _prune_interval 时只做主键索引偏移探测（OFFSET 查询
+        有无超限行），有超限行才修剪，保证小上限场景立即收敛且常规
+        场景不产生全表 DELETE；计数满窗口时必定修剪一次。_record_audit
+        在主事务提交后调用，使修剪与主写相互独立。
+        """
+
+        self._write_count += 1
+        overdue = self._write_count >= self._prune_interval
+        try:
+            with self._database.transaction() as connection:
+                if not overdue:
+                    row = connection.execute(
+                        "SELECT id FROM pet_diary_audit ORDER BY id DESC LIMIT 1 OFFSET ?",
+                        (self._max_audit_rows,),
+                    ).fetchone()
+                    if row is None:
+                        return
+                self._write_count = 0
+                self._trim_audit(connection)
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, RuntimeError, ValueError):
+            pass
 
     @staticmethod
     def _select_entry(connection: Any, entry_id: int) -> Any:
@@ -554,6 +592,7 @@ class PetDiaryRepository:
                 occurred_at=now,
                 details={"visibility": entry.visibility, "priority": entry.priority},
             )
+        self._maybe_prune()
         return entry
 
     def _get(
@@ -702,6 +741,7 @@ class PetDiaryRepository:
                 occurred_at=now,
                 details={"fields": sorted(normalized)},
             )
+        self._maybe_prune()
         return entry
 
     def _set_archived(
@@ -745,6 +785,7 @@ class PetDiaryRepository:
                 private_access=entry.is_private,
                 occurred_at=now,
             )
+        self._maybe_prune()
         return entry
 
     def _delete(self, access: object, entry_id: object, *, force: bool) -> bool:
@@ -785,6 +826,7 @@ class PetDiaryRepository:
             )
         if blocked:
             raise PermissionError("diary entry is protected by retention_until")
+        self._maybe_prune()
         return True
 
     def _archive_expired(self, access: object) -> tuple[int, ...]:
@@ -820,6 +862,7 @@ class PetDiaryRepository:
                     occurred_at=now,
                     details={"reason": "retention_expired"},
                 )
+        self._maybe_prune()
         return entry_ids
 
     def _list_audit(

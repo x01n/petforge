@@ -647,6 +647,8 @@ class WebLive2DRenderer:
             state=RendererReadyState.PENDING,
             reason_code="page_pending",
         )
+        self._performance_diagnostics: dict[str, object] = {}
+        self._performance_next_at = 0.0
 
     @property
     def capabilities(self) -> RendererCapabilities:
@@ -702,6 +704,80 @@ class WebLive2DRenderer:
             "frame_rate": self._frame_rate,
             "geometry_audit_hz": self._geometry_audit_hz,
         }
+
+    @property
+    def performance_diagnostics(self) -> Mapping[str, object]:
+        """异步返回页面端实际渲染计数的最近快照。"""
+
+        return dict(getattr(self, "_performance_diagnostics", {}))
+
+    def request_performance_diagnostics(self) -> Mapping[str, object]:
+        """向页面请求渲染计数；回调完成前保留上一份快照。"""
+
+        now = monotonic()
+        if now < self._performance_next_at:
+            return self.performance_diagnostics
+        self._performance_next_at = now + 0.5
+        if self._view is None or not self._page_ready or not self._page_bridge_ready:
+            return self.performance_diagnostics
+        script = """(function() {
+          const api = window.meapetLive2D;
+          if (!api || typeof api.debug !== 'function') return null;
+          const debug = api.debug();
+          return JSON.stringify(debug && debug.renderPerformance ? debug.renderPerformance : null);
+        })()"""
+        try:
+            page = self._view.page()
+            page.runJavaScript(script, self._on_performance_diagnostics)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return self.performance_diagnostics
+        return self.performance_diagnostics
+
+    def _on_performance_diagnostics(self, payload: object) -> None:
+        """接收页面渲染计数并过滤为有限数字。"""
+
+        value: object = payload
+        if isinstance(payload, str):
+            try:
+                value = json.loads(payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = None
+        if not isinstance(value, Mapping):
+            return
+        allowed = (
+            "targetFrameRate",
+            "renderIntervalMs",
+            "renderedFrames",
+            "throttledFrames",
+            "frameTimeAccumulatorMs",
+            "frameTimeSamples",
+            "largeFrameDeltas",
+            "geometryAuditHz",
+            "geometryAudits",
+            "geometryAuditCacheHits",
+            "geometryAuditCacheMisses",
+            "geometryVertexDirtyFrames",
+            "geometryStructuralDirtyFrames",
+        )
+        diagnostics: dict[str, object] = {}
+        for key in allowed:
+            item = value.get(key)
+            if isinstance(item, (int, float)) and not isinstance(item, bool):
+                number = float(item)
+                if math.isfinite(number) and number >= 0.0:
+                    diagnostics[key] = number
+        samples = diagnostics.get("frameTimeSamples", 0.0)
+        if isinstance(samples, float) and samples > 0.0:
+            accumulator = diagnostics.get("frameTimeAccumulatorMs", 0.0)
+            frame_time_ms = round(
+                float(accumulator) / samples if isinstance(accumulator, float) else 0.0,
+                1,
+            )
+            if frame_time_ms > 1_000_000.0:
+                frame_time_ms = 1_000_000.0
+            diagnostics["frame_time_ms"] = frame_time_ms
+        diagnostics["sampled_at"] = monotonic()
+        self._performance_diagnostics = diagnostics
 
     def set_frame_rate(self, value: float) -> bool:
         """更新页面绘制帧率，并让下一次时钟 tick 立即生效。"""
@@ -2050,8 +2126,8 @@ class WebLive2DRenderer:
                 pass
 
     def _set_unavailable(self, message: str, *, notify: bool = True) -> None:
-        # 页面/模型报告错误后，原生 Qt 输入回退不能继续把已失效模型当作
-        # 可命中对象；清掉就绪标志让宿主暂停部位反馈，等待精灵回退或重载。
+        # 页面/模型报告错误后，原生 Qt 输入不能继续把已失效模型当作
+        # 可命中对象；清掉就绪标志让宿主暂停部位反馈，等待宿主重载或重启。
         self._fail_pending_model_reload(message)
         self._model_ready = False
         self._set_page_bridge_ready(False)
@@ -2605,6 +2681,14 @@ canvas{{touch-action:none}}
     pendingSeconds: 0,
     renderedFrames: 0,
     throttledFrames: 0,
+    // 每帧耗时采样：只在真正提交渲染的 tick 内（renderedFrames++
+    // 前后）夹取 performance.now() 差值；节流帧与拖动帧不进入累加器。
+    // frameTimeSamples 与 renderedFrames 保持一致，帧均耗时由 Python
+    // 宿主按 frameTimeAccumulatorMs / frameTimeSamples 派生。
+    frameTimeAccumulatorMs: 0,
+    frameTimeSamples: 0,
+    // 大帧 dt（requestedDt > 0.05s）在 advance 提交路径计数。
+    largeFrameDeltas: 0,
     geometryAudits: 0,
     geometryAuditCacheHits: 0,
     geometryAuditCacheMisses: 0,
@@ -6149,6 +6233,7 @@ canvas{{touch-action:none}}
         0, renderPerformanceState.pendingSeconds - dt
       );
       renderPerformanceState.lastRenderAt = clockNow;
+      const frameStartedAt = performance.now();
       renderPerformanceState.renderedFrames += 1;
       // WebEngine/合成器在窗口移动、切屏或短暂阻塞后可能一次性回调
       // 很大的时间差。把整段差值限制在 50ms，后续帧再自然追上。
@@ -6156,6 +6241,7 @@ canvas{{touch-action:none}}
         cursorState.velocityX = 0;
         cursorState.velocityY = 0;
         trackingGuard.largeDeltaClamps += 1;
+        renderPerformanceState.largeFrameDeltas += 1;
         if (requestedDt > 0.2) resetGeometryContinuity(2);
       }}
       speechElapsed += dt;
@@ -6225,6 +6311,12 @@ canvas{{touch-action:none}}
       }}
       if (!enforceUniformTransform()) liveModel.visible = false;
       if (!frameValid) liveModel.visible = false;
+      // 帧耗时采样只在「实际提交渲染」的路径内闭合：advance/render
+      // 开销全部位于本窗口之中。raw 与负值隔离到最大 16.7ms，保证
+      // 累加器保持有限非负（页面异常导致 now 滞后也不会带脏计数）。
+      const frameElapsedMs = Math.max(0, Math.min(16.7, performance.now() - frameStartedAt));
+      renderPerformanceState.frameTimeAccumulatorMs += frameElapsedMs;
+      renderPerformanceState.frameTimeSamples += 1;
     }},
     setCursorTarget: function(x, y, width, height) {{
       return setCursorTarget(x, y, width, height);
@@ -6614,6 +6706,9 @@ canvas{{touch-action:none}}
         renderIntervalMs: Number(renderPerformanceState.renderIntervalMs) || 0,
         renderedFrames: Number(renderPerformanceState.renderedFrames) || 0,
         throttledFrames: Number(renderPerformanceState.throttledFrames) || 0,
+        frameTimeAccumulatorMs: Number(renderPerformanceState.frameTimeAccumulatorMs) || 0,
+        frameTimeSamples: Number(renderPerformanceState.frameTimeSamples) || 0,
+        largeFrameDeltas: Number(renderPerformanceState.largeFrameDeltas) || 0,
         geometryAuditHz: Number(renderPerformanceState.geometryAuditHz) || 0,
         geometryAuditIntervalMs: Number(renderPerformanceState.geometryAuditIntervalMs) || 0,
         geometryAudits: Number(renderPerformanceState.geometryAudits) || 0,

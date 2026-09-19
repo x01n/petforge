@@ -10,6 +10,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+# 本文件九个用例全部在子进程内经 xvfb-run 启动真实 Xvfb 窗口，且除
+# 纯信号收尾用例外均创建真实 WebEngine 渲染器。模块级统一打标，保持
+# 与「真实 Qt/Xvfb 组合根回归」的文件定位一致。
+pytestmark = [pytest.mark.xvfb, pytest.mark.webengine]
+
 
 def test_virtual_window_software_webgl_keeps_live2d_ready_with_qt_quick_software() -> None:
     """显式软件路径会自动同步 Qt Quick software 并创建真实模型。"""

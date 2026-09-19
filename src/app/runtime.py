@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
@@ -119,6 +120,20 @@ _RUNTIME_TEST_MODULE_IDS = frozenset(
 )
 
 
+def _bounded_start_duration(value: object) -> float | None:
+    """把启动耗时约束为 [0, 1_000_000] 毫秒；非有限数值返回 None。"""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return float(max(0, min(value, 1_000_000)))
+    if isinstance(value, float) and math.isfinite(value):
+        return float(max(0.0, min(value, 1_000_000.0)))
+    return None
+
+
 def _plugin_settings(value: object) -> PluginSettings:
     """用实例默认值补齐插件区，再交给领域解析器执行严格校验。"""
 
@@ -149,10 +164,26 @@ def _trigger_metadata(item: Mapping[str, Any]) -> dict[str, Any]:
     return metadata
 
 
+def _configuration_scheduler_owner(item: Mapping[str, Any], *, field_name: str) -> str:
+    """限制 YAML 调度条目只能归属于配置所有者。
+
+    调度器本身支持多个 owner；配置热重载只负责维护 ``config`` 这一组，
+    因此不能让 YAML 借 owner 字段覆盖会话、模型或用户创建的条目。
+    """
+
+    owner = item.get("owner", "config")
+    if not isinstance(owner, str) or owner.strip() != "config":
+        raise ConfigurationError(f"{field_name}.owner must be config")
+    return "config"
+
+
 class MutablePetController:
     def __init__(self, target: object | None = None, dispatcher: object | None = None) -> None:
         self._target = target
         self._dispatcher = dispatcher
+        # 资源根与 model3 清单快照由组合根在 attach 前同步；无宿主/无
+        # 清单时 ``available_models`` 与 ``switch_live2d_model`` 优雅降级。
+        self.inventory: object | None = None
         self._click_through_guard: Callable[[], bool] | None = None
         self._interaction_interrupt: Callable[[], object] | None = None
         self._activity_notifier: Callable[[], object] | None = None
@@ -164,6 +195,11 @@ class MutablePetController:
         # Qt 控制台打开时，桌宠自主漫游必须暂停；该标志由 Qt 主线程写入，
         # 行为服务只读取一个线程安全布尔值，避免后台线程直接访问 QWidget。
         self._ui_interaction_locked = False
+
+    def set_inventory(self, inventory: object | None) -> None:
+        """同步运行时资源清单；资源重载后由组合根再次调用。"""
+
+        self.inventory = inventory
 
     def attach(self, target: object) -> None:
         previous = self._target
@@ -287,6 +323,64 @@ class MutablePetController:
             resource_root,
             model_path=model_path,
             sprite_scale=sprite_scale,
+        )
+
+    def available_models(self) -> tuple[str, ...]:
+        """返回由渲染宿主导出的可用 Live2D 模型资源键。
+
+        宿主未挂载时返回空元组；路径不在规模上限内会失败关闭为不可用。
+        """
+
+        available = getattr(self, "inventory", None)
+        if available is None:
+            return ()
+        # 资源巡检已经完成 model3 引用校验；直接使用其绝对路径清单，
+        # 不重新递归扫描资源目录。
+        root = getattr(available, "root", None)
+        descriptors = getattr(available, "live2d_models", ())
+        if root is None or descriptors is None or isinstance(descriptors, (str, bytes, bytearray)):
+            return ()
+        try:
+            root_path = Path(str(root)).expanduser().resolve()
+            entries: list[str] = []
+            for descriptor in sorted(descriptors)[:64]:
+                try:
+                    resolved = Path(str(descriptor)).expanduser().resolve()
+                    relative = resolved.relative_to(root_path)
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    continue
+                entries.append(relative.as_posix())
+            return tuple(entries)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return ()
+
+    def switch_live2d_model(self, model_key: str) -> Mapping[str, object]:
+        """安全换模：先返回资源树的候选校验，再交由渲染宿主处理。
+
+        ``model_key`` 必须是相对资源根的 ``.model3.json`` 路径，且解析
+        后仍在资源根内；文件引用是否有效由宿主/目录校验负责。兼容
+        无宿主、孤儿回调和桌面未挂载场景。
+        """
+
+        raw = str(model_key or "").strip()
+        if not raw or len(raw) > 512:
+            return {"status": "unavailable", "reason": "模型键不可用"}
+        root = getattr(self.inventory, "root", None) if self.inventory is not None else None
+        if root is None:
+            return {"status": "unavailable", "reason": "资源根不可用"}
+        try:
+            target = Path(raw)
+            if target.is_absolute() or any(part in {"..", ""} for part in target.parts):
+                return {"status": "unavailable", "reason": "模型键不可用"}
+            descriptor = (Path(str(root)).expanduser().resolve() / target).resolve()
+            if not descriptor.is_file() or not str(raw).endswith(".model3.json"):
+                return {"status": "unavailable", "reason": "模型键不可用"}
+            descriptor.relative_to(Path(str(root)).expanduser().resolve())
+        except (OSError, ValueError):
+            return {"status": "unavailable", "reason": "模型键不可用"}
+        return self._invoke(
+            "switch_live2d_model",
+            model_key=raw,
         )
 
     def _invoke(self, method: str, *args: object, **kwargs: object) -> Any:
@@ -424,8 +518,8 @@ class MutablePetController:
     def set_rendering_performance(
         self,
         *,
-        frame_rate: float | None = None,
-        geometry_audit_hz: float | None = None,
+        frame_rate: float = 60.0,
+        geometry_audit_hz: float = 30.0,
     ) -> Any:
         """更新当前渲染器的帧率与几何审计频率。"""
 
@@ -1025,6 +1119,128 @@ class ApplicationRuntime:
         records = self.api_call_audit_records(limit=limit, **filters)
         return tuple(record.as_dict() for record in records)
 
+    def api_call_audit_summary(self, **filters: object) -> dict[str, object]:
+        """返回只读的调用审计聚合摘要，供 Qt/Web 控制台展示。
+
+        数值全部做 max(0, int(...)) 有界化，None 样本保持 None；
+        过滤键与 count() 一致，未知键直接上抛 ValueError。
+        """
+
+        repository = self.api_audit
+        if repository is None:
+            return {
+                "total": 0,
+                "by_status": (),
+                "by_channel": (),
+                "latency_ms": {"avg_first": None, "avg_total": None, "max_total": None},
+            }
+        summary = repository.summary(**filters)
+        groups = self._bounded_audit_groups(summary.get("by_status"), summary.get("by_channel"))
+        totals = []
+        for row in groups["by_status"]:
+            value = row.get("max_total_ms")
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and value is not None
+            ):
+                totals.append(value)
+        return {
+            "total": self._bounded_audit_total(summary.get("total")),
+            "by_status": groups["by_status"],
+            "by_channel": groups["by_channel"],
+            "latency_ms": {
+                "avg_first": self._bounded_audit_duration(
+                    self._weighted_average(groups["by_status"], "avg_first_ms")
+                ),
+                "avg_total": self._bounded_audit_duration(
+                    self._weighted_average(groups["by_status"], "avg_total_ms")
+                ),
+                "max_total": (self._bounded_audit_duration(max(totals)) if totals else None),
+            },
+        }
+
+    @staticmethod
+    def _bounded_audit_total(value: object) -> int:
+        """把聚合总数约束为 [0, 1_000_000] 的整数。"""
+
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, int):
+            return max(0, min(value, 1_000_000))
+        if isinstance(value, float) and math.isfinite(value):
+            return max(0, min(int(value), 1_000_000))
+        return 0
+
+    @staticmethod
+    def _bounded_audit_duration(value: object) -> float | None:
+        """把耗时约束为 [0, 1_000_000] 毫秒，非数值或负数返回 None。"""
+
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return float(max(0, min(value, 1_000_000)))
+        if isinstance(value, float) and math.isfinite(value) and value >= 0:
+            return float(max(0.0, min(value, 1_000_000.0)))
+        return None
+
+    @staticmethod
+    def _bounded_audit_groups(
+        by_status: object, by_channel: object
+    ) -> dict[str, tuple[dict[str, object], ...]]:
+        """把 by_status/by_channel 逐项约束为白名单键与有界数值。"""
+
+        def project(rows: object) -> tuple[dict[str, object], ...]:
+            if not isinstance(rows, (list, tuple)):
+                return ()
+            result: list[dict[str, object]] = []
+            for row in rows[:32]:
+                if not isinstance(row, Mapping):
+                    continue
+                key = str(row.get("key", "") or "").strip()
+                if not key.replace(":", "", 1).replace("-", "_").isalnum():
+                    continue
+                count = ApplicationRuntime._bounded_audit_total(row.get("count"))
+                result.append(
+                    {
+                        "key": key[:64],
+                        "count": count,
+                        "avg_first_ms": ApplicationRuntime._bounded_audit_duration(
+                            row.get("avg_first_ms")
+                        ),
+                        "avg_total_ms": ApplicationRuntime._bounded_audit_duration(
+                            row.get("avg_total_ms")
+                        ),
+                    }
+                )
+            return tuple(result)
+
+        return {"by_status": project(by_status), "by_channel": project(by_channel)}
+
+    @staticmethod
+    def _weighted_average(rows: tuple[dict[str, object], ...], field: str) -> float | None:
+        """按每组条数加权求均值；无有效样本返回 None。"""
+
+        total_weight = 0.0
+        weighted = 0.0
+        for row in rows:
+            value = row.get(field)
+            if value is None:
+                continue
+            count = row.get("count", 0)
+            try:
+                sample = float(value)
+                weight = int(count)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(sample) or sample < 0 or weight < 1:
+                continue
+            total_weight += weight
+            weighted += sample * weight
+        return weighted / total_weight if total_weight > 0 else None
+
     def module_diagnostics(self) -> Mapping[str, object]:
         """汇总运行时模块的固定、脱敏健康字段。"""
 
@@ -1161,6 +1377,11 @@ class ApplicationRuntime:
             "api_audit": {
                 "enabled": self.api_audit is not None,
                 "record_count": self.api_call_audit_count(),
+                "aggregate_count": (
+                    int(self.api_call_audit_summary().get("total", 0) or 0)
+                    if self.api_audit is not None
+                    else 0
+                ),
             },
             "plugins": dict(self.plugins.status()),
             "modules": dict(self.modules.status()),
@@ -1571,6 +1792,13 @@ class ApplicationRuntime:
                             and not isinstance(raw_ipc.get("pid"), bool)
                             else None
                         ),
+                        "queue_depth": (
+                            int(raw_ipc["queue_depth"])
+                            if isinstance(raw_ipc.get("queue_depth"), int)
+                            and not isinstance(raw_ipc.get("queue_depth"), bool)
+                            and int(raw_ipc["queue_depth"]) >= 0
+                            else None
+                        ),
                     }
                 raw_profiles = value.get("profiles", ())
                 if isinstance(raw_profiles, (str, bytes, bytearray, Mapping)):
@@ -1622,6 +1850,9 @@ class ApplicationRuntime:
         result["queue_size"] = int(getattr(self.tts, "queue_size", 0) or 0)
         if self.tts_startup_health:
             result["health"] = dict(self.tts_startup_health)
+            result["health"]["start_duration_ms"] = _bounded_start_duration(
+                result["health"].get("start_duration_ms")
+            )
         return result
 
     async def test_tts_module(self) -> Mapping[str, object]:
@@ -1711,6 +1942,15 @@ class ApplicationRuntime:
     def _set_tts_health(self, health: object) -> None:
         """保存不含地址或请求正文的 TTS 初始化状态。"""
 
+        previous = self.tts_startup_health
+        started_value = previous.get("started_at_ms") if isinstance(previous, Mapping) else None
+        duration = _bounded_start_duration(
+            (monotonic() - float(started_value)) * 1000.0
+            if isinstance(started_value, (int, float))
+            and not isinstance(started_value, bool)
+            and math.isfinite(float(started_value))
+            else None
+        )
         if not isinstance(health, EngineHealth):
             self.tts_startup_health = {
                 "status": "unavailable",
@@ -1719,6 +1959,8 @@ class ApplicationRuntime:
                 "engine": "unknown",
                 "message": "TTS health result is invalid",
                 "pending": False,
+                "started_at_ms": started_value,
+                "start_duration_ms": duration,
             }
             return
         self.tts_startup_health = {
@@ -1729,6 +1971,8 @@ class ApplicationRuntime:
             "message": str(health.message or "")[:240],
             "latency_ms": health.latency_ms,
             "pending": False,
+            "started_at_ms": started_value,
+            "start_duration_ms": duration,
         }
 
     async def _initialize_tts(self) -> None:
@@ -1752,7 +1996,9 @@ class ApplicationRuntime:
         task = self._tts_start_task
         if task is not None and not task.done():
             await asyncio.shield(task)
-        return dict(self.tts_startup_health)
+        snapshot = dict(self.tts_startup_health)
+        snapshot["start_duration_ms"] = _bounded_start_duration(snapshot.get("start_duration_ms"))
+        return snapshot
 
     @staticmethod
     async def _wait_cancelled_future(task: asyncio.Future[Any]) -> bool:
@@ -1807,6 +2053,7 @@ class ApplicationRuntime:
                 progress_message = str(result.get("message", "") or "").strip()
                 if progress_message:
                     health["message"] = progress_message[:240]
+            health["start_duration_ms"] = _bounded_start_duration(health.get("start_duration_ms"))
             result["health"] = health
             if bool(health.get("pending", False)):
                 pending_status = str(health.get("status", "queued") or "queued")[:32]
@@ -1826,12 +2073,23 @@ class ApplicationRuntime:
     def _set_asr_health(self, health: object) -> None:
         """保存只含固定状态字段的 ASR 初始化结果。"""
 
+        previous = self.asr_startup_health
+        started_value = previous.get("started_at_ms") if isinstance(previous, Mapping) else None
+        duration = _bounded_start_duration(
+            (monotonic() - float(started_value)) * 1000.0
+            if isinstance(started_value, (int, float))
+            and not isinstance(started_value, bool)
+            and math.isfinite(float(started_value))
+            else None
+        )
         if not isinstance(health, ASRHealth):
             self.asr_startup_health = {
                 "status": "unavailable",
                 "available": False,
                 "ready": False,
                 "message": "ASR health result is invalid",
+                "started_at_ms": started_value,
+                "start_duration_ms": duration,
             }
             return
         self.asr_startup_health = {
@@ -1842,6 +2100,8 @@ class ApplicationRuntime:
             "model": str(health.model or "SenseVoiceSmall")[:128],
             "model_loaded": bool(health.model_loaded),
             "message": str(health.message or "")[:240],
+            "started_at_ms": started_value,
+            "start_duration_ms": duration,
         }
 
     async def _initialize_asr(self) -> None:
@@ -1883,6 +2143,8 @@ class ApplicationRuntime:
             "ready": False,
             "message": "ASR is initializing",
             "pending": True,
+            "started_at_ms": monotonic(),
+            "start_duration_ms": None,
         }
         await self._initialize_asr()
 
@@ -1892,7 +2154,9 @@ class ApplicationRuntime:
         task = self._asr_start_task
         if task is not None and not task.done():
             await asyncio.shield(task)
-        return dict(self.asr_startup_health)
+        snapshot = dict(self.asr_startup_health)
+        snapshot["start_duration_ms"] = _bounded_start_duration(snapshot.get("start_duration_ms"))
+        return snapshot
 
     async def _cancel_asr_initialization(self) -> None:
         task = self._asr_start_task
@@ -2030,6 +2294,9 @@ class ApplicationRuntime:
         if not normalized:
             return {"status": "unavailable", "reason": "输出语言不可用"}
         self.conversation.tts_language = normalized
+        # 语言指令在 ConversationService 组装消息时按 LanguageInputs 注入，
+        # 不在 system_prompt 上积累重复段落。
+        self._set_language_inputs(normalized)
         proactive = getattr(self, "proactive", None)
         proactive_conversation = getattr(proactive, "conversation", None)
         if proactive_conversation is not None:
@@ -2039,6 +2306,30 @@ class ApplicationRuntime:
             "language": normalized,
             "language_protocol": protocol_tts_language(normalized),
         }
+
+    def _set_language_inputs(self, language: object) -> None:
+        """把输出语言同步到提示词注入输入。
+
+        ``LanguageInputs`` 是可热替换的值对象：对话服务按 tts_language
+        与当前时段生成语言指令并注入本轮消息；提示词本体保持不变。
+        """
+
+        normalized = str(canonical_tts_language(language) or "zh")
+        set_inputs = getattr(self.conversation, "set_output_language_inputs", None)
+        if callable(set_inputs):
+            set_inputs(normalized)
+        else:  # 轻量测试替身没有对话服务注入路径时退化为属性更新。
+            try:
+                self.conversation.tts_language = normalized
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                pass
+        if getattr(self, "proactive", None) is not None:
+            proactive_conversation = getattr(self.proactive, "conversation", None)
+            set_proactive_inputs = getattr(
+                proactive_conversation, "set_output_language_inputs", None
+            )
+            if callable(set_proactive_inputs):
+                set_proactive_inputs(normalized)
 
     def mcp_content_servers(self) -> tuple[Mapping[str, object], ...]:
         """返回可由控制台显式浏览的 MCP 内容来源摘要。"""
@@ -2644,6 +2935,7 @@ class ApplicationRuntime:
                     "storage",
                     "app",
                     "web",
+                    "mood",
                 )
                 if old_values.get(section) != new_values.get(section)
             )
@@ -2723,6 +3015,8 @@ class ApplicationRuntime:
                         "engine": "pending",
                         "message": "TTS is initializing",
                         "pending": True,
+                        "started_at_ms": monotonic(),
+                        "start_duration_ms": None,
                     }
                     self._tts_start_task = asyncio.create_task(self._initialize_tts())
                 if (
@@ -2736,6 +3030,8 @@ class ApplicationRuntime:
                         "ready": False,
                         "message": "ASR is queued after TTS initialization",
                         "pending": True,
+                        "started_at_ms": monotonic(),
+                        "start_duration_ms": None,
                     }
                     self._asr_start_task = asyncio.create_task(self._initialize_asr_after_tts())
 
@@ -2868,6 +3164,11 @@ class ApplicationRuntime:
                 if new_router_needed:
                     try:
                         new_router = ModelRouter.from_mapping(configuration.values)
+                        # 同 id 渠道路由器的键级冷却记忆不随配置热更清空，
+                        # 避免频繁调参反复把熔断重置为零。
+                        adopt_health = getattr(new_router, "adopt_health", None)
+                        if callable(adopt_health):
+                            adopt_health(self.router)
                         set_audit_repository = getattr(new_router, "set_audit_repository", None)
                         if callable(set_audit_repository):
                             set_audit_repository(self.api_audit)
@@ -2955,6 +3256,14 @@ class ApplicationRuntime:
                     await await_hot_section(
                         self._apply_memory_configuration(new_values),
                         on_commit=lambda: commit_applied_section("memory"),
+                    )
+
+                if "mood" in changed_sections:
+                    # 心情衰减与 proactive 系数支持热替换；coordinator 的
+                    # reconfigure 在后台主动被禁用时只替换内存策略。
+                    await await_hot_section(
+                        self._apply_mood_configuration(new_values),
+                        on_commit=lambda: commit_applied_section("mood"),
                     )
 
                 if "behavior" in changed_sections:
@@ -3087,6 +3396,7 @@ class ApplicationRuntime:
                             max_chars=int(getattr(new_tts, "segment_max_chars", 120)),
                             hard_boundaries=getattr(new_tts, "segment_hard_boundaries", None),
                             soft_boundaries=getattr(new_tts, "segment_soft_boundaries", None),
+                            soft_cut_trigger=getattr(new_tts, "segment_soft_cut_trigger", None),
                         )
                     set_queue_size = getattr(self.tts, "set_queue_size", None)
                     if callable(set_queue_size):
@@ -3369,6 +3679,33 @@ class ApplicationRuntime:
         await self.proactive.wait_idle()
         self.proactive.conversation.max_tool_rounds = settings.max_tool_rounds
 
+    async def _apply_mood_configuration(self, values: Mapping[str, Any]) -> None:
+        """热替换情绪衰减与 proactive 心情门槛参数。
+
+        coordinator ``reconfigure`` 会清理旧回合与旧审批，避免主动与对话
+        正在运行时交换其设置；AffectionService 只保存参数，天然线程安全。
+        """
+
+        mood_values = _mapping(values.get("mood"))
+        self.affection.configure_mood(
+            decay_enabled=parse_bool(
+                mood_values.get("decay_enabled"),
+                field_name="mood.decay_enabled",
+                default=True,
+            ),
+            decay_after_seconds=float(mood_values.get("decay_after_seconds", 14400)),
+            decay_prompt_probability=float(mood_values.get("decay_prompt_probability", 0.5)),
+        )
+        if self.proactive is not None:
+            selected: dict[str, Any] = dict(_mapping(values.get("proactive")))
+            mood_gate = _mapping(mood_values.get("proactive_mood_gate"))
+            if mood_gate.get("enabled") is not None:
+                selected["mood_gate_enabled"] = mood_gate.get("enabled")
+            if mood_gate.get("multipliers") is not None:
+                selected["mood_multipliers"] = dict(_mapping(mood_gate.get("multipliers")))
+            self.proactive.reconfigure(ProactiveSettings.from_mapping(selected))
+            await self.proactive.wait_idle()
+
     async def _apply_tools_configuration(self, values: Mapping[str, Any]) -> Mapping[str, object]:
         """热替换权限、工具组和命令白名单，不重建工具执行器。
 
@@ -3409,6 +3746,8 @@ class ApplicationRuntime:
             "bypass_approval",
             "auto_allow_low_risk",
             "approval_ttl_seconds",
+            "xml_approve_enabled",
+            "xml_approve_window_seconds",
         }
         unsupported_permission_fields = tuple(
             str(key) for key in permission_changed_fields if key not in supported_permission_fields
@@ -3433,6 +3772,16 @@ class ApplicationRuntime:
             default=True,
         )
         approval_ttl_seconds = float(permission_values.get("approval_ttl_seconds", 90.0))
+        # XML approve 门控：默认关闭；这两个键只在用户显式写入时进入
+        # changed_fields，热应用时由 reconfigure 同步开关与窗口 TTL。
+        xml_approve_enabled = parse_bool(
+            permission_values.get("xml_approve_enabled", False),
+            field_name="tools.permissions.xml_approve_enabled",
+            default=False,
+        )
+        xml_approve_window_seconds = float(
+            permission_values.get("xml_approve_window_seconds", 15.0)
+        )
 
         command_allowlist: tuple[str, ...] = ()
         normalized_command_allowlist: frozenset[str] | None = None
@@ -3460,6 +3809,8 @@ class ApplicationRuntime:
                 bypass_approval=bypass_approval,
                 auto_allow_low_risk=auto_allow_low_risk,
                 approval_ttl_seconds=approval_ttl_seconds,
+                xml_approve_enabled=xml_approve_enabled,
+                xml_approve_window_seconds=xml_approve_window_seconds,
             )
 
         if command_setter is not None and normalized_command_allowlist is not None:
@@ -3481,6 +3832,8 @@ class ApplicationRuntime:
             reconfigure = getattr(proactive_permissions, "reconfigure", None)
             if callable(reconfigure):
                 # 后台主动回合始终禁止继承普通对话的 bypass_approval。
+                # XML approve 门控同样不继承：不传参数即使用缺省关闭，
+                # 主动回合不允许通过模型指令放行任何工具。
                 reconfigure(
                     allow=allow,
                     deny=deny,
@@ -3557,6 +3910,10 @@ class ApplicationRuntime:
             status = str(result.get("status", "") or "").strip().lower()
             if status in {"available", "reloaded", "unchanged", "pending", "requested"}:
                 self.inventory = inspect_resources(resource_root)
+                # 资源重载后同步控制器清单，模型可见的换模工具读到新模型。
+                set_inventory = getattr(self.pet_controller, "set_inventory", None)
+                if callable(set_inventory):
+                    set_inventory(self.inventory)
 
         performance_result = self.pet_controller.set_rendering_performance(
             frame_rate=float(new_values.get("frame_rate", 60.0)),
@@ -3663,13 +4020,235 @@ class ApplicationRuntime:
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
             pass
 
+    @staticmethod
+    def _snapshot_scheduler_configuration_state(
+        scheduler: SchedulerService,
+        triggers: TriggerService,
+        activity: UserActivityTracker | None,
+    ) -> dict[str, object]:
+        """捕获调度配置事务需要恢复的内存和生命周期状态。
+
+        调度服务的任务/触发器对象包含下一次运行时间、去抖时间和运行计数；
+        只保存 ``list_tasks``/``list_triggers`` 会丢失这些运行时字段，因此
+        这里复制领域对象本身。活跃跟踪器使用其锁保护的私有状态，避免失败
+        的热重载清空用户最近一次交互或待投递事件。
+        """
+
+        activity_state: dict[str, object] | None = None
+        if activity is not None:
+            lock = getattr(activity, "_lock", None)
+            if lock is not None:
+                with lock:
+                    activity_state = {}
+                    for name in (
+                        "_enabled",
+                        "_idle_seconds",
+                        "_poll_seconds",
+                        "_system_idle_provider",
+                        "_system_idle_threshold_seconds",
+                        "_system_idle_probe",
+                        "_system_idle_status",
+                        "_last_system_idle_active",
+                        "_last_system_idle_at",
+                        "_last_interaction_at",
+                        "_state",
+                        "_last_source",
+                        "_interaction_count",
+                        "_idle_count",
+                        "_last_error",
+                        "_last_event_at",
+                    ):
+                        if not hasattr(activity, name):
+                            continue
+                        value = getattr(activity, name)
+                        # 系统探针可能是绑定到平台对象的 callable；复制它会
+                        # 克隆平台实例，恢复后会丢失真实窗口/空闲状态语义。
+                        activity_state[name] = value if callable(value) else copy.deepcopy(value)
+                    pending = getattr(activity, "_pending_interactions", None)
+                    if pending is not None:
+                        activity_state["_pending_interactions"] = tuple(
+                            copy.deepcopy(item) for item in pending
+                        )
+            else:
+                activity_state = {
+                    "_enabled": bool(getattr(activity, "enabled", True)),
+                    "_idle_seconds": float(getattr(activity, "idle_seconds", 300.0)),
+                    "_poll_seconds": float(getattr(activity, "poll_seconds", 0.5)),
+                    "_system_idle_provider": str(
+                        getattr(activity, "system_idle_provider", "disabled")
+                    ),
+                    "_system_idle_threshold_seconds": float(
+                        getattr(activity, "system_idle_threshold_seconds", 300.0)
+                    ),
+                }
+            activity_state["running"] = bool(getattr(activity, "running", False))
+
+        scheduler_status = scheduler.status()
+        trigger_status = triggers.status()
+        return {
+            "tasks": copy.deepcopy(dict(getattr(scheduler, "_tasks", {}))),
+            "triggers": copy.deepcopy(dict(getattr(triggers, "_triggers", {}))),
+            "scheduler_running": bool(scheduler_status.get("running", False)),
+            "scheduler_poll_seconds": float(getattr(scheduler, "_poll_seconds", 0.5)),
+            "scheduler_last_error": str(scheduler_status.get("last_error", "") or ""),
+            "scheduler_persistence_error": str(scheduler_status.get("persistence_error", "") or ""),
+            "trigger_persistence_error": str(trigger_status.get("persistence_error", "") or ""),
+            "activity": activity_state,
+        }
+
+    async def _restore_scheduler_configuration_state(self, snapshot: Mapping[str, object]) -> bool:
+        """恢复调度配置事务快照；返回是否有补偿步骤失败。"""
+
+        failed = False
+        scheduler = self.scheduler
+        triggers = self.triggers
+        old_tasks = copy.deepcopy(dict(snapshot.get("tasks", {})))
+        old_triggers = copy.deepcopy(dict(snapshot.get("triggers", {})))
+
+        # 先恢复内存映射，之后再尝试把删除/覆盖补偿写回状态仓储。这样即使
+        # 某个持久化驱动暂时故障，当前进程也不会继续暴露半应用配置。
+        current_task_ids = set(getattr(scheduler, "_tasks", {}))
+        old_task_ids = set(old_tasks)
+        scheduler_persistence_error_before = str(
+            snapshot.get("scheduler_persistence_error", "") or ""
+        )
+        trigger_persistence_error_before = str(snapshot.get("trigger_persistence_error", "") or "")
+        # 持久化 helper 为保持调度循环可用会吞掉异常；回滚前清空诊断
+        # 哨兵，使得与旧错误文本相同的新失败也能被识别。
+        if hasattr(scheduler, "_persistence_error"):
+            scheduler._persistence_error = ""
+        for task_id in current_task_ids - old_task_ids:
+            try:
+                scheduler._delete_persisted_task(task_id)
+            except BaseException:
+                failed = True
+        scheduler._tasks.clear()
+        scheduler._tasks.update(old_tasks)
+        if hasattr(scheduler, "_last_error"):
+            scheduler._last_error = str(snapshot.get("scheduler_last_error", "") or "")
+        if hasattr(scheduler, "_poll_seconds"):
+            scheduler._poll_seconds = float(snapshot.get("scheduler_poll_seconds", 0.5))
+        for task in old_tasks.values():
+            try:
+                scheduler._persist_task(task)
+            except BaseException:
+                failed = True
+
+        current_trigger_ids = set(getattr(triggers, "_triggers", {}))
+        old_trigger_ids = set(old_triggers)
+        if hasattr(triggers, "_persistence_error"):
+            triggers._persistence_error = ""
+        for trigger_id in current_trigger_ids - old_trigger_ids:
+            try:
+                triggers._delete_persisted_trigger(trigger_id)
+            except BaseException:
+                failed = True
+        triggers._triggers.clear()
+        triggers._triggers.update(old_triggers)
+        for trigger in old_triggers.values():
+            try:
+                triggers._persist_trigger(trigger)
+            except BaseException:
+                failed = True
+
+        scheduler_persistence_error_after = str(
+            scheduler.status().get("persistence_error", "") or ""
+        )
+        trigger_persistence_error_after = str(triggers.status().get("persistence_error", "") or "")
+        if scheduler_persistence_error_after:
+            failed = True
+        if trigger_persistence_error_after:
+            failed = True
+        if not scheduler_persistence_error_after and hasattr(scheduler, "_persistence_error"):
+            scheduler._persistence_error = scheduler_persistence_error_before
+        if not trigger_persistence_error_after and hasattr(triggers, "_persistence_error"):
+            triggers._persistence_error = trigger_persistence_error_before
+
+        # 生命周期回滚必须在恢复配置对象之后执行；重启调度器时使用失败前的
+        # 轮询间隔，避免热重载失败后悄悄改变后台开销。
+        scheduler_running = bool(snapshot.get("scheduler_running", False))
+        current_scheduler_running = bool(scheduler.status().get("running", False))
+        try:
+            if scheduler_running and not current_scheduler_running:
+                await scheduler.start(
+                    poll_seconds=float(snapshot.get("scheduler_poll_seconds", 0.5))
+                )
+            elif not scheduler_running and current_scheduler_running:
+                await scheduler.stop()
+        except BaseException:
+            failed = True
+
+        activity = self.activity
+        activity_snapshot = snapshot.get("activity")
+        if activity is not None and isinstance(activity_snapshot, Mapping):
+            try:
+                # 不再次调用 ``reconfigure``：失败的 setter 可能在修改一半
+                # 后抛错，也可能持续失败。快照来自同一实例的已校验状态，
+                # 直接在其锁内恢复可避免回滚依赖故障 setter。
+                lock = getattr(activity, "_lock", None)
+                if lock is not None:
+                    with lock:
+                        for name, value in activity_snapshot.items():
+                            if name in {"running", "_pending_interactions"}:
+                                continue
+                            if hasattr(activity, name):
+                                setattr(
+                                    activity,
+                                    name,
+                                    value if callable(value) else copy.deepcopy(value),
+                                )
+                        pending = getattr(activity, "_pending_interactions", None)
+                        if pending is not None:
+                            pending.clear()
+                            pending.extend(
+                                copy.deepcopy(item)
+                                for item in activity_snapshot.get("_pending_interactions", ())
+                            )
+                activity_running = bool(getattr(activity, "running", False))
+                was_running = bool(activity_snapshot.get("running", False))
+                if was_running and not activity_running:
+                    await activity.start()
+                elif not was_running and activity_running:
+                    await activity.stop()
+            except BaseException:
+                failed = True
+
+        if failed:
+            logger.warning("调度配置热重载回滚存在未完成步骤")
+        return failed
+
     async def _apply_scheduler_configuration(self, values: Mapping[str, Any]) -> None:
+        """以事务方式替换 owner=config 的任务/触发器。"""
+
+        snapshot = self._snapshot_scheduler_configuration_state(
+            self.scheduler, self.triggers, self.activity
+        )
+        try:
+            await self._apply_scheduler_configuration_unchecked(values)
+        except BaseException:
+            # 该操作通常由 ``await_hot_section`` shield，仍需覆盖直接取消或
+            # 测试宿主取消的路径；回滚失败只记录诊断，不遮蔽原始异常。
+            rollback = asyncio.create_task(
+                self._restore_scheduler_configuration_state(snapshot),
+                name="meapet-scheduler-configuration-rollback",
+            )
+            try:
+                await asyncio.shield(rollback)
+            except BaseException:
+                logger.warning("调度配置热重载回滚任务未完成", exc_info=True)
+            raise
+
+    async def _apply_scheduler_configuration_unchecked(self, values: Mapping[str, Any]) -> None:
         """替换 owner=config 的任务/触发器，保留模型或用户创建的条目。"""
 
         scheduler_values = _mapping(values.get("scheduler"))
         activity_values = _mapping(scheduler_values.get("activity"))
         raw_tasks = tuple(_sequence(scheduler_values.get("tasks")))
         raw_triggers = tuple(_sequence(scheduler_values.get("triggers")))
+        scheduler_persistence_before = str(
+            self.scheduler.status().get("persistence_error", "") or ""
+        )
+        trigger_persistence_before = str(self.triggers.status().get("persistence_error", "") or "")
         # 先用无副作用的临时服务完整校验领域约束，并检查显式 ID 是否
         # 抢占了非 config 所有者条目；实际服务在此之后才会开始变更。
         probe_scheduler = SchedulerService()
@@ -3681,7 +4260,7 @@ class ApplicationRuntime:
                 name=str(item["name"]),
                 expression=str(item["expression"]),
                 action=dict(item["action"]),
-                owner=str(item.get("owner", "config")),
+                owner=_configuration_scheduler_owner(item, field_name="scheduler.tasks"),
                 metadata=dict(item.get("metadata", {}))
                 if isinstance(item.get("metadata", {}), Mapping)
                 else item.get("metadata"),
@@ -3692,7 +4271,7 @@ class ApplicationRuntime:
                 trigger_id=str(item["trigger_id"]),
                 event_name=str(item["event_name"]),
                 action=dict(item["action"]),
-                owner=str(item.get("owner", "config")),
+                owner=_configuration_scheduler_owner(item, field_name="scheduler.triggers"),
                 debounce_seconds=float(item.get("debounce_seconds", 0.0)),
                 metadata=_trigger_metadata(item),
             )
@@ -3720,7 +4299,7 @@ class ApplicationRuntime:
                 name=str(item["name"]),
                 expression=str(item["expression"]),
                 action=dict(item["action"]),
-                owner=str(item.get("owner", "config")),
+                owner=_configuration_scheduler_owner(item, field_name="scheduler.tasks"),
                 metadata=dict(item.get("metadata", {}))
                 if isinstance(item.get("metadata", {}), Mapping)
                 else item.get("metadata"),
@@ -3738,7 +4317,7 @@ class ApplicationRuntime:
                 trigger_id=trigger_id,
                 event_name=str(item["event_name"]),
                 action=dict(item["action"]),
-                owner=str(item.get("owner", "config")),
+                owner=_configuration_scheduler_owner(item, field_name="scheduler.triggers"),
                 debounce_seconds=float(item.get("debounce_seconds", 0.0)),
                 metadata=_trigger_metadata(item),
             )
@@ -3749,6 +4328,22 @@ class ApplicationRuntime:
                 and trigger_id not in configured_trigger_ids
             ):
                 self.triggers.remove(trigger_id, owner="config")
+        # Scheduler/trigger persistence helpers intentionally swallow backend
+        # errors so normal runtime ticks remain available in detached mode. A
+        # configuration transaction must surface a newly introduced error,
+        # otherwise the in-memory update would be reported as successfully
+        # reloaded while the next process restores the previous YAML state.
+        scheduler_persistence_error = str(
+            self.scheduler.status().get("persistence_error", "") or ""
+        )
+        trigger_persistence_error = str(self.triggers.status().get("persistence_error", "") or "")
+        if (
+            scheduler_persistence_error
+            and scheduler_persistence_error != scheduler_persistence_before
+        ):
+            raise RuntimeError("scheduler persistence failed")
+        if trigger_persistence_error and trigger_persistence_error != trigger_persistence_before:
+            raise RuntimeError("trigger persistence failed")
         enabled = parse_bool(
             scheduler_values.get("enabled", True),
             field_name="scheduler.enabled",
@@ -3927,6 +4522,8 @@ class ApplicationRuntime:
             "engine": "pending",
             "message": "TTS is initializing",
             "pending": True,
+            "started_at_ms": monotonic(),
+            "start_duration_ms": None,
         }
         if self._tts_start_task is None or self._tts_start_task.done():
             self._tts_start_task = asyncio.create_task(self._initialize_tts())
@@ -3937,6 +4534,8 @@ class ApplicationRuntime:
             "ready": False,
             "message": "ASR is queued after TTS initialization",
             "pending": True,
+            "started_at_ms": monotonic(),
+            "start_duration_ms": None,
         }
         if self._asr_start_task is None or self._asr_start_task.done():
             self._asr_start_task = asyncio.create_task(self._initialize_asr_after_tts())
@@ -4484,6 +5083,11 @@ def _build_tts(configuration: LoadedConfiguration) -> TTSCoordinator:
             if "soft_boundaries" in segmentation_values
             else None
         ),
+        segment_soft_cut_trigger=(
+            int(segmentation_values["soft_cut_trigger"])
+            if "soft_cut_trigger" in segmentation_values
+            else None
+        ),
         feature_analyzer=feature_analyzer,
     )
 
@@ -4896,11 +5500,11 @@ def _validate_runtime_values(values: Mapping[str, Any]) -> None:
                 raise ConfigurationError(
                     f"tools.permissions.{field_name}[{index}] must be non-empty"
                 )
-    for field_name in ("bypass_approval", "auto_allow_low_risk"):
+    for field_name in ("bypass_approval", "auto_allow_low_risk", "xml_approve_enabled"):
         parse_bool(
             permissions.get(field_name),
             field_name=f"tools.permissions.{field_name}",
-            default=False if field_name == "bypass_approval" else True,
+            default=(False if field_name != "auto_allow_low_risk" else True),
         )
     approval_ttl = number(
         permissions.get("approval_ttl_seconds", 90.0),
@@ -4911,6 +5515,16 @@ def _validate_runtime_values(values: Mapping[str, Any]) -> None:
         raise ConfigurationError(
             "tools.permissions.approval_ttl_seconds is outside the allowed range"
         )
+    if "xml_approve_window_seconds" in permissions:
+        xml_window_ttl = number(
+            permissions.get("xml_approve_window_seconds"),
+            "tools.permissions.xml_approve_window_seconds",
+            minimum=5.0,
+        )
+        if xml_window_ttl > 300.0:
+            raise ConfigurationError(
+                "tools.permissions.xml_approve_window_seconds is outside the allowed range"
+            )
     for field_name in ("active_groups", "command_allowlist"):
         sequence(tools_values.get(field_name), f"tools.{field_name}")
 
@@ -5043,6 +5657,7 @@ def _validate_runtime_values(values: Mapping[str, Any]) -> None:
     tasks = sequence(scheduler_values.get("tasks"), "scheduler.tasks")
     for index, raw_task in enumerate(tasks):
         item = mapping(raw_task, f"scheduler.tasks[{index}]")
+        _configuration_scheduler_owner(item, field_name=f"scheduler.tasks[{index}]")
         for required in ("name", "expression", "action"):
             if required not in item:
                 raise ConfigurationError(f"scheduler.tasks[{index}] requires {required}")
@@ -5072,6 +5687,7 @@ def _validate_runtime_values(values: Mapping[str, Any]) -> None:
     triggers = sequence(scheduler_values.get("triggers"), "scheduler.triggers")
     for index, raw_trigger in enumerate(triggers):
         item = mapping(raw_trigger, f"scheduler.triggers[{index}]")
+        _configuration_scheduler_owner(item, field_name=f"scheduler.triggers[{index}]")
         for required in ("trigger_id", "event_name", "action"):
             if required not in item:
                 raise ConfigurationError(f"scheduler.triggers[{index}] requires {required}")
@@ -5115,6 +5731,46 @@ def _validate_runtime_values(values: Mapping[str, Any]) -> None:
             raise ConfigurationError(
                 "proactive.enabled requires an explicit llm.routing.proactive route"
             )
+
+    mood_values = mapping(values.get("mood"), "mood")
+    parse_bool(mood_values.get("decay_enabled"), field_name="mood.decay_enabled", default=True)
+    decay_after = number(
+        mood_values.get("decay_after_seconds", 14400),
+        "mood.decay_after_seconds",
+        minimum=600.0,
+    )
+    if decay_after > 30 * 24 * 3600.0:
+        raise ConfigurationError("mood.decay_after_seconds is outside the allowed range")
+    decay_probability = number(
+        mood_values.get("decay_prompt_probability", 0.5),
+        "mood.decay_prompt_probability",
+        minimum=0.0,
+    )
+    if decay_probability > 1.0:
+        raise ConfigurationError("mood.decay_prompt_probability is outside the allowed range")
+    mood_gate_values = mapping(mood_values.get("proactive_mood_gate"), "mood.proactive_mood_gate")
+    parse_bool(
+        mood_gate_values.get("enabled"),
+        field_name="mood.proactive_mood_gate.enabled",
+        default=True,
+    )
+    multipliers_raw = mood_gate_values.get("multipliers", None)
+    if multipliers_raw is not None:
+        from services.affection import MOODS
+
+        allowed_moods = frozenset(MOODS)
+        multipliers_mapping = mapping(multipliers_raw, "mood.proactive_mood_gate.multipliers")
+        for raw_key, raw_value in multipliers_mapping.items():
+            key = str(raw_key or "").strip()
+            if key not in allowed_moods:
+                raise ConfigurationError(
+                    f"mood.proactive_mood_gate.multipliers has unsupported mood: {key}"
+                )
+            factor = number(raw_value, f"mood.proactive_mood_gate.multipliers.{key}", minimum=0.0)
+            if factor > 2.0:
+                raise ConfigurationError(
+                    f"mood.proactive_mood_gate.multipliers.{key} is outside the allowed range"
+                )
 
     watcher_values = mapping(values.get("watcher"), "watcher")
     parse_bool(watcher_values.get("enabled"), field_name="watcher.enabled", default=False)
@@ -5403,6 +6059,16 @@ def _validate_runtime_values(values: Mapping[str, Any]) -> None:
         segmentation_values.get("hard_boundaries") or ""
     ):
         raise ConfigurationError("tts.segmentation.hard_boundaries cannot be empty")
+    raw_soft_cut_trigger = segmentation_values.get("soft_cut_trigger")
+    if raw_soft_cut_trigger is not None:
+        try:
+            soft_cut_trigger = int(raw_soft_cut_trigger)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ConfigurationError(
+                "tts.segmentation.soft_cut_trigger must be an integer"
+            ) from exc
+        if not 1 <= soft_cut_trigger <= 2000:
+            raise ConfigurationError("tts.segmentation.soft_cut_trigger is outside the range")
     if tts_values.get("prompt_lang") is not None and not isinstance(
         tts_values.get("prompt_lang"), str
     ):
@@ -5568,6 +6234,13 @@ def _validate_runtime_values(values: Mapping[str, Any]) -> None:
         validate_hotkey_config(mapping(values.get("ui"), "ui").get("hotkeys"))
     except (TypeError, ValueError) as exc:
         raise ConfigurationError(f"hotkey configuration is invalid: {exc}") from exc
+    start_timeout = number(
+        mapping(values.get("ui"), "ui").get("runtime_start_timeout_seconds", 10.0),
+        "ui.runtime_start_timeout_seconds",
+        minimum=0.1,
+    )
+    if start_timeout > 300.0:
+        raise ConfigurationError("ui.runtime_start_timeout_seconds is outside the allowed range")
     parse_bool(
         mapping(values.get("ui"), "ui").get("always_on_top"),
         field_name="ui.always_on_top",
@@ -5720,25 +6393,27 @@ def validate_runtime_configuration(configuration: LoadedConfiguration) -> None:
         scheduler = SchedulerService()
         triggers = TriggerService()
         scheduler_values = _mapping(values.get("scheduler"))
-        for raw_task in _sequence(scheduler_values.get("tasks")):
+        for index, raw_task in enumerate(_sequence(scheduler_values.get("tasks"))):
             item = _mapping(raw_task)
             scheduler.upsert(
                 task_id=str(item.get("task_id", "")).strip() or None,
                 name=str(item["name"]),
                 expression=str(item["expression"]),
                 action=dict(item["action"]),
-                owner=str(item.get("owner", "config")),
+                owner=_configuration_scheduler_owner(item, field_name=f"scheduler.tasks[{index}]"),
                 metadata=dict(item.get("metadata", {}))
                 if isinstance(item.get("metadata", {}), Mapping)
                 else item.get("metadata"),
             )
-        for raw_trigger in _sequence(scheduler_values.get("triggers")):
+        for index, raw_trigger in enumerate(_sequence(scheduler_values.get("triggers"))):
             item = _mapping(raw_trigger)
             triggers.register(
                 trigger_id=str(item["trigger_id"]),
                 event_name=str(item["event_name"]),
                 action=dict(item["action"]),
-                owner=str(item.get("owner", "config")),
+                owner=_configuration_scheduler_owner(
+                    item, field_name=f"scheduler.triggers[{index}]"
+                ),
                 debounce_seconds=float(item.get("debounce_seconds", 0.0)),
                 metadata=_trigger_metadata(item),
             )
@@ -5828,12 +6503,23 @@ def build_runtime(
             field_name="tools.permissions.auto_allow_low_risk",
         ),
         approval_ttl_seconds=float(permission_values.get("approval_ttl_seconds", 90.0)),
+        # XML approve 缺省关闭；装配不传开关时门控恒为 False（零回归）。
+        xml_approve_enabled=parse_bool(
+            permission_values.get("xml_approve_enabled", False),
+            field_name="tools.permissions.xml_approve_enabled",
+            default=False,
+        ),
+        xml_approve_window_seconds=float(permission_values.get("xml_approve_window_seconds", 15.0)),
     )
     base_platform: DesktopPlatform = platform if platform is not None else create_desktop_platform()
     platform_value: DesktopPlatform = DispatchingDesktopPlatform(base_platform, ui_dispatcher)
     pet_value = pet_controller or MutablePetController(dispatcher=ui_dispatcher)
     if pet_controller is not None and ui_dispatcher is not None:
         pet_controller.set_dispatcher(ui_dispatcher)
+    # 资源清单同步给控制器，模型可见的换模/清单工具才能读到真实模型。
+    set_inventory = getattr(pet_value, "set_inventory", None)
+    if callable(set_inventory):
+        set_inventory(inventory)
     scheduler: SchedulerService
     triggers: TriggerService
 
@@ -6096,6 +6782,7 @@ def build_runtime(
         platform=platform_value,
         pet_controller=pet_value,
         scheduler=scheduler,
+        trigger_service=triggers,
         tts=tts,
         asr=asr,
         asr_provider=lambda: runtime.asr,
@@ -6200,7 +6887,7 @@ def build_runtime(
     if callable(set_activity_notifier):
         set_activity_notifier(lambda: activity.record_interaction("pet"))
     scheduler_values = _mapping(values.get("scheduler"))
-    for raw_task in _sequence(scheduler_values.get("tasks")):
+    for index, raw_task in enumerate(_sequence(scheduler_values.get("tasks"))):
         item = _mapping(raw_task)
         try:
             scheduler.upsert(
@@ -6208,21 +6895,23 @@ def build_runtime(
                 name=str(item["name"]),
                 expression=str(item["expression"]),
                 action=dict(item["action"]),
-                owner=str(item.get("owner", "config")),
+                owner=_configuration_scheduler_owner(item, field_name=f"scheduler.tasks[{index}]"),
                 metadata=dict(item.get("metadata", {}))
                 if isinstance(item.get("metadata", {}), Mapping)
                 else item.get("metadata"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ConfigurationError("invalid scheduler or trigger configuration") from exc
-    for raw_trigger in _sequence(scheduler_values.get("triggers")):
+    for index, raw_trigger in enumerate(_sequence(scheduler_values.get("triggers"))):
         item = _mapping(raw_trigger)
         try:
             triggers.register(
                 trigger_id=str(item["trigger_id"]),
                 event_name=str(item["event_name"]),
                 action=dict(item["action"]),
-                owner=str(item.get("owner", "config")),
+                owner=_configuration_scheduler_owner(
+                    item, field_name=f"scheduler.triggers[{index}]"
+                ),
                 debounce_seconds=float(item.get("debounce_seconds", 0.0)),
                 metadata=_trigger_metadata(item),
             )
@@ -6271,12 +6960,46 @@ def build_runtime(
             base_directory=configuration.directory,
         ),
     )
-    affection = AffectionService(database)
+    affection = AffectionService(
+        database,
+        decay_enabled=parse_bool(
+            _mapping(values.get("mood")).get("decay_enabled"),
+            field_name="mood.decay_enabled",
+            default=True,
+        ),
+        decay_after_seconds=float(_mapping(values.get("mood")).get("decay_after_seconds", 14400)),
+        decay_prompt_probability=float(
+            _mapping(values.get("mood")).get("decay_prompt_probability", 0.5)
+        ),
+    )
     configured_tool_groups = (
         None
         if "active_groups" not in tools_values or tools_values.get("active_groups") is None
         else tuple(str(item) for item in _sequence(tools_values.get("active_groups")))
     )
+
+    def _apply_directives_to_pet(mood: str, expression: str, motion: str, silent: bool) -> object:
+        """把 XML 指令落到桌宠：情绪进情感服务，动作/表情经控制器。"""
+
+        if mood:
+            mood_setter = getattr(affection, "set_mood", None)
+            if callable(mood_setter):
+                try:
+                    mood_setter(mood)
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    pass
+        if expression:
+            setter = getattr(pet_value, "set_expression", None)
+            if callable(setter):
+                setter(expression)
+        if motion:
+            player = getattr(pet_value, "play_motion", None)
+            if callable(player):
+                player(motion)
+        return True
+
+    directives_sink = _apply_directives_to_pet
+
     try:
         conversation = ConversationService(
             router,
@@ -6299,8 +7022,19 @@ def build_runtime(
                 or _mapping(_mapping(values.get("tts")).get("routing")).get("default_role", "")
                 or ""
             ),
+            mood_hint_provider=lambda: affection.stale_mood_hint(),
         )
-        proactive_settings = ProactiveSettings.from_mapping(_mapping(values.get("proactive")))
+        set_directive_sink = getattr(conversation, "set_directive_sink", None)
+        if callable(set_directive_sink) and directives_sink is not None:
+            set_directive_sink(directives_sink)
+        proactive_config = dict(_mapping(values.get("proactive")))
+        mood_gate = _mapping(_mapping(values.get("mood")).get("proactive_mood_gate"))
+        proactive_config["mood_gate_enabled"] = mood_gate.get(
+            "enabled", proactive_config.get("mood_gate_enabled", True)
+        )
+        if "multipliers" in mood_gate:
+            proactive_config["mood_multipliers"] = mood_gate.get("multipliers")
+        proactive_settings = ProactiveSettings.from_mapping(proactive_config)
         proactive_conversation = ConversationService(
             router,
             memory=None,
@@ -6324,6 +7058,7 @@ def build_runtime(
                 or _mapping(_mapping(values.get("tts")).get("routing")).get("default_role", "")
                 or ""
             ),
+            mood_hint_provider=lambda: affection.stale_mood_hint(),
         )
     except BaseException:
         database.close()
@@ -6368,6 +7103,7 @@ def build_runtime(
             "locked": bool(runtime.pet_controller.is_window_locked()),
             "dialogue_active": bool(runtime.conversation.has_active_conversation()),
         },
+        mood_provider=lambda: affection.get_mood(),
     )
     runtime.memory_summarizer = MemorySummaryCoordinator(
         memory,

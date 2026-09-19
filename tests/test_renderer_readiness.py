@@ -208,6 +208,50 @@ def test_web_ready_requires_bridge_geometry_visible_model_and_raw_alpha(tmp_path
     assert renderer.ready_status.alpha_nonempty is False
 
 
+def test_web_performance_diagnostics_is_bounded_and_sampled(tmp_path: Path) -> None:
+    model = _write_model(tmp_path, "performance")
+    _write_web_assets(tmp_path)
+    renderer = WebLive2DRenderer(
+        tmp_path,
+        model_path=model,
+        importer=lambda _name: object(),
+    )
+    page = _FakePage()
+    renderer._view = _FakeView(page)
+    renderer._page_ready = True
+    renderer._model_ready = True
+    renderer._page_bridge_ready = True
+
+    renderer.request_performance_diagnostics()
+    assert page.callback is not None
+    page.callback(
+        json.dumps(
+            {
+                "targetFrameRate": 60,
+                "renderedFrames": 120,
+                "throttledFrames": 7,
+                "geometryAuditHz": 30,
+                "geometryAudits": 12,
+                "geometryAuditCacheHits": 9,
+                "geometryAuditCacheMisses": 3,
+                "geometryVertexDirtyFrames": 2,
+                "geometryStructuralDirtyFrames": 1,
+                "secret": "must-not-leak",
+            }
+        )
+    )
+    diagnostics = renderer.performance_diagnostics
+    assert diagnostics["renderedFrames"] == 120.0
+    assert diagnostics["throttledFrames"] == 7.0
+    assert diagnostics["geometryAuditCacheHits"] == 9.0
+    assert diagnostics["geometryStructuralDirtyFrames"] == 1.0
+    assert "secret" not in diagnostics
+
+    script_count = len(page.scripts)
+    renderer.request_performance_diagnostics()
+    assert len(page.scripts) == script_count
+
+
 def test_web_model_reload_timeout_releases_transaction_and_keeps_old_model(
     tmp_path: Path,
 ) -> None:

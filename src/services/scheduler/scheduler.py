@@ -27,6 +27,44 @@ class ScheduleExpressionError(ValueError):
     pass
 
 
+# every 表达式的最小间隔下限，防止模型通过 scheduler:upsert 注册高频任务
+# 造成动作风暴；daily:HH:MM 不受该下限影响。
+_MIN_SCHEDULE_INTERVAL_SECONDS = 1.0
+# 模型注册的定时/触发任务允许引用的工具身份集合：取示例配置 GUI 预设
+# 动作全集（GUI 能无损回写的 safe presets，见 gui/qt6/scheduler_panel.py
+# 的 ACTION_PRESETS）与只读检索身份。schedule 失败会给出与频率拒绝同样
+# 明确的 reason，并在进入持久化前拦截，避免把不可审批的副作用卡进存储。
+# scheduler:* 自指 / system:run_command / desktop 自动化 / 截图 / 截图 OCR
+# 均为拒绝集合；pet:diary_write 因任务审计会抄录动作内容（私密条目
+# 不能经调度创建），只允许经 TriggerService 的 set_trigger 使用。
+_SCHEDULER_ALLOWED_ACTION_IDENTITIES: frozenset[str] = frozenset(
+    {
+        "pet:play_motion",
+        "pet:set_expression",
+        "pet:speak",
+        "pet:autonomous_move",
+        "pet:list_models",
+        "pet:diary_recall",
+        # 凌晨提醒类任务经运行时 immediate 分支进入主动协调器并接受
+        # metadata.require_user_active 门禁；无该约束的力量反弹不存在。
+        "proactive:run",
+    }
+)
+
+
+def _scheduler_action_identity_allowed(identity: object) -> bool:
+    """判定动作身份是否落入调度注册允许集合。"""
+
+    return str(identity or "").strip() in _SCHEDULER_ALLOWED_ACTION_IDENTITIES
+
+
+def _safe_error_text(exc: BaseException) -> str:
+    """状态接口回传的异常摘要：类名加有界清洗正文，敏感细节仅进日志。"""
+
+    text = str(exc).replace("\r", " ").replace("\n", " ").strip()[:160]
+    return f"{type(exc).__name__}: {text}"
+
+
 def parse_interval(expression: str) -> float:
     """解析 every:<number><ms|s|m|h> 固定间隔表达式。"""
 
@@ -46,7 +84,11 @@ def parse_interval(expression: str) -> float:
     unit = match.group(2)
     multiplier = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}[unit]
     seconds = amount * multiplier
-    if not math.isfinite(seconds) or seconds < 0.1 or seconds > 31_536_000:
+    if (
+        not math.isfinite(seconds)
+        or seconds < _MIN_SCHEDULE_INTERVAL_SECONDS
+        or seconds > 31_536_000
+    ):
         raise ScheduleExpressionError("schedule interval is outside the allowed range")
     return seconds
 
@@ -166,6 +208,7 @@ class SchedulerService:
         self._max_tasks = max(1, min(int(max_tasks), 1024))
         self._loop_task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+        self._poll_seconds = 0.5
         self._last_error = ""
         self._state_store: SchedulerStateStore | None = None
         self._persistence_error = ""
@@ -248,7 +291,7 @@ class SchedulerService:
         try:
             snapshots = loader()
         except Exception as exc:
-            self._persistence_error = f"{type(exc).__name__}: {exc}"
+            self._persistence_error = _safe_error_text(exc)
             return
         for snapshot in snapshots or ():
             self._restore_snapshot(snapshot)
@@ -291,8 +334,8 @@ class SchedulerService:
             metadata = snapshot.get("metadata", {})
             metadata = self._validate_metadata(metadata)
             json.dumps(dict(action), ensure_ascii=False, allow_nan=False)
-        except (TypeError, ValueError, OverflowError) as exc:
-            self._persistence_error = f"{type(exc).__name__}: {exc}"
+        except (TypeError, ValueError, OverflowError, ScheduleExpressionError) as exc:
+            self._persistence_error = _safe_error_text(exc)
             return
         if task_id in self._tasks or len(self._tasks) >= self._max_tasks:
             return
@@ -332,7 +375,7 @@ class SchedulerService:
         try:
             saver(self._snapshot(task))
         except Exception as exc:
-            self._persistence_error = f"{type(exc).__name__}: {exc}"
+            self._persistence_error = _safe_error_text(exc)
 
     def _delete_persisted_task(self, task_id: str) -> None:
         store = self._state_store
@@ -342,7 +385,7 @@ class SchedulerService:
         try:
             remover(task_id)
         except Exception as exc:
-            self._persistence_error = f"{type(exc).__name__}: {exc}"
+            self._persistence_error = _safe_error_text(exc)
 
     def _record_run(
         self,
@@ -377,7 +420,7 @@ class SchedulerService:
                 payload={"run_count": task.run_count, "expression": task.expression},
             )
         except Exception as exc:
-            self._persistence_error = f"{type(exc).__name__}: {exc}"
+            self._persistence_error = _safe_error_text(exc)
 
     def upsert(
         self,
@@ -406,6 +449,11 @@ class SchedulerService:
         validate_schedule_expression(normalized_expression)
         if not isinstance(action, Mapping) or not action:
             raise ValueError("task action must be a non-empty mapping")
+        identity = action.get("identity")
+        if isinstance(identity, bool) or not isinstance(identity, str) or not identity.strip():
+            raise ValueError("task action identity must be a non-empty string")
+        if not _scheduler_action_identity_allowed(identity):
+            raise ValueError("task action identity is not allowed for scheduled tasks")
         try:
             json.dumps(dict(action), ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError) as exc:
@@ -536,7 +584,13 @@ class SchedulerService:
                     )
                     raise
                 except Exception as exc:
-                    self._last_error = f"{type(exc).__name__}: {exc}"
+                    # 异常正文可能携带敏感上下文，不回传 UI 与诊断通道；
+                    # 只保存类名，完整堆栈由本模块日志经脱敏层输出。
+                    logger.exception(
+                        "scheduler action failed task_id=%s",
+                        task.task_id,
+                    )
+                    self._last_error = type(exc).__name__
                     run_status = "failed"
                     run_error = self._last_error
             self._record_run(
@@ -583,8 +637,9 @@ class SchedulerService:
             raise ValueError("scheduler poll_seconds is invalid") from exc
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError("scheduler poll_seconds is invalid")
+        self._poll_seconds = max(0.05, interval)
         self._stop_event = asyncio.Event()
-        self._loop_task = asyncio.create_task(self._run_loop(max(0.05, interval)))
+        self._loop_task = asyncio.create_task(self._run_loop(self._poll_seconds))
 
     async def _run_loop(self, poll_seconds: float) -> None:
         assert self._stop_event is not None
@@ -594,7 +649,10 @@ class SchedulerService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._last_error = f"{type(exc).__name__}: {exc}"
+                # 与动作执行失败相同：异常正文不进入状态接口，
+                # 细节由日志脱敏层承载。
+                logger.exception("scheduler run loop failed")
+                self._last_error = type(exc).__name__
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=poll_seconds)
             except TimeoutError:

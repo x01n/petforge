@@ -48,6 +48,8 @@ from services.processes import (
     terminate_process_tree,
 )
 
+from .backpress import QueueDepthProbe, wait_until_acquired
+
 logger = logging.getLogger(__name__)
 
 _TTS_WORKER_PROTOCOL = TTS_IPC_PROTOCOL
@@ -454,6 +456,7 @@ class SubprocessTTSBackend:
         self._group_id: int | None = None
         self._process_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
+        self._request_lock.queue_depth = QueueDepthProbe()
         self._dispose_lock = asyncio.Lock()
         self._closing = False
         self._closed = False
@@ -952,6 +955,10 @@ class SubprocessTTSBackend:
         process = self._process
         running = process is not None and process.returncode is None
         ipc_ready = bool(running and self._worker_ready)
+        queue_probe = getattr(self._request_lock, "queue_depth", None)
+        queue_depth = getattr(queue_probe, "value", 0)
+        if not isinstance(queue_depth, int) or isinstance(queue_depth, bool) or queue_depth < 0:
+            queue_depth = 0
         return {
             "backend": self.engine_name,
             "mode": self._worker_mode,
@@ -961,6 +968,7 @@ class SubprocessTTSBackend:
                 "running": running,
                 "ready": ipc_ready,
                 "pid": int(process.pid) if running else None,
+                "queue_depth": int(queue_depth),
             },
             "capabilities": tuple(sorted(self._worker_capabilities)),
         }
@@ -1158,10 +1166,19 @@ class SubprocessTTSBackend:
     async def stream(self, request: SpeechRequest) -> AsyncIterator[SpeechChunk]:
         if self._closing or self._closed:
             raise RuntimeError("TTS worker backend is closed")
-        async with self._request_lock:
+        # 有界排队：无限期 async with 会在一次超长推理期间吞掉后续请求。
+        # 锁等待超时抛 RequestBacklogError（"TTS worker queue is unavailable"），
+        # 任其向上冒泡为明确的忙状态，而不是永久挂起。
+        await wait_until_acquired(
+            self._request_lock,
+            fallback_message="TTS worker queue is unavailable",
+        )
+        try:
             if self._closing or self._closed:
                 raise RuntimeError("TTS worker backend is closed")
             process, wait_task = await self._running_process()
+            # 空闲超时语义：deadline 只在两次读取之间作预算，每收到一个
+            # 解析合法事件就重置。总流长不限时，真实静默才被枪毙。
             deadline = monotonic() + self.timeout_seconds
             failed = False
             cancelled = False
@@ -1226,6 +1243,8 @@ class SubprocessTTSBackend:
                     message = parsed.payload
                     event_type = parsed.type
                     response_request_id = parsed.request_id
+                    if event_type not in {"ready", "status", "log"}:
+                        deadline = monotonic() + self.timeout_seconds
                     # 允许一个已完成请求的迟到 ``done``，它可能紧随
                     # ``audio(final=true)`` 出现在同一常驻 stdout 管道中。
                     # 其它请求 ID 或其它事件仍按协议错误处理，避免掩盖
@@ -1444,6 +1463,8 @@ class SubprocessTTSBackend:
                     if self._active_stream_task is active_task:
                         self._active_stream_task = None
                         self._active_request_id = ""
+        finally:
+            self._request_lock.release()
 
     def _close_wait_timeout(self) -> float:
         """返回关闭锁等待上限；推理超时不参与关闭预算。"""
@@ -1481,15 +1502,17 @@ class SubprocessTTSBackend:
         process = self._process
         if process is None:
             return
+        clean = True
         if "shutdown" in self._worker_capabilities and process.returncode is None:
             operation_id = self._operation("shutdown", process.pid)
             try:
-                await self._invoke_ipc(
+                message = await self._invoke_ipc(
                     "shutdown",
                     request_id=operation_id,
                     expected=frozenset({"shutdown"}),
                     timeout=min(self.shutdown_timeout_seconds, self._close_wait_timeout()),
                 )
+                clean = _protocol_bool(message.get("clean", True), "clean")
             except (
                 BrokenPipeError,
                 ConnectionError,
@@ -1497,8 +1520,8 @@ class SubprocessTTSBackend:
                 RuntimeError,
                 TimeoutError,
             ):
-                pass
-        await self._dispose_process(process, graceful=True)
+                clean = False
+        await self._dispose_process(process, graceful=clean)
 
     async def _close_once(
         self,

@@ -6,9 +6,11 @@ import asyncio
 import inspect
 import logging
 import math
+import threading
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future as ConcurrentFuture
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from threading import RLock
@@ -305,8 +307,15 @@ class ToolExecutionService:
         # 这些状态既会在运行时事件循环中访问，也会被无 Qt 的同步审批入口读取。
         # 临界区内不等待协程，因此使用线程锁避免跨线程读写竞态。
         self._state_lock = RLock()
-        self._side_effect_lock = asyncio.Lock()
+        # 副作用调用会从事件循环（对话、调度器）与同步线程（触发器、审批）进入。
+        # asyncio.Lock 绑定其创建循环，跨循环 await 会抛 "bound to a different event
+        # loop" 并被上层吞掉，使副作用工具请求静默丢失。改为线程锁在入口串行，
+        # 执行体内部不再 await 跨越锁边界，因此不会阻塞任何事件循环之外的新循环。
+        self._side_effect_lock = threading.Lock()
         self._read_lock = asyncio.Semaphore(4)
+        # asyncio.Semaphore 的 _loop 字段在部分 Python 版本并非可靠的持锁者，
+        # 因此显式记录首次实际使用只读信号量的循环，跨循环调用据此拒绝。
+        self._read_lock_loop: asyncio.AbstractEventLoop | None = None
         self._approval_lock = RLock()
         self._pending_approvals: dict[str, _PendingInvocation] = {}
         self._audit_lock = RLock()
@@ -315,6 +324,24 @@ class ToolExecutionService:
         self._execution_sequence = 0
         # 生命周期计时只按不可逆签名索引，不保存工具参数或原始 call_id。
         self._operation_started: dict[str, float] = {}
+
+    def promote_xml_approve(
+        self,
+        context: ToolCallContext,
+        *,
+        identities: Iterable[object] = (),
+    ) -> bool:
+        """纯转发：向权限服务提交一次 XML approve 有界放行声明。
+
+        不在此处做任何风险裁决或策略判断；是否生效完全由
+        ``PermissionService.accept_xml_approve`` 依据门控开关、deny/allow
+        名单与风险等级决定（本轮最小的桥接入口，不做决策）。
+        """
+
+        accept = getattr(self.permissions, "accept_xml_approve", None)
+        if not callable(accept):
+            return False
+        return bool(accept(context, identities=identities))
 
     async def _notify(self, state: str, outcome: ToolOutcome) -> None:
         if self._event_sink is None:
@@ -1003,11 +1030,33 @@ class ToolExecutionService:
             return result
 
         try:
-            lock = self._read_lock if spec.read_only else self._side_effect_lock
-            async with lock:
-                raw_result = await invoke()
-            content = raw_result if isinstance(raw_result, Mapping) else {"value": raw_result}
-            content = dict(content)
+            use_thread_lock = not spec.read_only
+            acquired = False
+            if use_thread_lock:
+                self._side_effect_lock.acquire()
+                acquired = True
+            elif self._read_lock_bound_elsewhere():
+                # 只读调用在非创建循环上执行时会撞上跨循环信号量，返回明确
+                # 拒绝而不是抛 RuntimeError 被吞掉。
+                return ToolOutcome(
+                    "failed",
+                    spec.identity,
+                    call_id,
+                    {"error": "tool read lock is bound to another event loop"},
+                )
+            read_context = self._read_lock if spec.read_only else nullcontext()
+            try:
+                async with read_context:
+                    if spec.read_only:
+                        self._read_lock_loop = asyncio.get_running_loop()
+                    raw_result = await invoke()
+                content_raw = (
+                    raw_result if isinstance(raw_result, Mapping) else {"value": raw_result}
+                )
+                content = dict(content_raw)
+            finally:
+                if acquired:
+                    self._side_effect_lock.release()
             embedded_status = str(content.get("status", "")).strip().lower()
             failure_states = {"denied", "error", "failed", "unavailable"}
             if (
@@ -1028,6 +1077,20 @@ class ToolExecutionService:
                 call_id,
                 {"error": f"tool failed: {type(exc).__name__}"},
             )
+
+    def _read_lock_bound_elsewhere(self) -> bool:
+        """判断只读信号量是否已绑定到其它事件循环。
+
+        以首次实际占用的循环为准（Python 版本的 Semaphore._loop 语义不稳定），
+        只要当前运行循环不是该循环就拒绝，避免跨循环阻塞或误放行。
+        """
+
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        bound_loop = self._read_lock_loop
+        return bound_loop is not None and bound_loop is not running_loop
 
     async def _evaluate_unique_invocation(
         self,
@@ -1388,24 +1451,34 @@ class ToolExecutionService:
                         break
         parallel_group = 1 if can_parallel else 0
         if can_parallel:
-            return tuple(
-                await asyncio.gather(
-                    *(
-                        self.execute(
-                            call_id=str(call_id or ""),
-                            identity=str(identity or ""),
-                            arguments=(arguments if isinstance(arguments, Mapping) else None),
-                            context=context,
-                            audit_metadata={
-                                "batch_id": batch_id,
-                                "batch_index": index,
-                                "parallel_group": parallel_group,
-                            },
-                        )
-                        for index, (call_id, identity, arguments) in enumerate(prepared)
-                    )
+            tasks = [
+                asyncio.create_task(
+                    self.execute(
+                        call_id=str(call_id or ""),
+                        identity=str(identity or ""),
+                        arguments=(arguments if isinstance(arguments, Mapping) else None),
+                        context=context,
+                        audit_metadata={
+                            "batch_id": batch_id,
+                            "batch_index": index,
+                            "parallel_group": parallel_group,
+                        },
+                    ),
+                    name=f"meapet-tool-batch-{batch_id[:12]}-{index}",
                 )
-            )
+                for index, (call_id, identity, arguments) in enumerate(prepared)
+            ]
+            try:
+                return tuple(await asyncio.gather(*tasks))
+            except BaseException:
+                # gather 不会在一个子任务异常时自动取消其它任务；工具可能仍持有
+                # 外部资源或执行桌面操作，因此必须显式清理同批未完成调用。
+                pending = tuple(task for task in tasks if not task.done())
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                raise
 
         outcomes: list[ToolOutcome] = []
         for index, (call_id, identity, arguments) in enumerate(prepared):
@@ -1736,6 +1809,44 @@ class ToolExecutionService:
             raise RuntimeError("tool plan step did not produce an outcome")
         return last_outcome, step.max_attempts
 
+    async def _execute_parallel_plan_steps(
+        self,
+        executable: Sequence[tuple[ToolPlanStep, Mapping[str, Any]]],
+        *,
+        context: ToolCallContext,
+        remaining_timeout_seconds: float,
+        cancel_event: asyncio.Event | None,
+        parallel_group: int,
+        plan_id: str,
+    ) -> tuple[tuple[ToolOutcome, int], ...]:
+        """并行执行计划步骤；任一任务失败或取消时清理同层其余任务。"""
+
+        tasks = [
+            asyncio.create_task(
+                self._execute_plan_step(
+                    step,
+                    arguments,
+                    context=context,
+                    remaining_timeout_seconds=remaining_timeout_seconds,
+                    cancel_event=cancel_event,
+                    parallel_group=parallel_group,
+                    plan_id=plan_id,
+                )
+            )
+            for step, arguments in executable
+        ]
+        if not tasks:
+            return ()
+        try:
+            return tuple(await asyncio.gather(*tasks))
+        except BaseException:
+            pending = tuple(task for task in tasks if not task.done())
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
+
     async def _execute_plan_normalized(
         self,
         steps: tuple[ToolPlanStep, ...],
@@ -1925,19 +2036,13 @@ class ToolExecutionService:
 
             if len(executable) > 1 and all(is_safe_read(item) for item in executable):
                 try:
-                    step_results = await asyncio.gather(
-                        *(
-                            self._execute_plan_step(
-                                step,
-                                arguments,
-                                context=context,
-                                remaining_timeout_seconds=remaining_timeout(),
-                                cancel_event=cancel_event,
-                                parallel_group=parallel_group,
-                                plan_id=plan_id,
-                            )
-                            for step, arguments in executable
-                        )
+                    step_results = await self._execute_parallel_plan_steps(
+                        executable,
+                        context=context,
+                        remaining_timeout_seconds=remaining_timeout(),
+                        cancel_event=cancel_event,
+                        parallel_group=parallel_group,
+                        plan_id=plan_id,
                     )
                 except asyncio.CancelledError:
                     self._cancel_plan_approvals(plan_id)
@@ -2174,6 +2279,9 @@ class ToolExecutionService:
             initial_parallel_group=checkpoint.parallel_group,
             force_stop=force_stop,
             deadline=checkpoint.deadline,
+            # 恢复必须继续使用检查点中的计划身份。否则恢复阶段会生成
+            # 新的 plan_id，导致执行审计、审批取消和同一计划的追踪被拆开。
+            plan_id=checkpoint.plan_id,
         )
 
     def pending_approval(self, approval_id: str) -> ApprovalRequest | None:

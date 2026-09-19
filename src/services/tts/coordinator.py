@@ -7,12 +7,13 @@ import inspect
 import logging
 import secrets
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from threading import Event as ThreadEvent
 from threading import Lock as ThreadLock
 from threading import RLock, Thread
+from time import monotonic
 
 from core.events.types import AudioChunk, AudioFeature, ConversationContext
 from core.tts.contracts import AudioFeatureAnalyzer, EngineHealth, SpeechBackend, SpeechRequest
@@ -68,6 +69,7 @@ class SpeechSegmenter:
         max_chars: int = 120,
         hard_boundaries: str | None = None,
         soft_boundaries: str | None = None,
+        soft_cut_trigger: int | None = None,
     ) -> None:
         try:
             limit = int(max_chars)
@@ -82,6 +84,13 @@ class SpeechSegmenter:
         )
         if not self.hard_boundaries:
             raise ValueError("speech segment hard_boundaries cannot be empty")
+        if soft_cut_trigger is None:
+            soft_cut_trigger = int(self.max_chars * 0.4)
+        try:
+            trigger = int(soft_cut_trigger)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("speech segment soft_cut_trigger must be an integer") from exc
+        self.soft_cut_trigger = max(12, min(trigger, self.max_chars))
         self._buffer = ""
 
     @property
@@ -146,8 +155,23 @@ class SpeechSegmenter:
                 # 没有右侧字符时无法判断它是句末还是版本号/小数点。
                 # 延迟到下一增量或最终 flush，再决定是否提交给 TTS。
                 if not force and self._buffer[boundary] in {".", "．"} and cut == len(self._buffer):
-                    break
+                    # 段落换行的尾部句点不参与小数延迟；换行本身已经是
+                    # 明确的切分信号，句子在跨行时立即提交。
+                    if "\r" not in self._buffer[: cut + 1] and "\n" not in self._buffer[: cut + 1]:
+                        break
             elif len(self._buffer) < self.max_chars and not force:
+                # 无标点长句但已越过软切点：即使未达到硬上限，也在最近
+                # 的软边界提前断句，避免整段长句一次性输出。没有软边界
+                # 可用时按呼吸点硬切一个触发长度，保证输出仍是流式的。
+                if self._buffer.strip() and len(self._buffer) >= self.soft_cut_trigger:
+                    soft = self._soft_cut(len(self._buffer))
+                    if soft > 0:
+                        cut = self._consume_segment(soft, segments)
+                        if cut > 0:
+                            continue
+                    cut = self._consume_segment(self.soft_cut_trigger, segments)
+                    if cut > 0:
+                        continue
                 break
             else:
                 limit = min(len(self._buffer), self.max_chars)
@@ -163,6 +187,27 @@ class SpeechSegmenter:
             if segment.strip():
                 segments.append(segment)
         return tuple(segments)
+
+    def _consume_segment(self, cut: int, segments: list[str]) -> int:
+        """把缓冲前 ``cut`` 字符制成一个非空片段。
+
+        Args:
+            cut: 待消费的字符数。
+            segments: 输出列表，非空时追加。
+
+        Returns:
+            实际消费的字符数；片段为纯空白时返回 0 并丢弃缓冲。
+        """
+
+        bounded = max(1, min(int(cut), self.max_chars, len(self._buffer)))
+        if bounded <= 0:
+            return 0
+        raw_segment = self._buffer[:bounded]
+        self._buffer = self._buffer[bounded:]
+        segment = raw_segment.replace("\r", "").replace("\n", "")
+        if segment.strip():
+            segments.append(segment)
+        return bounded
 
     def push(self, text: str) -> tuple[str, ...]:
         self._buffer += str(text or "")
@@ -194,6 +239,7 @@ class TTSCoordinator:
         segment_max_chars: int = 120,
         segment_hard_boundaries: str | None = None,
         segment_soft_boundaries: str | None = None,
+        segment_soft_cut_trigger: int | None = None,
         status_sink: Callable[[SpeechStatus], Awaitable[None] | None] | None = None,
         audio_sink: Callable[[AudioChunk], Awaitable[None] | None] | None = None,
         feature_analyzer: AudioFeatureAnalyzer | None = None,
@@ -208,6 +254,11 @@ class TTSCoordinator:
         self.segment_max_chars = max(20, min(int(segment_max_chars), SpeechSegmenter.MAX_CHARS))
         self.segment_hard_boundaries = segment_hard_boundaries
         self.segment_soft_boundaries = segment_soft_boundaries
+        if segment_soft_cut_trigger is None:
+            segment_soft_cut_trigger = int(self.segment_max_chars * 0.4)
+        self.segment_soft_cut_trigger = max(
+            12, min(int(segment_soft_cut_trigger), self.segment_max_chars)
+        )
         self._status_sink = status_sink
         self._audio_sink = audio_sink
         self._feature_analyzer = feature_analyzer
@@ -362,21 +413,26 @@ class TTSCoordinator:
         max_chars: int,
         hard_boundaries: str | None = None,
         soft_boundaries: str | None = None,
+        soft_cut_trigger: int | None = None,
     ) -> None:
         """更新后续语音分段策略，并安全回收已完成的旧分段器。"""
 
         self.segment_max_chars = max(20, min(int(max_chars), SpeechSegmenter.MAX_CHARS))
         self.segment_hard_boundaries = hard_boundaries
         self.segment_soft_boundaries = soft_boundaries
+        if soft_cut_trigger is None:
+            soft_cut_trigger = int(self.segment_max_chars * 0.4)
+        self.segment_soft_cut_trigger = max(12, min(int(soft_cut_trigger), self.segment_max_chars))
         # 运行时通常只在空闲时替换配置；若旧回合仍在收尾，保留其活动
         # 分段器及未形成句子的尾部，避免热重载截断已经到达的文本。新建
-        # 回合会使用上面的新配置。
+        # 回合会使用上面的新配置。整个检查和回收必须持有同一把锁，
+        # 否则跨事件循环的 enqueue_text 可能在遍历期间修改字典。
         with self._audio_lock:
             active_keys = set(self._active_tasks)
-        for key, segmenter in tuple(self._segments.items()):
-            if key in active_keys or segmenter.buffered_chars:
-                continue
-            self._segments.pop(key, None)
+            for key, segmenter in tuple(self._segments.items()):
+                if key in active_keys or segmenter.buffered_chars:
+                    continue
+                self._segments.pop(key, None)
 
     def set_status_sink(
         self, sink: Callable[[SpeechStatus], Awaitable[None] | None] | None
@@ -666,7 +722,24 @@ class TTSCoordinator:
             not preferred_profile
             and (not role or _tts_role_key(role) == _tts_role_key(existing_role))
         ):
-            return existing
+            # 热重载可能移除当前回合最初使用的 profile。继续返回失效
+            # ``profile_id`` 会让路由器拒绝后续句段，导致文本正常完成而
+            # TTS 静默丢失。仅在后端明确提供 profile 探针且 profile 已
+            # 不可用时迁移快照；仍存在的 profile 继续保持回合内音色固定。
+            profile_id = existing[1]
+            enabled_probe = getattr(self.backend, "profile_enabled", None)
+            if not profile_id or not callable(enabled_probe):
+                return existing
+            try:
+                profile_available = bool(enabled_probe(profile_id))
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                profile_available = False
+            if profile_available:
+                return existing
+            with self._audio_lock:
+                if self._context_routes.get(key) == existing:
+                    self._context_routes.pop(key, None)
+                    self._context_route_roles.pop(key, None)
         profile = self._profile_for(normalized_language, preferred_profile, role=role)
         if existing is not None and (preferred_profile or role):
             return normalized_language, profile
@@ -724,6 +797,7 @@ class TTSCoordinator:
                         max_chars=self.segment_max_chars,
                         hard_boundaries=self.segment_hard_boundaries,
                         soft_boundaries=self.segment_soft_boundaries,
+                        soft_cut_trigger=getattr(self, "segment_soft_cut_trigger", None),
                     ),
                 )
                 segments = list(segmenter.push(text))
@@ -815,6 +889,10 @@ class TTSCoordinator:
         started_status_task = asyncio.create_task(
             self._status(SpeechStatus(context, "started", "语音分段已排队"))
         )
+        synthesis_started = monotonic()
+        first_audio_at: float | None = None
+        audio_chunk_count = 0
+        audio_bytes = 0
         cancelled = False
         stream: object | None = None
         try:
@@ -839,6 +917,10 @@ class TTSCoordinator:
                         is_final=chunk.is_final,
                         request_id=request.request_id,
                     )
+                    audio_chunk_count += 1
+                    audio_bytes += len(event.data)
+                    if event.data and first_audio_at is None:
+                        first_audio_at = monotonic()
                     with self._audio_lock:
                         if (
                             self._closing
@@ -871,16 +953,22 @@ class TTSCoordinator:
                             logger.debug("speech audio sink await failed", exc_info=True)
                     await self._dispatch_features(event)
             finally:
-                close_stream = getattr(stream, "aclose", None)
-                if callable(close_stream):
-                    try:
-                        close_result = close_stream()
-                        if inspect.isawaitable(close_result):
-                            await close_result
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.debug("speech stream close failed: %s", type(exc).__name__)
+                try:
+                    close_stream = getattr(stream, "aclose", None)
+                    if callable(close_stream):
+                        try:
+                            close_result = close_stream()
+                            if inspect.isawaitable(close_result):
+                                await close_result
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.debug("speech stream close failed: %s", type(exc).__name__)
+                finally:
+                    # 自定义后端可能在异常/取消时没有发送 is_final；
+                    # 让有状态分析器释放本请求的帧偏移，避免请求 ID 重用
+                    # 后沿用旧时间轴。
+                    await self._reset_feature_request(context, request.request_id)
             # 状态 sink 的异常已在 ``_status`` 内隔离；等待任务只为确保
             # 快速 sink 的 started 事件先于终态，慢 sink 不会影响首个音频。
             await self._wait_status_task(started_status_task)
@@ -897,6 +985,16 @@ class TTSCoordinator:
                 component="tts.coordinator",
                 status="cancelled" if cancelled else "completed",
                 correlation_id=request.request_id,
+                duration_ms=(monotonic() - synthesis_started) * 1000.0,
+                fields={
+                    "audio_chunk_count": audio_chunk_count,
+                    "audio_bytes": audio_bytes,
+                    "time_to_first_audio_ms": (
+                        (first_audio_at - synthesis_started) * 1000.0
+                        if first_audio_at is not None
+                        else None
+                    ),
+                },
             )
         except asyncio.CancelledError:
             if not started_status_task.done():
@@ -912,6 +1010,16 @@ class TTSCoordinator:
                 component="tts.coordinator",
                 status="cancelled",
                 correlation_id=request.request_id,
+                duration_ms=(monotonic() - synthesis_started) * 1000.0,
+                fields={
+                    "audio_chunk_count": audio_chunk_count,
+                    "audio_bytes": audio_bytes,
+                    "time_to_first_audio_ms": (
+                        (first_audio_at - synthesis_started) * 1000.0
+                        if first_audio_at is not None
+                        else None
+                    ),
+                },
             )
             raise
         except Exception as exc:
@@ -928,11 +1036,41 @@ class TTSCoordinator:
                 status="failed",
                 level=logging.WARNING,
                 correlation_id=request.request_id,
-                fields={"error": type(exc).__name__},
+                duration_ms=(monotonic() - synthesis_started) * 1000.0,
+                fields={
+                    "error": type(exc).__name__,
+                    "audio_chunk_count": audio_chunk_count,
+                    "audio_bytes": audio_bytes,
+                    "time_to_first_audio_ms": (
+                        (first_audio_at - synthesis_started) * 1000.0
+                        if first_audio_at is not None
+                        else None
+                    ),
+                },
             )
             await self._emit_status_bounded(
                 SpeechStatus(context, "degraded", "语音不可用，保留文本输出")
             )
+
+    async def _reset_feature_request(
+        self,
+        context: ConversationContext,
+        request_id: str,
+    ) -> None:
+        """在音频流异常终止时释放分析器的请求状态。"""
+
+        analyzer = self._feature_analyzer
+        reset = getattr(analyzer, "reset", None) if analyzer is not None else None
+        if not callable(reset):
+            return
+        try:
+            result = reset(context, request_id)
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("speech feature analyzer reset failed: %s", type(exc).__name__)
 
     async def _dispatch_features(self, chunk: AudioChunk) -> None:
         """将分析器明确确认的特征送往渲染边界。
@@ -1056,6 +1194,72 @@ class TTSCoordinator:
                 if self._context_key(chunk.context) in self._cancelled:
                     continue
             return chunk
+
+    def iter_audio(self, context: ConversationContext | None = None) -> Iterator[AudioChunk]:
+
+        with self._queue.mutex:
+            snapshot = tuple(self._queue.queue)
+        remaining: list[AudioChunk] = []
+        for chunk in snapshot:
+            if context is None or self._context_key(chunk.context) == self._context_key(context):
+                remaining.append(chunk)
+        for item in remaining:
+            try:
+                self._queue.get_nowait()
+            except Empty:  # pragma: no cover - 并发消费竞态下的保守兜底
+                continue
+            with self._audio_lock:
+                if self._context_key(item.context) in self._cancelled:
+                    continue
+            yield item
+
+    async def stream_audio(
+        self,
+        context: ConversationContext,
+        *,
+        timeout_seconds: float = 0.0,
+    ) -> AsyncIterator[AudioChunk]:
+        """异步拉取音频分片流。
+
+        Args:
+            context: 只消费该会话代际的音频；其余分片保留给其它消费者。
+            timeout_seconds: 队列连续空闲超过该秒数时结束迭代；0 表示一直
+                等待到协调器关闭，适合流式播放的长期消费者。
+
+        Yields:
+            按到达顺序的 :class:`.SpeechChunk` 音频分片。
+        """
+
+        idle = 0.0
+        while not (self._closing or self._closed):
+            try:
+                chunk = self._queue.get_nowait()
+            except Empty:
+                if timeout_seconds > 0 and idle >= timeout_seconds:
+                    return
+                await asyncio.to_thread(self._audio_available.wait, 0.25)
+                idle += 0.25
+                with self._queue.mutex:
+                    if not self._queue.queue:
+                        self._audio_available.clear()
+                continue
+            idle = 0.0
+            key = self._context_key(chunk.context)
+            if key != self._context_key(context):
+                # 不属于本回合的分片留在队列中供其它消费者读取。先取锁
+                # 再写队列以保持 ``_audio_lock → _queue.mutex`` 顺序，
+                # 与 ``_drop_context_audio``/``next_audio`` 的取锁顺序一致。
+                with self._audio_lock:
+                    with self._queue.mutex:
+                        self._queue.queue.appendleft(chunk)
+                        self._queue.not_full.notify_all()
+                continue
+            with self._audio_lock:
+                if key in self._cancelled:
+                    continue
+            yield chunk
+        if self._closing or self._closed:
+            raise RuntimeError("TTS coordinator is closed")
 
     def cancel(self, context: ConversationContext) -> None:
         if self._closing or self._closed:

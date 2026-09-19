@@ -10,6 +10,12 @@ from pathlib import Path
 import pytest
 
 
+# test_app_tray_hide_keeps_hotkey_conversation_and_streaming_audio：重入本
+# 文件执行真实应用场景，Linux 下整套走 xvfb-run + xcb；celery sprite 与
+# web_live2d 两个后端都会启动 WebEngine 渲染器（MEAPET_WEBENGINE_SOFTWARE=1），
+# 故同时打 xvfb 与 webengine。另一用例为纯导入测试，不落模块级。
+@pytest.mark.xvfb
+@pytest.mark.webengine
 @pytest.mark.parametrize("backend", ["sprite", "web_live2d"])
 def test_app_tray_hide_keeps_hotkey_conversation_and_streaming_audio(backend: str) -> None:
     """真实应用窗口隐藏后，快捷键对话与 TTS 消费仍贯通。"""

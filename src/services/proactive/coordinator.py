@@ -5,10 +5,12 @@ import hashlib
 import json
 import logging
 import math
+import random
+import re
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -22,6 +24,9 @@ _MAX_EVENT_NAME = 64
 _MAX_INSTRUCTION_CHARS = 600
 _MAX_PAYLOAD_TEXT = 256
 _CONVERSATION_WAIT_TIMEOUT_SECONDS = 0.5
+# 进入事件 payload 的文本字段前先剔除全部 C0 控制符与 DEL（\x00-\x1f
+# 与 \x7f），防止控制字符污染后续提示构造、事件指纹与日志行边界。
+_PAYLOAD_CONTROL_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
 _PAYLOAD_FIELDS = frozenset(
     {
         "status",
@@ -68,6 +73,12 @@ def _integer(value: object, *, name: str, minimum: int, maximum: int) -> int:
     return integer
 
 
+def _bool(value: object, *, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{name} must be a boolean")
+
+
 def _event_name(value: object) -> str:
     text = str(value or "").strip().lower()
     if (
@@ -77,6 +88,39 @@ def _event_name(value: object) -> str:
     ):
         raise ValueError("proactive event name is invalid")
     return text
+
+
+def _mood_multipliers(value: object) -> dict[str, float]:
+
+    from services.affection.service import MOODS
+
+    allowed_moods = frozenset(MOODS)
+    if value is None:
+        return {
+            "烦躁": 0.5,
+            "生气": 0.5,
+            "难过": 0.5,
+            "高兴": 1.2,
+            "期待": 1.2,
+            "好奇": 1.2,
+        }
+    if not isinstance(value, Mapping):
+        raise ValueError("proactive.mood_multipliers must be a mapping")
+    result: dict[str, float] = {}
+    for raw_key, raw_number in value.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            raise ValueError("proactive.mood_multipliers contains an empty key")
+        if key not in allowed_moods:
+            raise ValueError(f"proactive.mood_multipliers has unsupported mood: {key}")
+        number = _number(
+            raw_number,
+            name=f"proactive.mood_multipliers.{key}",
+            minimum=0.0,
+            maximum=2.0,
+        )
+        result[key] = number
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,8 +186,22 @@ class ProactiveSettings:
     global_cooldown_seconds: float = 15.0
     dedupe_seconds: float = 60.0
     max_pending_events: int = 32
-    memory_context_chars: int = 2400
+    memory_context_chars: int = 2600
     max_tool_rounds: int = 2
+    user_active_required: bool = False
+
+    mood_gate_enabled: bool = True
+    mood_multipliers: Mapping[str, float] = field(
+        default_factory=lambda: {
+            "烦躁": 0.5,
+            "生气": 0.5,
+            "难过": 0.5,
+            "高兴": 1.2,
+            "期待": 1.2,
+            "好奇": 1.2,
+        }
+    )
+
     rules: tuple[ProactiveRule, ...] = ()
 
     @classmethod
@@ -158,6 +216,9 @@ class ProactiveSettings:
             "max_pending_events",
             "memory_context_chars",
             "max_tool_rounds",
+            "user_active_required",
+            "mood_gate_enabled",
+            "mood_multipliers",
             "rules",
         }
         if set(values) - allowed:
@@ -221,6 +282,15 @@ class ProactiveSettings:
                 minimum=1,
                 maximum=4,
             ),
+            user_active_required=_bool(
+                values.get("user_active_required", False),
+                name="proactive.user_active_required",
+            ),
+            mood_gate_enabled=_bool(
+                values.get("mood_gate_enabled", True),
+                name="proactive.mood_gate_enabled",
+            ),
+            mood_multipliers=_mood_multipliers(values.get("mood_multipliers", None)),
             rules=rules,
         )
 
@@ -247,6 +317,8 @@ class ProactiveCoordinator:
         activity_provider: Callable[[], object] | None = None,
         gate_provider: Callable[[], Mapping[str, object]] | None = None,
         clock: Callable[[], float] | None = None,
+        mood_provider: Callable[[], str] | None = None,
+        rng: Callable[[], float] | None = None,
     ) -> None:
         self.conversation = conversation
         self._memory = memory
@@ -255,6 +327,8 @@ class ProactiveCoordinator:
         self._activity_provider = activity_provider
         self._gate_provider = gate_provider
         self._clock = clock or time.time
+        self._mood_provider = mood_provider
+        self._rng = rng or random.random
         self._queue: deque[ProactiveEvent] = deque()
         self._worker: asyncio.Task[None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -321,7 +395,8 @@ class ProactiveCoordinator:
             if value is None or isinstance(value, (bool, int, float)):
                 result[key] = value
             elif isinstance(value, str):
-                result[key] = value.replace("\x00", "")[:_MAX_PAYLOAD_TEXT]
+                cleaned = _PAYLOAD_CONTROL_PATTERN.sub("", value)
+                result[key] = cleaned[:_MAX_PAYLOAD_TEXT]
             elif key == "geometry" and isinstance(value, Sequence):
                 result[key] = [int(item) for item in tuple(value)[:4] if isinstance(item, int)]
         return result
@@ -330,7 +405,7 @@ class ProactiveCoordinator:
     def _fingerprint(event_name: str, rule_id: str, payload: Mapping[str, Any]) -> str:
         stable = {
             key: payload.get(key)
-            for key in ("process_name", "app_id", "title", "task_id", "label", "value")
+            for key in ("window_id", "process_name", "app_id", "title", "task_id", "label", "value")
             if key in payload
         }
         encoded = json.dumps(
@@ -364,7 +439,13 @@ class ProactiveCoordinator:
             # 当前事件回调中的 ``dialogue_active`` 门禁吞掉。
             if not allow_dialogue_active and gate.get("dialogue_active") is True:
                 return False
-        if rule.conditions.get("require_user_active") is True:
+        required_by_rule = rule.conditions.get("require_user_active") is True
+        required_globally = bool(self.settings.user_active_required)
+        # 全局开关强制时只有规则显式豁免（require_user_active: false）可以
+        # 跳过；其余情况只要任一层要求活跃就必须检查 provider。
+        if required_by_rule or required_globally:
+            if required_globally and rule.conditions.get("require_user_active") is False:
+                return True
             provider = self._activity_provider
             try:
                 active = (
@@ -459,6 +540,18 @@ class ProactiveCoordinator:
                 self._dropped += 1
                 rejection_status = rejection_status or "queue_full"
                 continue
+            if settings.mood_gate_enabled:
+                factor = self._mood_factor()
+                try:
+                    roll = float(self._rng())
+                except (TypeError, ValueError, OverflowError):
+                    roll = 1.0
+                if not math.isfinite(roll) or not 0.0 <= roll <= 1.0:
+                    roll = 1.0
+                if roll >= factor:
+                    self._dropped += 1
+                    rejection_status = rejection_status or "skipped_mood"
+                    continue
             self._dedupe[fingerprint] = now
             if len(self._dedupe) > 512:
                 oldest = sorted(self._dedupe.items(), key=lambda item: item[1])[:128]
@@ -526,6 +619,18 @@ class ProactiveCoordinator:
         self._conversation_idle_event.set()
         self._ensure_worker()
 
+    def _mood_factor(self) -> float:
+
+        provider = self._mood_provider
+        if not callable(provider):
+            return 1.0
+        try:
+            mood = str(provider()).strip()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return 1.0
+        factor = float(self._settings.mood_multipliers.get(mood, 1.0))
+        return max(0.0, min(2.0, factor))
+
     def _event_prompt(self, event: ProactiveEvent) -> str:
         payload_text = json.dumps(event.payload, ensure_ascii=False, sort_keys=True)
         query = " ".join(
@@ -545,6 +650,19 @@ class ProactiveCoordinator:
             affection = int(getattr(self._affection, "get_affection")())
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
             affection = 0
+        mood_text = ""
+        mood_provider = self._mood_provider
+        try:
+            raw_mood = str(mood_provider()).strip() if callable(mood_provider) else ""
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            raw_mood = ""
+        from services.affection.service import MOODS
+        from services.directives import mood_description
+
+        if raw_mood in MOODS:
+            mood_text = f"当前心情：{raw_mood}（{mood_description(raw_mood)}）"
+        elif raw_mood:
+            mood_text = f"当前心情：{raw_mood}"
         sections = [
             "这是桌宠后台主动事件，不是用户输入。只在确有帮助时简短回应；需要行动时调用现有工具。",
             "不得声称执行未获得成功回执的操作，中高风险工具必须等待用户审批。",
@@ -553,6 +671,8 @@ class ProactiveCoordinator:
             f"本次目标：{event.rule.instruction}",
             f"当前好感度：{max(0, min(100, affection))}/100",
         ]
+        if mood_text:
+            sections.append(mood_text)
         if memory_prompt:
             sections.append(memory_prompt)
         return "\n\n".join(sections)[:8000]

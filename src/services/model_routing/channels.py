@@ -113,6 +113,14 @@ class ChannelConfig:
     request_body_template: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
     adapter: str = ""
+    # 渠道可能没有图片理解能力，或“能收图但理解不可靠”；置 true 表示
+    # 路由层判定该渠道接收图片后，图片会先由视觉渠道转成文本摘要。
+    image_summary_fallback: bool = False
+    # 允许该渠道路由到的任务集合；空集表示不参与任何可路由任务。
+    tasks: frozenset[str] = field(default_factory=frozenset)
+    # 该渠道 API 审计快照中单条消息正文本的截断阈值（字符数）。默认 4000；
+    # 超出窗口的值不生效，低于全局默认视为配置错误（不能主动缩小审计口径）。
+    audit_text_limit: int = 4000
 
     def __post_init__(self) -> None:
         channel_id = _text(self.id, "id", required=True)
@@ -186,6 +194,22 @@ class ChannelConfig:
             _mapping(self.request_body_template, "request_body_template"),
         )
         object.__setattr__(self, "metadata", _mapping(self.metadata, "metadata"))
+        # 图片缺口标志和任务白名单走同一配置文件校验，保证实例化时已安全。非
+        # 布尔值按失败关闭处理。
+        image_summary_fallback = _bool(self.image_summary_fallback, "image_summary_fallback")
+        tasks = {
+            str(item).strip().lower()
+            for item in _string_set(self.tasks, "tasks")
+            if str(item).strip()
+        }
+        object.__setattr__(self, "image_summary_fallback", image_summary_fallback)
+        object.__setattr__(self, "tasks", frozenset(tasks))
+        if isinstance(self.audit_text_limit, bool) or not isinstance(self.audit_text_limit, int):
+            raise AdapterConfigurationError("channel audit_text_limit must be an integer")
+        audit_text_limit = int(self.audit_text_limit)
+        if audit_text_limit < 4000 or audit_text_limit > 32768:
+            raise AdapterConfigurationError("channel audit_text_limit is out of range")
+        object.__setattr__(self, "audit_text_limit", audit_text_limit)
 
     @property
     def selected_model(self) -> str:
@@ -288,6 +312,9 @@ class ChannelConfig:
             if redact_api_key
             else dict(self.request_body_template),
             "metadata": redact(self.metadata) if redact_api_key else dict(self.metadata),
+            "image_summary_fallback": self.image_summary_fallback,
+            "audit_text_limit": self.audit_text_limit,
+            "tasks": sorted(self.tasks),
         }
 
     @classmethod
@@ -333,7 +360,24 @@ class ChannelConfig:
             request_body_template=raw.get("request_body_template", {}),
             metadata=raw.get("metadata", raw.get("extra", {})),
             adapter=str(raw.get("adapter", protocol) or ""),
+            image_summary_fallback=_bool(
+                raw.get("image_summary_fallback", False), "image_summary_fallback"
+            ),
+            audit_text_limit=int(raw.get("audit_text_limit", 4000)),
+            tasks=_parse_tasks(raw.get("tasks")),
         )
+
+
+def _parse_tasks(value: object) -> frozenset[str]:
+    """把渠道级任务白名单收敛为小写字符串集合。"""
+
+    if value is None:
+        return frozenset()
+    if isinstance(value, str):
+        return frozenset({value.strip().lower()}) if value.strip() else frozenset()
+    if isinstance(value, Iterable) and not isinstance(value, Mapping):
+        return frozenset(str(item).strip().lower() for item in value if str(item or "").strip())
+    raise AdapterConfigurationError("channel tasks must be a list of strings")
 
 
 def channel_from_mapping(value: Mapping[str, Any]) -> ChannelConfig:

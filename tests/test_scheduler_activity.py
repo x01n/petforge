@@ -160,7 +160,7 @@ def test_scheduler_activity_metadata_is_strict_and_configuration_is_validated() 
             task_id="bad",
             name="坏",
             expression="every:1s",
-            action={"identity": "pet:ping"},
+            action={"identity": "pet:play_motion", "arguments": {"name": "wave"}},
             owner="test",
             metadata={"require_user_active": "true"},
         )

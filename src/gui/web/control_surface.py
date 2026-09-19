@@ -54,13 +54,20 @@ _PUBLIC_INTERNAL_PROTOCOL_PATTERN = re.compile(
 )
 _PUBLIC_CAPABILITY_TOKEN = re.compile(r"^cap-(?:expression|motion)-\d{1,2}$")
 _PUBLIC_THEME_TOKEN = re.compile(r"^--md3-[a-z0-9-]{1,80}$")
+# 与 frontend/console/src/lib/theme.ts 的 SAFE_THEME_VALUE 逐字符镜像。
 _PUBLIC_THEME_VALUE = re.compile(r"^[#A-Za-z0-9 ,.()'\"_-]{1,128}$")
+_PUBLIC_AGGREGATE_KEY = re.compile(r"^(status|channel):[A-Za-z0-9_.-]{0,64}$")
+_PUBLIC_DIAGNOSTIC_GROUP_KEY = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# 与 frontend/console/src/lib/theme.ts 的 PUBLIC_THEME_KEYS 保持一致：
+# 29 个 --md3-color-<kebab> 颜色令牌（md3_web_tokens 全量） + 19 个非颜色令牌
+# （--md3-color-scheme 与 font/radius/height/density/spacing/motion 系列），
+# 再并入 --md3-seed（仅当 MD3Theme.seed 非空时由 md3_web_tokens 产出）。
 _PUBLIC_THEME_KEYS = frozenset((*md3_web_tokens(DARK_MD3_THEME), "--md3-seed"))
 _RENDERER_LABELS = {
     "auto": "自动选择",
     "opengl": "OpenGL Live2D",
     "web_live2d": "Web Live2D",
-    "sprite": "精灵回退",
+    "sprite": "精灵（显式）",
     "vulkan": "Vulkan 渲染",
     "vllank": "Vulkan 渲染",
     "vllakn": "Vulkan 渲染",
@@ -149,6 +156,8 @@ _OPERATION_LABELS = {
     "restart_application": "重启桌宠",
     "read_foreground_window": "查看前台窗口",
     "read_processes": "查看运行中的程序",
+    "read_api_audit": "查看 API 调用审计",
+    "read_log_records": "查看运行日志",
     "点击互动": "部位互动",
     "approval": "桌面审批",
     "审批": "桌面审批",
@@ -156,6 +165,8 @@ _OPERATION_LABELS = {
     "进程列表": "查看运行中的程序",
 }
 _PUBLIC_PART_IDS = frozenset({"head", "body", "lower_left", "lower_right"})
+# 公开投影只放行权威 9 值情绪词汇集原文，其余（含旧值/未知值）一律清空。
+_PUBLIC_MOODS = frozenset({"高兴", "平静", "困倦", "烦躁", "难过", "期待", "好奇", "生气", "孤独"})
 _FRIENDLY_PHASES = frozenset(_PHASE_LABELS.values())
 _FRIENDLY_OPERATION_LABELS = frozenset(_OPERATION_LABELS.values())
 _CHANNEL_STATUS_LABELS = {
@@ -338,6 +349,13 @@ def friendly_public_text(
 
 def _text(value: object, *, limit: int = 240) -> str:
     return safe_public_text(value, limit=limit)
+
+
+def _safe_public_mood(value: object) -> str:
+    """情绪投影白名单：仅在权威 9 值集合内的原文，否则空串。"""
+
+    text = str(value or "").strip()
+    return text if text in _PUBLIC_MOODS else ""
 
 
 def _safe_int(value: object, default: int = 0) -> int:
@@ -920,6 +938,12 @@ def _safe_memory_status(value: object) -> dict[str, object]:
             "recall_limit": 0,
             "context_max_chars": 0,
             "max_memories": 0,
+            "prune_importance_floor": 0,
+            "exchange_importance": 0,
+            "extract_default_priority": 0,
+            "always_recall_priority": 0,
+            "recall_min_similarity": 0.0,
+            "auto_extract_enabled": False,
             "consolidation_enabled": False,
             "summarization_enabled": False,
             "summary_running": False,
@@ -946,6 +970,13 @@ def _safe_memory_status(value: object) -> dict[str, object]:
             return 0
         return max(low, min(high, parsed)) if parsed else 0
 
+    def bounded_float(name: str, low: float, high: float) -> float:
+        try:
+            parsed = float(value.get(name, 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return round(parsed, 4) if isfinite(parsed) and low <= parsed <= high else 0.0
+
     message = friendly_public_text(value.get("message"), limit=160)
     if not message:
         message = (
@@ -960,6 +991,12 @@ def _safe_memory_status(value: object) -> dict[str, object]:
         "recall_limit": bounded_int("recall_limit", 1, 100),
         "context_max_chars": bounded_int("context_max_chars", 512, 50000),
         "max_memories": bounded_int("max_memories", 100, 10000),
+        "prune_importance_floor": bounded_int("prune_importance_floor", 0, 10),
+        "exchange_importance": bounded_int("exchange_importance", 0, 10),
+        "extract_default_priority": bounded_int("extract_default_priority", 0, 10),
+        "always_recall_priority": bounded_int("always_recall_priority", 0, 10),
+        "recall_min_similarity": bounded_float("recall_min_similarity", 0.0, 1.0),
+        "auto_extract_enabled": bool(value.get("auto_extract_enabled", False)),
         "consolidation_enabled": bool(value.get("consolidation_enabled", False)),
         "summarization_enabled": bool(value.get("summarization_enabled", False)),
         "summary_running": bool(value.get("summary_running", False)),
@@ -976,6 +1013,11 @@ def _safe_memory_status(value: object) -> dict[str, object]:
             in {"fts5", "sparse_fallback", "unavailable"}
             else "unavailable"
         ),
+        # 召回质量快照：有界、纯数值，只从 MemoryService 状态层投影。
+        "recall_total": bounded_int("recall_total", 0, 1_000_000),
+        "recall_hit_rate": bounded_float("recall_hit_rate", 0.0, 1.0),
+        "recall_top_mean_score": bounded_float("recall_top_mean_score", 0.0, 1.0),
+        "recall_calibration": bounded_float("recall_calibration", 0.0, 0.4),
         "message": message,
     }
 
@@ -1018,8 +1060,68 @@ def _safe_activity_status(value: object) -> dict[str, object]:
     }
 
 
+def _safe_scheduler_status(value: object) -> dict[str, object]:
+    """投影调度与触发计数，隐藏任务动作和持久化细节。"""
+
+    source = value if isinstance(value, Mapping) else {}
+
+    def count(name: str) -> int:
+        return max(0, min(1_000_000, _safe_int(source.get(name, 0))))
+
+    duration = source.get("last_duration_ms")
+    try:
+        duration_value = float(duration) if duration is not None else None
+    except (TypeError, ValueError, OverflowError):
+        duration_value = None
+    return {
+        "status": _status_key(source.get("status")) or "unavailable",
+        "running": bool(source.get("running", False)),
+        "task_count": count("task_count"),
+        "trigger_count": count("trigger_count"),
+        "event_count": count("event_count"),
+        "matched_count": count("matched_count"),
+        "completed_count": count("completed_count"),
+        "failed_count": count("failed_count"),
+        "skipped_count": count("skipped_count"),
+        "last_status": _text(source.get("last_status"), limit=32),
+        "last_duration_ms": round(duration_value, 3)
+        if duration_value is not None and isfinite(duration_value) and duration_value >= 0
+        else None,
+    }
+
+
+def _safe_proactive_status(value: object) -> dict[str, object]:
+    """投影主动行为规则、预算和队列状态，不公开规则指令。"""
+
+    source = value if isinstance(value, Mapping) else {}
+
+    def count(name: str) -> int:
+        return max(0, min(1_000_000, _safe_int(source.get(name, 0))))
+
+    return {
+        "status": _text(source.get("status"), limit=32) or "unavailable",
+        "enabled": bool(source.get("enabled", False)),
+        "running": bool(source.get("running", False)),
+        "rule_count": count("rule_count"),
+        "pending_events": count("pending_events"),
+        "waiting_for_conversation": bool(source.get("waiting_for_conversation", False)),
+        "hourly_used": count("hourly_used"),
+        "hourly_budget": count("hourly_budget"),
+        "daily_used": count("daily_used"),
+        "daily_budget": count("daily_budget"),
+        "accepted": count("accepted"),
+        "completed": count("completed"),
+        "dropped": count("dropped"),
+        "budget_rejections": count("budget_rejections"),
+    }
+
+
 def _safe_theme_tokens(value: object) -> dict[str, str]:
-    """只公开 MD3 令牌，不接受选择器或任意 CSS 声明。"""
+    """只公开 MD3 令牌，不接受选择器或任意 CSS 声明。
+
+    键按 _PUBLIC_THEME_KEYS 集合白名单（29 色 + 19 非颜色 + seed），
+    值按 _PUBLIC_THEME_VALUE 白名单；该约定与前端 theme.ts 镜像。
+    """
 
     if not isinstance(value, Mapping):
         return {}
@@ -1034,6 +1136,174 @@ def _safe_theme_tokens(value: object) -> dict[str, str]:
         ):
             result[name] = rendered
     return result
+
+
+def _safe_optional_duration(value: object) -> float | None:
+    """投影可显示的有限耗时，不接受负值和布尔值。"""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return round(duration, 3) if isfinite(duration) and duration >= 0 else None
+
+
+def _safe_aggregate_key(value: object) -> str:
+    """提取聚合键；只放行 status:/channel: 字面量白名单。"""
+
+    if not isinstance(value, str):
+        return ""
+    key = value.strip()
+    return key if _PUBLIC_AGGREGATE_KEY.fullmatch(key) else ""
+
+
+def _safe_api_audit_group(value: object) -> tuple[dict[str, object], ...]:
+    """把 by_status/by_channel 投影为白名单键的有界条目。"""
+
+    if not isinstance(value, (list, tuple)):
+        return ()
+    rows: list[dict[str, object]] = []
+    for row in value[:64]:
+        if not isinstance(row, Mapping):
+            continue
+        key = _safe_aggregate_key(row.get("key"))
+        if not key:
+            continue
+        rows.append(
+            {
+                "key": key,
+                "count": min(max(0, _safe_int(row.get("count"))), 1_000_000),
+                "avg_first_ms": _safe_optional_duration(row.get("avg_first_ms")),
+                "avg_total_ms": _safe_optional_duration(row.get("avg_total_ms")),
+            }
+        )
+    return tuple(rows)
+
+
+def _safe_api_audit_summary(value: object) -> dict[str, object]:
+    """投影点击界面的审计聚合摘要，只输出白名单字面量。"""
+
+    source = value if isinstance(value, Mapping) else {}
+    latency = source.get("latency_ms")
+    latency = latency if isinstance(latency, Mapping) else {}
+    return {
+        "total": min(max(0, _safe_int(source.get("total"))), 1_000_000),
+        "by_status": _safe_api_audit_group(source.get("by_status")),
+        "by_channel": _safe_api_audit_group(source.get("by_channel")),
+        "latency_ms": {
+            "avg_first": _safe_optional_duration(latency.get("avg_first")),
+            "avg_total": _safe_optional_duration(latency.get("avg_total")),
+            "max_total": _safe_optional_duration(latency.get("max_total")),
+        },
+    }
+
+
+def _safe_api_audit_diagnostic(value: object) -> dict[str, object]:
+    """公开 API 调用审计的摘要指标与聚合结果，不回传载荷正文。"""
+
+    source = value if isinstance(value, Mapping) else {}
+    rows = _sequence(source.get("records"))
+    records: list[dict[str, object]] = []
+    for row in rows[:20]:
+        if not isinstance(row, Mapping):
+            continue
+        records.append(
+            {
+                "kind": safe_public_text(row.get("kind"), limit=32),
+                "status": _status_key(row.get("status")) or "idle",
+                "channel": safe_public_text(
+                    row.get("channel_id", row.get("channel_name")), limit=64
+                ),
+                "model": safe_public_text(
+                    row.get("response_model", row.get("requested_model")), limit=80
+                ),
+                "first_ms": _safe_optional_duration(row.get("time_to_first_token_ms")),
+                "total_ms": _safe_optional_duration(row.get("total_duration_ms")),
+                "tool_count": _safe_int(row.get("tool_execution_count", 0)),
+                "cache_read": bool(row.get("cache_read", False)),
+                "cache_write": bool(row.get("cache_write", False)),
+                "error_type": safe_public_text(row.get("error_type"), limit=64),
+            }
+        )
+    return {
+        "status": _status_key(source.get("status")) or "idle",
+        "count": _safe_int(source.get("count", len(records))),
+        "summary": _safe_api_audit_summary(source.get("summary")),
+        "records": records,
+    }
+
+
+def _safe_log_summary(value: object) -> dict[str, object]:
+    """投影日志聚合摘要；分组键白名单正则，计数有界，异常整体置空。"""
+
+    try:
+        source = value if isinstance(value, Mapping) else {}
+        summary: dict[str, object] = {
+            "total": min(max(0, _safe_int(source.get("total"))), 1_000_000),
+            "warning_plus": min(max(0, _safe_int(source.get("warning_plus"))), 1_000_000),
+        }
+        for dimension in ("by_level", "by_logger", "by_event"):
+            raw = source.get(dimension)
+            if not isinstance(raw, Mapping):
+                return {}
+            rows: dict[str, object] = {}
+            for raw_key, raw_count in tuple(raw.items())[:16]:
+                count = _safe_int(raw_count)
+                if not 0 <= count <= 1_000_000:
+                    return {}
+                safe_key = safe_public_text(raw_key, limit=64)
+                safe_key = (
+                    safe_key
+                    if safe_key and _PUBLIC_DIAGNOSTIC_GROUP_KEY.fullmatch(safe_key)
+                    else ""
+                )
+                if not safe_key:
+                    continue
+                rows[safe_key] = min(count, 1_000_000)
+            summary[dimension] = dict(sorted(rows.items(), key=lambda item: (-item[1], item[0])))
+        return summary
+    except (TypeError, ValueError, AttributeError):
+        return {}
+
+
+def _safe_log_diagnostic(value: object) -> dict[str, object]:
+    """公开运行日志的结构化摘要，不传递未结构化消息正文。"""
+
+    source = value if isinstance(value, Mapping) else {}
+    rows = _sequence(source.get("records"))
+    records: list[dict[str, object]] = []
+    for row in rows[:30]:
+        if not isinstance(row, Mapping):
+            continue
+        records.append(
+            {
+                "level": safe_public_text(row.get("level"), limit=16),
+                "logger": safe_public_text(row.get("logger"), limit=80),
+                "event": safe_public_text(row.get("event"), limit=96),
+                "status": _status_key(row.get("status")) or "",
+                "duration_ms": _safe_optional_duration(row.get("duration_ms")),
+                "reason": safe_public_text(row.get("reason_code"), limit=64),
+                "detail": friendly_public_text(row.get("detail"), limit=160),
+            }
+        )
+    return {
+        "status": _status_key(source.get("status")) or "idle",
+        "count": _safe_int(source.get("count", len(records))),
+        "summary": _safe_log_summary(source.get("summary")),
+        "records": records,
+    }
+
+
+def _safe_diagnostics(value: object) -> dict[str, object]:
+    """投影网页诊断卡片；只允许 API 指标和结构化日志摘要。"""
+
+    source = value if isinstance(value, Mapping) else {}
+    return {
+        "api_audit": _safe_api_audit_diagnostic(source.get("api_audit")),
+        "logs": _safe_log_diagnostic(source.get("logs")),
+    }
 
 
 def public_control_state(value: Mapping[str, Any] | None) -> dict[str, object]:
@@ -1069,6 +1339,9 @@ def public_control_state(value: Mapping[str, Any] | None) -> dict[str, object]:
     configuration = _safe_configuration(source.get("configuration"))
     memory = _safe_memory_status(source.get("memory"))
     activity = _safe_activity_status(source.get("activity"))
+    scheduler = _safe_scheduler_status(source.get("scheduler"))
+    proactive = _safe_proactive_status(source.get("proactive"))
+    diagnostics = _safe_diagnostics(source.get("diagnostics"))
     raw_parts = source.get("parts")
     position = _safe_position(window.get("position"))
     operation = _safe_operation(source.get("operation"))
@@ -1116,6 +1389,44 @@ def public_control_state(value: Mapping[str, Any] | None) -> dict[str, object]:
                 ][:32],
             }
         )
+    if isinstance(renderer.get("ready"), bool):
+        renderer_public["ready"] = bool(renderer["ready"])
+    lifecycle_state = _text(renderer.get("lifecycle_state"), limit=32).lower()
+    if lifecycle_state:
+        renderer_public["lifecycle_state"] = lifecycle_state
+    actual_api = _text(renderer.get("actual_api"), limit=32).lower()
+    if actual_api:
+        renderer_public["actual_api"] = actual_api
+    for key in (
+        "frame_rate",
+        "geometry_audit_hz",
+        "rendered_frames",
+        "throttled_frames",
+        "geometry_audits",
+        "geometry_cache_hits",
+        "geometry_cache_misses",
+        "geometry_vertex_dirty_frames",
+        "geometry_structural_dirty_frames",
+    ):
+        value = renderer.get(key)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and isfinite(float(value))
+        ):
+            renderer_public[key] = float(value)
+    for key, minimum, maximum in (
+        ("frame_time_ms", 0.0, 1_000_000.0),
+        ("large_frame_deltas", 0.0, 1_000_000.0),
+    ):
+        value = renderer.get(key)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and isfinite(float(value))
+            and minimum <= float(value) <= maximum
+        ):
+            renderer_public[key] = float(value)
     return {
         "revision": revision,
         "updated_at": updated_at,
@@ -1157,6 +1468,9 @@ def public_control_state(value: Mapping[str, Any] | None) -> dict[str, object]:
         "theme": _safe_theme_tokens(source.get("theme")),
         "memory": memory,
         "activity": activity,
+        "scheduler": scheduler,
+        "proactive": proactive,
+        "diagnostics": diagnostics,
         "renderer": renderer_public,
         "window": {
             "locked": bool(window.get("locked", False)),
@@ -1175,6 +1489,7 @@ def public_control_state(value: Mapping[str, Any] | None) -> dict[str, object]:
             "tier": _text(affection.get("tier"), limit=48),
             "threshold": _text(affection.get("threshold"), limit=32),
             "description": friendly_public_text(affection.get("description"), limit=200),
+            "mood": _safe_public_mood(affection.get("mood")),
         },
         "feedback": feedback,
         "parts": _safe_parts(raw_parts),

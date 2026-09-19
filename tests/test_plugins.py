@@ -381,6 +381,68 @@ def test_plugin_context_configuration_and_reload_hook_receive_new_snapshot() -> 
     asyncio.run(scenario())
 
 
+def test_plugin_reload_hook_can_replace_instance() -> None:
+    events: list[str] = []
+    labels: list[str] = []
+
+    class Plugin:
+        def __init__(self, context: PluginContext, label: str) -> None:
+            self.context = context
+            self.label = label
+            labels.append(label)
+
+        async def load(self, context: PluginContext) -> None:
+            events.append(f"{self.label}:load:{context.generation}")
+
+        async def start(self) -> None:
+            events.append(f"{self.label}:start")
+
+        async def stop(self) -> None:
+            events.append(f"{self.label}:stop")
+
+        async def unload(self) -> None:
+            events.append(f"{self.label}:unload")
+
+        async def reload(self, context: PluginContext) -> object:
+            events.append(f"{self.label}:reload:{context.configuration.get('mode')}")
+            return Plugin(context, f"{self.label}-replacement")
+
+        async def health(self) -> str:
+            return "ready"
+
+    manager = PluginManager(configuration={"mode": "one"})
+    manager.register(
+        PluginDescriptor(
+            "replace-on-reload",
+            lambda context: Plugin(context, "first"),
+        )
+    )
+
+    async def scenario() -> None:
+        await manager.start()
+        first_generation = int(manager.status("replace-on-reload")["generation"])
+        await manager.reconfigure({"mode": "two"})
+        status = manager.status("replace-on-reload")
+        assert status["state"] == "running"
+        assert int(status["generation"]) > first_generation
+        replacement_generation = int(status["generation"])
+        assert labels == ["first", "first-replacement"]
+        assert events == [
+            f"first:load:{first_generation}",
+            "first:start",
+            "first:reload:two",
+            f"first-replacement:load:{replacement_generation}",
+            "first-replacement:start",
+            "first:stop",
+            "first:unload",
+        ]
+        health = await manager.health()
+        assert health[0]["health"] == "ready"
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
 def test_plugin_settings_reject_invalid_directory_and_interval() -> None:
     with pytest.raises(ValueError, match="plugins.directories"):
         PluginSettings.from_mapping({"directories": "plugins"})

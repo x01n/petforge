@@ -46,8 +46,15 @@ def _state_revision(value: Mapping[str, object] | None) -> int:
     return max(0, revision)
 
 
+# 公开动作白名单由 gui.web.action_contract 单源下发（无 Qt 依赖），
+# Qt 端点只消费 QT_PUBLIC_ACTION_KINDS；本模块 import 不触发 PySide6。
+from gui.web.action_contract import (  # noqa: E402
+    PY_PUBLIC_ACTION_PAYLOAD_KEYS,
+    QT_PUBLIC_ACTION_KINDS,
+)
+
 try:  # WebEngine 仅作为可选桌面能力，不影响无 GUI 核心。
-    from PySide6.QtCore import QObject, Qt, QUrl, Signal, Slot
+    from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal, Slot
     from PySide6.QtWebChannel import QWebChannel
     from PySide6.QtWebEngineCore import QWebEnginePage
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -62,6 +69,7 @@ if pyside6_available:
     _PUBLIC_INPUT_KEYS = frozenset(
         {
             "name",
+            "section",
             "part",
             "target",
             "mode",
@@ -83,60 +91,9 @@ if pyside6_available:
     )
     # 每类公开动作只接收其点击路径需要的字段；额外字段即使是标量也不
     # 进入宿主回调，避免把调试参数或配置片段伪装成公开路由载荷。
-    _PUBLIC_ACTION_PAYLOAD_KEYS = {
-        "open_config": frozenset(),
-        "restart_application": frozenset(),
-        "select_renderer_backend": frozenset({"backend"}),
-        "configure_model": frozenset({"target", "mode"}),
-        "select_model_channel": frozenset({"channel_id", "model"}),
-        "select_renderer_model": frozenset({"model"}),
-        "select_tts_profile": frozenset({"profile", "language"}),
-        "select_tts_language": frozenset({"language"}),
-        "submit_text": frozenset({"text"}),
-        "pet_part": frozenset({"part"}),
-        "expression": frozenset({"name"}),
-        "motion": frozenset({"name"}),
-        "expression_request": frozenset({"expressions", "mode", "loop"}),
-        "motion_request": frozenset(
-            {"name", "duration_seconds", "transition_seconds", "loop", "parameters"}
-        ),
-        "nudge_pet": frozenset({"direction"}),
-        "set_display_size": frozenset({"preset"}),
-    }
-    _PUBLIC_ACTION_KINDS = frozenset(
-        {
-            "open_config",
-            "restart_application",
-            "select_renderer_backend",
-            "configure_model",
-            "select_model_channel",
-            "select_renderer_model",
-            "select_tts_profile",
-            "select_tts_language",
-            "submit_text",
-            "stop",
-            "retry",
-            "approve",
-            "grant_session",
-            "deny",
-            "pet_part",
-            "expression",
-            "motion",
-            "expression_request",
-            "motion_request",
-            "show_pet",
-            "toggle_visibility",
-            "center_pet",
-            "nudge_pet",
-            "set_display_size",
-            "toggle_window_lock",
-            "toggle_always_on_top",
-            "toggle_click_through",
-            "restore_click_through",
-            "read_foreground_window",
-            "read_processes",
-        }
-    )
+    # 键白名单与动作族由 action_contract 单源维护，Qt/HTTP 双向同源。
+    _PUBLIC_ACTION_PAYLOAD_KEYS = PY_PUBLIC_ACTION_PAYLOAD_KEYS
+    _PUBLIC_ACTION_KINDS = QT_PUBLIC_ACTION_KINDS
     _PUBLIC_CAPABILITY_NAME = re.compile(r"^cap-(?:expression|motion)-\d{1,2}$")
     _PUBLIC_PARAMETER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
     _PUBLIC_PARTS = frozenset({"head", "body", "lower_left", "lower_right"})
@@ -508,9 +465,13 @@ if pyside6_available:
             self.resize(width, height)
             self._state_provider = state_provider
             self._page_ready = False
+            self._page_discarded = False
+            self._page_reload_pending = False
             self._shutdown = False
             self._pending_state: dict[str, object] | None = None
             self._last_state_revision = -1
+            self._last_payload = ""
+            self._focus_restore_generation = 0
             self._channel = QWebChannel(self)
             self._bridge = _ControlSurfaceBridge(state_provider, action_callback)
             self._channel.registerObject("meapetControlSurfaceBridge", self._bridge)
@@ -532,18 +493,57 @@ if pyside6_available:
             return self._page_ready
 
         def _on_load_finished(self, ok: bool) -> None:
+            self._page_reload_pending = False
             self._page_ready = bool(ok)
+            self._last_payload = ""
+            if self._page_ready:
+                # Discarded 页面必须重新加载；只有拿到成功的 loadFinished
+                # 才能清除墓碑，避免失败后下次显示再次落入空白页。
+                self._page_discarded = False
             if not self._page_ready:
                 return
-            self._run_state(self._pending_state or _public_control_state(self._state_provider()))
-            self._pending_state = None
+            self.set_state(self._pending_state or self._state_provider())
 
         def _on_lifecycle_state_changed(self, state: QWebEnginePage.LifecycleState) -> None:
-            """停止向已被 Qt 丢弃的页面投递 JavaScript。"""
+            """记录被 Qt 丢弃的页面，并在下次显示时重载。"""
 
-            if state == QWebEnginePage.LifecycleState.Discarded:
-                self._page_ready = False
-                self._pending_state = None
+            if state != QWebEnginePage.LifecycleState.Discarded:
+                return
+            self._page_ready = False
+            self._page_discarded = True
+            self._last_payload = ""
+            # 隐藏期间 Qt 可能为节省内存直接销毁 Chromium 页面。不能
+            # 清空待投递状态，否则恢复时即使页面重载也只能显示初始空状态。
+            try:
+                current = self._state_provider()
+            except Exception:
+                current = None
+            self._pending_state = (
+                _public_control_state(current) if isinstance(current, Mapping) else None
+            )
+            if self.isVisible() and not self.isMinimized():
+                QTimer.singleShot(0, self._reload_discarded_page)
+
+        def _reload_discarded_page(self) -> None:
+            """重建被 Qt 丢弃的控制台页面，并保留最新公开状态。"""
+
+            if (
+                self._shutdown
+                or not self._page_discarded
+                or self._page_reload_pending
+                or not self.isVisible()
+                or self.isMinimized()
+            ):
+                return
+            self._page_reload_pending = True
+            self._page_ready = False
+            self._last_payload = ""
+            try:
+                # Discarded 页面没有可恢复的 Chromium 文档，必须重新提交
+                # 独立 HTML；QWebChannel 仍挂在同一 QWebEnginePage 上。
+                self._view.setHtml(_control_surface_html(), QUrl("about:blank"))
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                self._page_reload_pending = False
 
         def _page_is_discarded(self) -> bool:
             try:
@@ -569,11 +569,14 @@ if pyside6_available:
             payload = json.dumps(
                 _public_control_state(state), ensure_ascii=False, separators=(",", ":")
             )
+            if payload == self._last_payload:
+                return
             try:
                 self._view.page().runJavaScript(
                     "window.meapetControlSurface && "
                     f"window.meapetControlSurface.setState({payload});"
                 )
+                self._last_payload = payload
             except (AttributeError, RuntimeError, TypeError, ValueError):
                 self._page_ready = False
 
@@ -581,23 +584,86 @@ if pyside6_available:
             if self._shutdown:
                 return
             value = _public_control_state(state if state is not None else self._state_provider())
-            if not self._page_ready:
-                if self._pending_state is None or self._accept_state(value):
+            if not self._page_ready or not self.isVisible() or self.isMinimized():
+                if self._accept_state(value):
                     self._pending_state = value
                 return
+            self._pending_state = None
             self._run_state(value)
+
+        def _suspend_if_hidden(self) -> None:
+            if self._shutdown or not self._page_ready:
+                return
+            if not self.isVisible() or self.isMinimized():
+                self._view.page().setLifecycleState(QWebEnginePage.LifecycleState.Frozen)
+
+        def _resume_page(self) -> None:
+            if self._shutdown or not hasattr(self, "_view"):
+                return
+            if self.isVisible() and not self.isMinimized():
+                if self._page_discarded:
+                    self._reload_discarded_page()
+                    return
+                self._view.page().setLifecycleState(QWebEnginePage.LifecycleState.Active)
+                self.set_state(self._pending_state or self._state_provider())
+
+        def showEvent(self, event: object) -> None:  # noqa: N802
+            super().showEvent(event)
+            self._resume_page()
+
+        def changeEvent(self, event: object) -> None:  # noqa: N802
+            super().changeEvent(event)
+            if event.type() == QEvent.Type.WindowStateChange:
+                if self.isMinimized():
+                    QTimer.singleShot(0, self._suspend_if_hidden)
+                else:
+                    self._resume_page()
+
+        def _restore_after_focus(self, generation: int, attempt: int = 0) -> None:
+            """在已排队的窗口状态事件处理后恢复窗口并补发页面状态。"""
+
+            if self._shutdown or generation != self._focus_restore_generation:
+                return
+            # 关闭事件可能在恢复定时器之前到达；隐藏后的控制台不得被
+            # 延迟恢复回调重新显示，否则关闭后会马上重新出现在任务栏。
+            if not self.isVisible():
+                return
+            self.showNormal()
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+            self.raise_()
+            self.activateWindow()
+            if not self.isMinimized():
+                self._resume_page()
+            # showMinimized() 的 WindowStateChange 可能在本回调之后再次到达。
+            # 保持短暂的重试窗口，直到平台状态稳定后再停止，避免页面只缓存状态。
+            if attempt < 8:
+
+                def retry_restore_after_focus() -> None:
+                    if self._shutdown or generation != self._focus_restore_generation:
+                        return
+                    self._restore_after_focus(generation, attempt + 1)
+
+                QTimer.singleShot(25, retry_restore_after_focus)
 
         def show_and_focus(self) -> None:
             # 恢复被用户最小化的控制台；仅调用 show() 时 Qt 可能保留
             # WindowMinimized 状态，导致救援入口看似已打开但仍不可见。
+            self._focus_restore_generation += 1
+            generation = self._focus_restore_generation
             self.showNormal()
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
             self.raise_()
             self.activateWindow()
+            # showMinimized() 产生的 WindowStateChange 可能已经进入事件队列，
+            # 随后才把窗口重新置为最小化。事件队列清空后再恢复一次，避免
+            # 页面在最小化期间只缓存状态而永远没有机会投递。
+            QTimer.singleShot(0, lambda: self._restore_after_focus(generation))
 
         def hideEvent(self, event: object) -> None:  # noqa: N802
             super().hideEvent(event)
             if not self._shutdown:
                 self.hidden.emit()
+                QTimer.singleShot(0, self._suspend_if_hidden)
 
         def closeEvent(self, event: object) -> None:  # noqa: N802
             if self._shutdown:

@@ -11,6 +11,7 @@ import secrets
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from time import time
 from typing import Any, Literal, cast
 
@@ -31,6 +32,7 @@ from core.events.types import (
     TurnFailed,
     TurnFinished,
 )
+from core.tts.language import canonical_tts_language
 from db.conversation_repository import ConversationRepository, ConversationTurn
 from services.affection.service import AffectionService
 from services.memory.service import MemoryService
@@ -50,6 +52,69 @@ from .presentation import PresentationService
 
 EventSink = Callable[[object], Awaitable[None] | None]
 logger = logging.getLogger(__name__)
+
+# 从本地时间推断经济时段，供语言/提醒提示词注入使用；原始时区信息
+# 由系统时钟提供，配置只影响提示词措辞。
+_MORNING_HOUR = 5
+_EVENING_HOUR = 21
+
+# 输出语言指令与 TTS 标签对应的自然语言名；未知标签只带原始标签，
+# 不猜测具体语言。
+_LANGUAGE_NAMES = {
+    "zh": "中文",
+    "jp": "日语",
+    "en": "英语",
+}
+
+
+def _language_name(language: object) -> str:
+    """把规范语言桶映射为自然语言名。"""
+
+    return _LANGUAGE_NAMES.get(str(language or "").strip(), str(language or "").strip())
+
+
+def _language_locale(language: object) -> str:
+    """映射到提示词中可展示的语言名称。"""
+
+    name = _language_name(language)
+    return name or "中文"
+
+
+def _language_note(language: object, locale: object) -> str:
+    """生成本轮消息的输出语言指令。
+
+    Args:
+        language: 规范语言桶；无法识别为空。
+        locale: 已在外部解析的语言名称；留空时回退到 language 本身。
+
+    Returns:
+        一段可注入系统提示的语气一致指令；无法识别语言时返回空串。
+    """
+
+    raw = str(language or "").strip()
+    if not raw:
+        return ""
+    name = str(locale or "").strip() or _LANGUAGE_NAMES.get(raw, raw)
+    return (
+        f"你应始终用{name}回答，调用工具或写作代码时也保持{name}作为主要表达语言；"
+        "在明确要求切换当前回复语言前不要主动改变语言，不要用其它语言重复解释。"
+    )
+
+
+def _time_language_note(note: str) -> str:
+    """按系统本地时段给语言指令加上时间提示。"""
+
+    text = str(note or "").strip()
+    if not text:
+        return ""
+    hour = int(datetime.now().hour)
+    if hour < _MORNING_HOUR:
+        time_hint = "现在是深夜，回答应简短安抚。"
+    elif hour >= _EVENING_HOUR:
+        time_hint = "现在是晚上，回答可以温和收尾。"
+    else:
+        time_hint = "现在是白天，语气自然即可。"
+    return f"【输出语言与时段】{text} {time_hint}"
 
 
 @dataclass(frozen=True)
@@ -203,6 +268,7 @@ class ConversationService:
         show_reasoning: bool = False,
         tts_language: str = "zh",
         tts_role: str = "",
+        mood_hint_provider: Callable[[], str] | None = None,
     ) -> None:
         if not isinstance(router, ModelRouter):
             raise TypeError("router must be a ModelRouter")
@@ -223,20 +289,222 @@ class ConversationService:
         self.history_limit = max(0, min(int(history_limit), 50))
         self.tts_language = str(tts_language or "zh").strip() or "zh"
         self.tts_role = str(tts_role or "").strip()
+        self._mood_hint_provider = mood_hint_provider
+        # 输出语言提示词输入：语言指令由 _language_note 生成，构造期
+        # 固定初始值，配置热更时由 set_output_language_inputs 刷新。
+        self.language_note = _language_note(self.tts_language, "")
+        self.language_locale = _language_locale(self.tts_language)
         self._tts_language_snapshots: dict[ConversationContext, str] = {}
         self._tts_role_snapshots: dict[ConversationContext, str] = {}
         self._tts_turns: dict[ConversationContext, _TTSTurnState] = {}
         self._sentence_turns: dict[ConversationContext, _SentenceTurnState] = {}
         self._tts_tasks: set[asyncio.Task[object]] = set()
+        self._directive_sink: Callable[[str, str, str, bool], object] | None = None
+        # XML 指令门禁状态：silent/refuse 都按“本回合不再进入 TTS”处理；
+        # key 使用会话代际，回合收尾时清理。
+        self._silent_directives: set[ConversationContext] = set()
+        self._rejected_directives: dict[ConversationContext, bool] = {}
+        # 后置状态字典保持构造尾部：会话结果、暂停回合和审批锁等。
         self._results: dict[tuple[str, str, str, str, int], ConversationResult] = {}
         self._paused_turns: dict[str, _PausedTurn] = {}
-        # 同一审批可能同时收到多个批准回调；只串行消费审批快照，
-        # 防止第二个回调重复启动模型续接请求。
         self._approval_resume_lock = asyncio.Lock()
         self._active_cancels: dict[ConversationKey, asyncio.Event] = {}
         self._active_task_by_key: dict[ConversationKey, asyncio.Task[object]] = {}
         self._active_tasks: set[asyncio.Task[object]] = set()
         self._closed = False
+
+    def set_output_language_inputs(self, language: object) -> None:
+        """热更新输出语言提示词输入。
+
+        只刷新值对象，不覆盖系统人设提示词本体；下一轮消息组装时
+        由 ``_build_messages`` 读取最新快照。当前进行中的回合继续
+        使用它开始时的快照，避免语句切换语言。
+        """
+
+        try:
+            normalized = str(canonical_tts_language(language) or "")
+        except (TypeError, ValueError):  # 防御：异常调用方直接传入非法值
+            normalized = str(language or "").strip()
+        if not normalized:
+            return
+        self.tts_language = normalized
+        self.language_locale = _language_locale(normalized)
+        self.language_note = _language_note(normalized, self.language_locale)
+
+    def set_directive_sink(
+        self,
+        sink: Callable[[str, str, str, bool], object] | None,
+    ) -> None:
+        """绑定 XML 指令落地点。
+
+        签名按 (mood, expression, motion, silent) 传递；仅安全标签可通过，
+        未知标签已由 ``validate_directives`` 在进入前过滤。绑定为空时
+        指令只影响回答正文，不执行任何桌宠行为。
+        """
+
+        self._directive_sink = sink
+
+    def _promote_xml_approve_window(
+        self,
+        context: ConversationContext,
+        eligible: Sequence[str],
+        outcomes: Sequence[ToolOutcome],
+    ) -> None:
+        """把本回合被拦截的工具身份提为有界放行窗口。
+
+        Args:
+            context: 当前会话回合。
+            eligible: 建议放行的身份序列；高风险身份由权限服务过滤。
+            outcomes: 本回合全部工具结果；用于按注册表风险等级双重过滤。
+        """
+
+        if self.tools is None:
+            return
+        typed_context = ToolCallContext(
+            context.profile_id,
+            context.session_id,
+            context.turn_id,
+        )
+        high_risk_found = False
+        for outcome in outcomes:
+            spec = self.tools.registry.get(outcome.identity)
+            if spec is not None and spec.risk == RiskLevel.HIGH:
+                high_risk_found = True
+                break
+        if high_risk_found:
+            # HIGH 拒绝/拦截也在本回合出现时整体降级，不进入放行窗口。
+            return
+        eligible_filtered = tuple(
+            identity
+            for identity in eligible
+            if (spec := self.tools.registry.get(identity)) is None or spec.risk != RiskLevel.HIGH
+        )
+        if not eligible_filtered:
+            return
+        promote = getattr(self.tools, "promote_xml_approve", None)
+        if not callable(promote):
+            return
+        bool(promote(typed_context, identities=eligible_filtered))
+
+    def _directive_rejected(self, context: ConversationContext) -> bool:
+        """检查当前回合的指令是否要求跳过语音/行为流水线。"""
+
+        return bool(
+            context in self._silent_directives or self._rejected_directives.get(context, False)
+        )
+
+    def _strip_pending_xml(self, context: ConversationContext, text: str) -> str:
+        """剥离增量中出现的 XML 指令行；仍在构造的标签也只保留净正文。
+
+        若增量已经带出一个可解析的指令块，则立即应用 silent/refuse
+        门禁，保证指令行不进入语音，后续增量也不再合成。
+        """
+
+        value = str(text or "")
+        if "<meapet" not in value:
+            return value
+        from services.directives import DirectivesError, split_xml_directives
+
+        try:
+            directives, plain = split_xml_directives(value)
+        except DirectivesError:
+            # 标签尚未闭合或跨增量损坏：仍剥离明显标记，等待收尾解析。
+            plain = value.split("<meapet", 1)[0]
+            return plain
+        if directives.any_control:
+            self.apply_answer_directive(
+                context,
+                silent=bool(directives.silent),
+                approve=bool(directives.approve),
+                refuse=bool(directives.refuse),
+            )
+        return plain
+
+    def apply_answer_directive(
+        self,
+        context: ConversationContext,
+        *,
+        silent: bool = False,
+        approve: bool = False,
+        refuse: bool = False,
+    ) -> bool:
+        """把运行中解析出的指令应用到回合中的 TTS/行为门禁。
+
+        该入口供回合收尾解析控制系统调用；silent 只停止后续合成，
+        approve/refuse 只写入队列，实际审批行为仍由权限服务裁决。
+        注意：本方法有意保留布尔透传语义；权限副作用统一由
+        :meth:`_promote_xml_approve_window` 提交，避免在增量剥离阶段
+        （标签尚未完整）就产生放行窗口。因此这里始终返回 approve，
+        不再读取上下文中的窗口状态。
+        """
+
+        if refuse:
+            self._rejected_directives[context] = True
+            return True
+        if silent:
+            # 静默是回合级语义：不仅要挡住后续增量，还要取消已排队/
+            # 合成中的语音；已播出的分片不回溯。
+            self._silent_directives.add(context)
+            self._cancel_tts_turn(context)
+            if self.tts is not None:
+                cancel_speech = getattr(self.tts, "cancel", None)
+                if callable(cancel_speech):
+                    try:
+                        cancel_speech(context)
+                    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                        logger.debug("silent directive speech cancel failed", exc_info=True)
+            return True
+        return approve
+
+    def _apply_answer_directives(
+        self, context: ConversationContext, answer: str
+    ) -> tuple[object, str]:
+        """析取回答尾部 XML 指令并返回安全快照与净正文。"""
+
+        from services.directives import DirectivesError, split_xml_directives, validate_directives
+
+        try:
+            capabilities = getattr(self.tools, "registry", None)
+            expression_caps: object = ()
+            motion_caps: object = ()
+            if capabilities is not None:
+                capabilities = getattr(capabilities, "capabilities", None)
+                if capabilities is not None:
+                    expression_caps = getattr(capabilities, "expressions", ())
+                    motion_caps = getattr(capabilities, "motions", ())
+            directive, plain = split_xml_directives(answer or "")
+            directive = validate_directives(
+                directive,
+                allowed_motions=motion_caps,
+                allowed_expressions=expression_caps,
+            )
+            if not directive.any_control and not directive.text:
+                return None, str(plain or answer or "").strip()
+            return directive, str(plain or "")
+        except DirectivesError:
+            # 坏指令 XML 不作为旁路：正文保留，行为不触发。
+            return None, str(answer or "").strip()
+
+    def _apply_xml_controls(self, directives: object, owner: object) -> bool:
+        """把指令快照落到桌宠行为；安全标签外的字段不会产生副作用。
+
+        ``owner`` 是持有桌宠控制能力的服务；没有可用落地点或调用失败时
+        返回 False，调用方保持净正文输出而不展开指令字段。
+        """
+
+        del owner  # 保留参数位保持注册表同源,便于后续平台实现替换。
+        sink = self._directive_sink
+        if sink is None:
+            return False
+        mood = str(getattr(directives, "mood", "") or "")
+        expression = str(getattr(directives, "expression", "") or "")
+        motion = str(getattr(directives, "motion", "") or "")
+        silent = bool(getattr(directives, "silent", False))
+        try:
+            result = sink(mood, expression, motion, silent)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return bool(result)
 
     def begin_context(
         self,
@@ -804,6 +1072,15 @@ class ConversationService:
     ) -> list[ChatMessage]:
         messages: list[ChatMessage] = []
         system_parts = [self.system_prompt] if self.system_prompt else []
+        # 输出语言指令在每条轮询开始前按当前快照拼接；用户显式要求用
+        # 其它语言回答时保持原平铺语义，不覆盖用户的直接指令。
+        if self.language_note:
+            inject = _time_language_note(self.language_note)
+            system_parts.append(inject)
+        else:
+            inject = _language_note(self.tts_language, self.language_locale)
+            if inject:
+                system_parts.append(_time_language_note(inject))
         if self._memory_enabled():
             try:
                 async_builder = getattr(self.memory, "abuild_context_prompt", None)
@@ -815,6 +1092,16 @@ class ConversationService:
                 memory_prompt = ""
             if memory_prompt:
                 system_parts.append(memory_prompt)
+        # 陈旧心情提示作为语言/记忆提示之后的独立 system 部分注入；
+        # provider 返回空串时不拼接，非空输出按原文追加。
+        hint_provider = self._mood_hint_provider
+        if callable(hint_provider):
+            try:
+                mood_hint = str(hint_provider() or "").strip()
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                mood_hint = ""
+            if mood_hint:
+                system_parts.append(mood_hint)
         if system_parts:
             messages.append(ChatMessage("system", "\n\n".join(system_parts)))
         messages.extend(self._history_messages(context))
@@ -1042,11 +1329,14 @@ class ConversationService:
         """按完成句子顺序更新展示，不重复进入原始事件流。
 
         TTS 在每个原始 ``TextDelta`` 到达时已经排入独立 worker；这里仅
-        提交共享分段器产出的展示事件。若在这里再次提交完整句，会把同一
-        片段送入 TTS 两次，尤其是一个供应商包包含多句时更容易重复播放。
+        提交共享分段器产出的展示事件。XML 指令行同样不进入展示句子。
         """
 
-        values = tuple(str(sentence or "") for sentence in sentences if str(sentence or "").strip())
+        values = tuple(
+            str(sentence or "").strip()
+            for sentence in sentences
+            if str(sentence or "").strip() and "<meapet" not in str(sentence)
+        )
         for index, value in enumerate(values):
             if state.cancelled or not self.generation_gate.accepts(context):
                 raise AdapterCancelled("conversation context was superseded")
@@ -1149,11 +1439,16 @@ class ConversationService:
 
         ``_schedule_tts`` 保留给旧的同步扩展入口；模型流使用这个异步入口，
         因而即使供应商一次返回超长 delta，也不会把整段文本一次性压入内存。
+        静默门禁：XML 指令行在调度前剥离，只有净正文进入语音链路。
         """
 
         if self.tts is None or self._closed or not text:
             return False
-        value = str(text)
+        value = self._strip_pending_xml(context, str(text))
+        if not value:
+            return False
+        if self._directive_rejected(context):
+            return False
         should_yield = False
         while value:
             state = self._tts_turns.get(context)
@@ -1186,6 +1481,8 @@ class ConversationService:
         """
 
         if self.tts is None or self._closed or not text:
+            return False
+        if self._directive_rejected(context):
             return False
         state = self._tts_turns.get(context)
         created = state is None
@@ -1246,6 +1543,9 @@ class ConversationService:
 
         self._tts_language_snapshots.pop(context, None)
         self._tts_role_snapshots.pop(context, None)
+        # silent/refuse 门禁与回合同生命周期，避免旧代际错误波及下一轮。
+        self._silent_directives.discard(context)
+        self._rejected_directives.pop(context, None)
         if self.tts is None:
             return
         release_context = getattr(self.tts, "release_context", None)
@@ -1552,6 +1852,22 @@ class ConversationService:
         )
         if not self.generation_gate.accepts(current):
             raise RuntimeError("conversation context is stale")
+        # 回合唯一负责人：XML approve 只在回合收尾时按当回合的工具拦截
+        # 记录归因。登记新回合上下文后，任何迟到的旧窗口都失去放行资格；
+        # 审批续接走同一条路径，只保留正在放行窗口中持续有效的会话状态。
+        typed_context = ToolCallContext(
+            current.profile_id,
+            current.session_id,
+            current.turn_id,
+        )
+        approve_gate = getattr(self.tools, "permissions", None)
+        if approve_gate is not None:
+            appliance_active = getattr(approve_gate, "appliance_active", None)
+            window_valid = bool(callable(appliance_active) and appliance_active(typed_context))
+            if not window_valid:
+                cancel_window = getattr(approve_gate, "cancel_xml_approve_window", None)
+                if callable(cancel_window):
+                    cancel_window(typed_context)
         # 兼容入口可能已经请求上一批语音 flush；续接同一 context 前
         # 等待旧 worker 退出，避免新文本被 flush_requested 状态吞掉。
         await self._await_flushed_tts_turn(current)
@@ -1959,6 +2275,34 @@ class ConversationService:
                     break
             await self._flush_tts(current)
             tts_flushed = True
+            # XML 指令协议：解析回合正文末尾的 <meapet> 指令并落到
+            # 桌宠行为；解析失败整体拒绝，但正文保留按既定流继续输出。
+            # 指令行只从回答正文剥离，记忆与历史写入的是净正文。
+            directives, clean_answer = self._apply_answer_directives(current, answer)
+            if directives is not None:
+                if directives.any_control:
+                    self._apply_xml_controls(directives, self)
+                # silent/refuse 与当前回合的 TTS 门禁绑定，保证指令
+                # 不只落入渲染层：skip 语音的意图在调度层同样生效。
+                self.apply_answer_directive(
+                    current,
+                    silent=bool(getattr(directives, "silent", False)),
+                    approve=bool(getattr(directives, "approve", False)),
+                    refuse=bool(getattr(directives, "refuse", False)),
+                )
+                if bool(getattr(directives, "approve", False)):
+                    # XML approve 有界放行：仅把本回合被拒绝/拦截的假性
+                    # 操作身份提为“本会话、短窗口、仅 MEDIUM 及以下”的
+                    # 放行集合；HIGH 与 deny 名单在权限服务里永远优先。
+                    # 无工具管线或门控未启用的环境保持现状，无任何副作用。
+                    eligible = tuple(
+                        outcome.identity
+                        for outcome in outcomes
+                        if outcome.status in {"denied", "approval_required"}
+                    )
+                    if eligible and self.tools is not None:
+                        self._promote_xml_approve_window(current, eligible, outcomes)
+                answer = clean_answer
             # 外部停止请求与 TTS worker 的取消可能同时抵达；某些异步适配器
             # 会先消费掉 task.cancel() 再返回。终态写入前再次检查代际和取消
             # 事件，确保这种竞态不会把已取消回合误报为 completed。

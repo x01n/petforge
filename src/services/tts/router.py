@@ -5,7 +5,7 @@ import inspect
 import logging
 import threading
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from time import monotonic
 from typing import Any, cast
@@ -18,14 +18,6 @@ logger = logging.getLogger(__name__)
 
 
 class _CrossLoopLock:
-    """可跨 asyncio 事件循环等待的串行锁。
-
-    TTS 路由器可能被配置观察器、控制台和主循环分别调用；使用
-    ``asyncio.Lock`` 会把锁绑定到首次使用的事件循环，导致跨线程热重载
-    直接失败。这里以线程锁为实际互斥，协程侧采用非阻塞轮询，保证取消
-    不会遗留在线程池中的等待任务。
-    """
-
     def __init__(self) -> None:
         self._lock = threading.Lock()
 
@@ -39,7 +31,6 @@ class _CrossLoopLock:
 
 
 def _as_languages(value: object) -> frozenset[str]:
-    """把 profile 的 ``languages`` 字段规范化为语言桶集合。"""
 
     if value is None:
         return frozenset()
@@ -807,10 +798,21 @@ class TTSProfileRouter:
             completed = False
             pending_empty: list[SpeechChunk] = []
             try:
+                # profile_id 是路由层的后端选择标识。发生回退时不能把首选
+                # profile 的标识继续传给后备后端，否则后端若用该字段选择
+                # voice，会在已切换模型后仍生成首选音色。显式 voice 仍保持
+                # 原值，由调用方决定后端内部的具体音色。
+                profile_request = (
+                    request
+                    if request.profile_id == profile_id
+                    else replace(request, profile_id=profile_id)
+                )
                 stream_method = getattr(profile.backend, "stream", None)
                 if not callable(stream_method):
                     raise RuntimeError("TTS profile backend stream is not asynchronous")
-                stream_value = cast(Callable[[SpeechRequest], object], stream_method)(request)
+                stream_value = cast(Callable[[SpeechRequest], object], stream_method)(
+                    profile_request
+                )
                 if not hasattr(stream_value, "__aiter__"):
                     raise RuntimeError("TTS profile backend stream is not asynchronous")
                 stream = cast(AsyncIterator[SpeechChunk], stream_value)

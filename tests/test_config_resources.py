@@ -92,7 +92,7 @@ def test_real_resource_inventory_uses_capability_facts() -> None:
     assert all(not item.valid for item in inventory.interaction_voices)
 
 
-def test_live2d_runtime_loader_failure_degrades_to_sprite(tmp_path: Path) -> None:
+def test_live2d_runtime_loader_failure_keeps_auto_unavailable(tmp_path: Path) -> None:
     resource_root = tmp_path / "resources"
     model_root = resource_root / "live2d" / "model" / "demo"
     sprite_root = resource_root / "sprites"
@@ -112,7 +112,8 @@ def test_live2d_runtime_loader_failure_degrades_to_sprite(tmp_path: Path) -> Non
     runtime = probe_live2d_runtime(importer=broken_import)
     assert not runtime.available
     selection = select_renderer(resource_root, runtime=runtime)
-    assert selection.backend == "sprite"
+    assert selection.backend == "unavailable"
+    assert "Live2D" in selection.reason
 
 
 def test_live2d_runtime_rejects_module_without_instantiable_model_loader() -> None:
@@ -135,7 +136,7 @@ def test_live2d_runtime_rejects_module_without_instantiable_model_loader() -> No
     assert "LoadModelJson" not in runtime.evidence
 
 
-def test_renderer_selection_only_auto_allows_runtime_fallback(tmp_path: Path) -> None:
+def test_renderer_auto_never_uses_sprite_runtime_fallback(tmp_path: Path) -> None:
     resource_root = tmp_path / "resources"
     sprite_root = resource_root / "sprites"
     sprite_root.mkdir(parents=True)
@@ -159,7 +160,8 @@ def test_renderer_selection_only_auto_allows_runtime_fallback(tmp_path: Path) ->
         runtime=unavailable_native,
         web_runtime=unavailable_web,
     )
-    assert automatic.allows_runtime_fallback is True
+    assert automatic.backend == "unavailable"
+    assert automatic.allows_runtime_fallback is False
     assert explicit_sprite.allows_runtime_fallback is False
 
     model_root = resource_root / "live2d" / "model" / "demo"
@@ -275,16 +277,16 @@ def test_renderer_backend_selection_is_explicit_and_vulkan_aliases_are_available
         runtime=unavailable_native,
         web_runtime=available_web,
     )
-    assert vllank.backend == "vulkan"
+    assert vllank.backend == "unavailable"
     assert vllank.state.compatibility_alias == "vllank"
-    assert "Vulkan" in vllank.reason
+    assert "Vulkan rendering is unavailable" in vllank.reason
     vllakn = select_renderer(
         resource_root,
         requested_backend="vllakn",
         runtime=unavailable_native,
         web_runtime=available_web,
     )
-    assert vllakn.backend == "vulkan"
+    assert vllakn.backend == "unavailable"
     assert vllakn.state.compatibility_alias == "vllakn"
     with pytest.raises(ValueError):
         select_renderer(resource_root, requested_backend="unknown")

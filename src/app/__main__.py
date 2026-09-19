@@ -66,8 +66,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"resource_warning: {warning}", file=sys.stderr)
         else:
             logger.warning("resource_warning: %s", warning)
-    # 自动模式在资源不完整时仍保留旧的启动路径（例如首次安装或由宿主
-    # 稍后补齐精灵资源）；显式选择不可用后端才应在入口处立即给出错误。
+    # 自动模式在资源不完整时允许进入诊断，让首次安装能够先看到精确
+    # 的 Live2D 能力缺口；显式选择不可用后端则立即返回错误。
     if (
         not (args.validate or args.no_gui)
         and renderer_selection.requested_backend != "auto"

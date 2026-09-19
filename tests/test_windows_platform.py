@@ -396,6 +396,54 @@ def test_windows_automation_batch_accepts_hex_window_id_from_tool_schema() -> No
     assert calls == [("activate", 0x5B)]
 
 
+def test_windows_automation_batch_waits_for_delayed_foreground_readback(monkeypatch) -> None:
+    calls: list[tuple[object, ...]] = []
+    foreground_values = iter((0x10, 0x5B))
+
+    class User32:
+        def SetForegroundWindow(self, hwnd):
+            calls.append(("activate", hwnd))
+            return 1
+
+        def GetForegroundWindow(self):
+            return next(foreground_values)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(windows_module, "sleep", sleeps.append)
+
+    result = WindowsDesktopPlatform(is_windows=True, user32=User32()).automation_batch(
+        [{"type": "activate_window", "window_id": "0x5b"}]
+    )
+
+    assert result["status"] == "completed"
+    assert calls == [("activate", 0x5B)]
+    assert sleeps == [0.01]
+
+
+def test_windows_automation_batch_fails_after_foreground_readback_timeout(monkeypatch) -> None:
+    class User32:
+        def SetForegroundWindow(self, _hwnd):
+            return 1
+
+        def GetForegroundWindow(self):
+            return 0x10
+
+    clock_values = iter((0.0, 0.0, 0.3))
+    monkeypatch.setattr(windows_module, "monotonic", lambda: next(clock_values))
+    monkeypatch.setattr(windows_module, "sleep", lambda _duration: None)
+
+    result = WindowsDesktopPlatform(is_windows=True, user32=User32()).automation_batch(
+        [{"type": "activate_window", "window_id": 0x5B}]
+    )
+
+    assert result == {
+        "status": "unavailable",
+        "backend": BACKEND_WINDOWS,
+        "reason": "Win32 foreground readback did not match",
+        "completed_steps": (),
+    }
+
+
 def test_windows_automation_batch_uses_sendinput_and_verifies_window_operations() -> None:
     sent: list[list[tuple[int, int, int, int]]] = []
     calls: list[tuple[object, ...]] = []

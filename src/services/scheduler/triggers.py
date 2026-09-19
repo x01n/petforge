@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import math
 import re
 import time
@@ -12,7 +13,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from logger.events import log_event
+
 from .persistence import SchedulerStateStore
+
+logger = logging.getLogger(__name__)
 
 _CONDITION_TEXT_FIELDS = ("process_name", "app_id", "title")
 _MATCH_MODES = frozenset({"exact", "prefix", "contains", "regex"})
@@ -155,6 +160,15 @@ class TriggerService:
         self._clock = clock
         self._max_triggers = max(1, min(int(max_triggers), 1024))
         self._last_error = ""
+        self._last_event_name = ""
+        self._last_trigger_id = ""
+        self._last_status = "idle"
+        self._last_duration_ms: float | None = None
+        self._event_count = 0
+        self._matched_count = 0
+        self._completed_count = 0
+        self._failed_count = 0
+        self._skipped_count = 0
         self._state_store: SchedulerStateStore | None = None
         self._persistence_error = ""
         if state_store is not None:
@@ -300,6 +314,7 @@ class TriggerService:
         finished_at: float,
         status: str,
         error_text: str = "",
+        payload: Mapping[str, Any] | None = None,
     ) -> None:
         store = self._state_store
         recorder = getattr(store, "record_run", None) if store is not None else None
@@ -314,7 +329,11 @@ class TriggerService:
                 finished_at=finished_at,
                 status=status,
                 error_text=error_text,
-                payload={"event_name": trigger.event_name},
+                payload={
+                    "event_name": trigger.event_name,
+                    "action_identity": trigger.action.get("identity", ""),
+                    "payload_fields": len(payload or {}),
+                },
             )
         except Exception as exc:
             self._persistence_error = f"{type(exc).__name__}: {exc}"
@@ -401,6 +420,8 @@ class TriggerService:
         event_name = raw_event_name.strip().lower()
         current = self._now()
         payload = dict(payload or {})
+        self._event_count += 1
+        self._last_event_name = event_name
         fired: list[str] = []
         for trigger in sorted(self._triggers.values(), key=lambda item: item.trigger_id):
             if trigger.event_name != event_name:
@@ -409,6 +430,18 @@ class TriggerService:
             if not trigger_conditions_match(
                 conditions if isinstance(conditions, Mapping) else {}, payload
             ):
+                self._skipped_count += 1
+                log_event(
+                    logger,
+                    "scheduler.trigger.skipped",
+                    component="scheduler.trigger",
+                    status="skipped",
+                    reason_code="condition",
+                    fields={
+                        "event_name": event_name,
+                        "trigger_id": trigger.trigger_id,
+                    },
+                )
                 continue
             cooldown = (
                 float(conditions.get("cooldown_seconds", 0.0))
@@ -417,35 +450,122 @@ class TriggerService:
             )
             debounce = max(trigger.debounce_seconds, cooldown)
             if trigger.last_fired_at and current - trigger.last_fired_at < debounce:
+                self._skipped_count += 1
+                log_event(
+                    logger,
+                    "scheduler.trigger.skipped",
+                    component="scheduler.trigger",
+                    status="skipped",
+                    reason_code="cooldown",
+                    fields={
+                        "event_name": event_name,
+                        "trigger_id": trigger.trigger_id,
+                        "cooldown_seconds": debounce,
+                    },
+                )
                 continue
             trigger.last_fired_at = current
             self._persist_trigger(trigger)
             started_at = current
+            self._matched_count += 1
+            self._last_trigger_id = trigger.trigger_id
+            self._last_status = "running"
+            correlation_id = f"{event_name}:{trigger.trigger_id}:{started_at}"
+            log_event(
+                logger,
+                "scheduler.trigger.started",
+                component="scheduler.trigger",
+                status="started",
+                correlation_id=correlation_id,
+                operation_id=trigger.trigger_id,
+                fields={
+                    "event_name": event_name,
+                    "trigger_id": trigger.trigger_id,
+                    "owner": trigger.owner,
+                    "action_identity": trigger.action.get("identity", ""),
+                    "payload_fields": len(payload),
+                },
+            )
             run_status = "completed"
             run_error = ""
-            if self._action_runner is not None:
-                try:
+            run_reason = "ok"
+            try:
+                if self._action_runner is not None:
                     result = self._action_runner(dict(trigger.action), trigger, payload)
                     if inspect.isawaitable(result):
                         await result
-                except asyncio.CancelledError:
-                    self._record_run(
-                        trigger,
-                        started_at=started_at,
-                        finished_at=self._now(),
-                        status="cancelled",
-                    )
-                    raise
-                except Exception as exc:
-                    self._last_error = f"{type(exc).__name__}: {exc}"
-                    run_status = "failed"
-                    run_error = self._last_error
+            except asyncio.CancelledError:
+                finished_at = self._now()
+                duration_ms = max(0.0, (finished_at - started_at) * 1000.0)
+                self._last_status = "cancelled"
+                self._last_duration_ms = duration_ms
+                log_event(
+                    logger,
+                    "scheduler.trigger.cancelled",
+                    component="scheduler.trigger",
+                    status="cancelled",
+                    level=20,
+                    correlation_id=correlation_id,
+                    operation_id=trigger.trigger_id,
+                    duration_ms=duration_ms,
+                    reason_code="cancelled",
+                    fields={
+                        "event_name": event_name,
+                        "trigger_id": trigger.trigger_id,
+                    },
+                )
+                self._record_run(
+                    trigger,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    status="cancelled",
+                    payload=payload,
+                )
+                raise
+            except Exception as exc:
+                # 异常正文可能携带敏感上下文，不回传 UI 与诊断通道；
+                # 只保存异常类名，完整堆栈由模块日志经脱敏层输出。
+                logger.exception(
+                    "trigger action failed trigger_id=%s event=%s",
+                    trigger.trigger_id,
+                    event_name,
+                )
+                self._last_error = type(exc).__name__
+                run_status = "failed"
+                run_reason = type(exc).__name__
+                run_error = self._last_error
+            finished_at = self._now()
+            duration_ms = max(0.0, (finished_at - started_at) * 1000.0)
+            self._last_duration_ms = duration_ms
+            self._last_status = run_status
+            if run_status == "completed":
+                self._completed_count += 1
+            else:
+                self._failed_count += 1
+            log_event(
+                logger,
+                f"scheduler.trigger.{run_status}",
+                component="scheduler.trigger",
+                status=run_status,
+                level=30 if run_status == "failed" else 20,
+                correlation_id=correlation_id,
+                operation_id=trigger.trigger_id,
+                duration_ms=duration_ms,
+                reason_code=run_reason,
+                fields={
+                    "event_name": event_name,
+                    "trigger_id": trigger.trigger_id,
+                    "owner": trigger.owner,
+                    "action_identity": trigger.action.get("identity", ""),
+                },
+            )
             self._record_run(
                 trigger,
                 started_at=started_at,
-                finished_at=self._now(),
+                finished_at=finished_at,
                 status=run_status,
                 error_text=run_error,
+                payload=payload,
             )
             fired.append(trigger.trigger_id)
         return tuple(fired)
@@ -463,11 +583,20 @@ class TriggerService:
         return await self.emit("idle", payload)
 
     def status(self) -> dict[str, object]:
-        """返回触发器数量和最近一次动作错误。"""
+        """返回触发器数量、最近运行状态及结构化计数。"""
 
         return {
             "trigger_count": len(self._triggers),
             "last_error": self._last_error,
+            "last_event_name": self._last_event_name,
+            "last_trigger_id": self._last_trigger_id,
+            "last_status": self._last_status,
+            "last_duration_ms": self._last_duration_ms,
+            "event_count": self._event_count,
+            "matched_count": self._matched_count,
+            "completed_count": self._completed_count,
+            "failed_count": self._failed_count,
+            "skipped_count": self._skipped_count,
             "persistence": "attached" if self._state_store is not None else "detached",
             "persistence_error": self._persistence_error,
         }

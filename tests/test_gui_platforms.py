@@ -29,6 +29,158 @@ from gui.qt6.web_host import WebPetHost
 from gui.renderers.live2d import Live2DRenderer
 from gui.renderers.web_live2d import WebLive2DRenderer, probe_web_live2d
 
+# xvfb 子进程用例的固定超时，允许门禁或慢机器通过环境变量放宽。
+_XVFB_TEST_TIMEOUT_SECONDS = float(os.getenv("MEAPET_XVFB_TEST_TIMEOUT", "20"))
+
+
+def test_x11_automation_batch_supports_keys_text_pointer_click_and_window_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, object, object, dict[str, object]]] = []
+
+    class FakeWindow:
+        def set_input_focus(self, revert, timestamp):
+            events.append(("focus", revert, timestamp, {}))
+
+        def configure(self, **kwargs):
+            events.append(("configure", None, None, dict(kwargs)))
+
+    class FakeDisplay:
+        def __init__(self, name):
+            assert name == ":99"
+            self.closed = False
+            self.window = FakeWindow()
+
+        def has_extension(self, name):
+            return name == "XTEST"
+
+        def keysym_to_keycode(self, keysym):
+            return int(keysym) if isinstance(keysym, int) else len(str(keysym)) + 20
+
+        def sync(self):
+            events.append(("sync", None, None, {}))
+
+        def create_resource_object(self, kind, identifier):
+            assert kind == "window"
+            assert identifier == 0x44
+            return self.window
+
+        def close(self):
+            self.closed = True
+
+    class FakeX:
+        KeyPress = 2
+        KeyRelease = 3
+        MotionNotify = 6
+        ButtonPress = 4
+        ButtonRelease = 5
+        RevertToParent = 0
+        CurrentTime = 0
+
+    class FakeXTest:
+        @staticmethod
+        def fake_input(display, event_type, detail=0, **kwargs):
+            events.append(("input", event_type, detail, dict(kwargs)))
+
+    class FakeXK:
+        @staticmethod
+        def string_to_keysym(value):
+            return ord(value) if len(value) == 1 else len(value) + 100
+
+    modules = {
+        "Xlib.display": SimpleNamespace(Display=FakeDisplay),
+        "Xlib.X": FakeX,
+        "Xlib.ext.xtest": FakeXTest,
+        "Xlib.XK": FakeXK,
+    }
+    monkeypatch.setattr(linux_platform, "_import_optional", modules.__getitem__)
+    platform = linux_platform.LinuxDesktopPlatform(
+        environ={"QT_QPA_PLATFORM": "xcb", "DISPLAY": ":99"}
+    )
+
+    result = platform.automation_batch(
+        [
+            {"type": "key", "key": "a", "modifiers": ["ctrl"]},
+            {"type": "text", "text": "Ab!"},
+            {"type": "move_pointer", "x": 20, "y": 30},
+            {"type": "click", "x": 20, "y": 30, "button": "left"},
+            {"type": "wait", "duration_ms": 1},
+            {"type": "activate_window", "window_id": "0x44"},
+            {"type": "move_window", "window_id": "0x44", "x": 40, "y": 50},
+        ]
+    )
+
+    assert result["status"] == "completed"
+    assert [item["type"] for item in result["steps"]] == [
+        "key",
+        "text",
+        "move_pointer",
+        "click",
+        "wait",
+        "activate_window",
+        "move_window",
+    ]
+    assert ("configure", None, None, {"x": 40, "y": 50}) in events
+    assert any(item[0] == "focus" for item in events)
+    assert any(item[0] == "input" and item[1] == FakeX.ButtonPress for item in events)
+
+
+def test_x11_automation_batch_rejects_unicode_text_without_input_method(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Display:
+        def __init__(self, _name):
+            return None
+
+        def has_extension(self, _name):
+            return True
+
+        def keysym_to_keycode(self, _keysym):
+            return 24
+
+        def sync(self):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeX:
+        KeyPress = 2
+        KeyRelease = 3
+
+    class FakeXTest:
+        @staticmethod
+        def fake_input(*_args, **_kwargs):
+            return None
+
+    class FakeXK:
+        @staticmethod
+        def string_to_keysym(value):
+            return ord(value) if len(value) == 1 else 100
+
+    modules = {
+        "Xlib.display": SimpleNamespace(Display=Display),
+        "Xlib.X": FakeX,
+        "Xlib.ext.xtest": FakeXTest,
+        "Xlib.XK": FakeXK,
+    }
+    monkeypatch.setattr(linux_platform, "_import_optional", modules.__getitem__)
+    platform = linux_platform.LinuxDesktopPlatform({"DISPLAY": ":99"})
+
+    result = platform.automation_batch([{"type": "text", "text": "中"}])
+
+    assert result["status"] == "unavailable"
+    assert "printable ASCII" in result["reason"]
+
+
+def test_x11_automation_batch_fails_closed_on_wayland() -> None:
+    platform = linux_platform.LinuxDesktopPlatform(
+        environ={"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"}
+    )
+    result = platform.automation_batch([{"type": "wait", "duration_ms": 1}])
+    assert result["status"] == "unavailable"
+    assert "X11" in result["reason"]
+
 
 def test_x11_idle_probe_uses_mit_screensaver_and_closes_display(monkeypatch) -> None:
     """X11 空闲探针只读取 MIT-SCREEN-SAVER 的累计毫秒数。"""
@@ -144,7 +296,7 @@ def test_console_adjacent_placement_avoids_pet_and_respects_screen(tmp_path: Pat
     try:
         import PySide6  # noqa: F401
     except (ImportError, ModuleNotFoundError, OSError):
-        return
+        pytest.skip("requires PySide6")
 
     project_root = Path(__file__).resolve().parents[1]
     source_root = project_root / "src"
@@ -214,17 +366,80 @@ print("qt-adjacent-placement-ok")
     assert "qt-adjacent-placement-ok" in result.stdout
 
 
+@pytest.mark.xvfb
+def test_x11_automation_reaches_qt_line_edit(tmp_path: Path) -> None:
+    """XTEST 键盘事件必须真正到达 Qt 输入控件，而不只返回 completed。"""
+
+    if shutil.which("xvfb-run") is None:
+        pytest.skip("requires xvfb-run")
+    try:
+        import PySide6  # noqa: F401
+    except (ImportError, ModuleNotFoundError, OSError):
+        pytest.skip("requires PySide6")
+
+    project_root = Path(__file__).resolve().parents[1]
+    source_root = project_root / "src"
+    script = r"""
+import json
+import os
+from PySide6.QtWidgets import QApplication, QLineEdit
+from gui.platforms.linux import LinuxDesktopPlatform
+
+app = QApplication.instance() or QApplication([])
+line = QLineEdit()
+line.resize(400, 60)
+line.show()
+line.activateWindow()
+line.setFocus()
+app.processEvents()
+platform = LinuxDesktopPlatform(environ=dict(os.environ))
+result = platform.automation_batch([{"type": "text", "text": "Ab!"}])
+app.processEvents()
+assert result["status"] == "completed", result
+assert line.text() == "Ab!", json.dumps(result, ensure_ascii=False)
+line.close()
+print("x11-automation-qt-line-edit-ok")
+"""
+    environment = os.environ.copy()
+    environment["QT_QPA_PLATFORM"] = "xcb"
+    environment["XDG_SESSION_TYPE"] = "x11"
+    old_python_path = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        f"{source_root}{os.pathsep}{old_python_path}" if old_python_path else str(source_root)
+    )
+    result = subprocess.run(
+        [
+            "xvfb-run",
+            "-a",
+            "-s",
+            "-screen 0 1024x768x24",
+            sys.executable,
+            "-c",
+            script,
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=_XVFB_TEST_TIMEOUT_SECONDS,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "x11-automation-qt-line-edit-ok" in result.stdout
+
+
+@pytest.mark.xvfb
 def test_tiny_screen_uses_full_click_surface_instead_of_narrow_sidebar(
     tmp_path: Path,
 ) -> None:
     """极小屏侧栏不足时应暂时隐藏桌宠，并保留可点击的全宽控制台。"""
 
     if shutil.which("xvfb-run") is None:
-        return
+        pytest.skip("requires xvfb-run")
     try:
         import PySide6  # noqa: F401
     except (ImportError, ModuleNotFoundError, OSError):
-        return
+        pytest.skip("requires PySide6")
 
     project_root = Path(__file__).resolve().parents[1]
     source_root = project_root / "src"
@@ -369,7 +584,7 @@ print("tiny-screen-click-surface-ok")
         env=environment,
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=_XVFB_TEST_TIMEOUT_SECONDS,
         check=False,
     )
     assert result.returncode == 0, result.stderr
@@ -833,6 +1048,47 @@ def test_x11_coordinate_click_uses_xtest_and_closes_display(monkeypatch) -> None
     assert calls == [(6, 0, 120, 240), (4, 3, None, None), (5, 3, None, None)]
 
 
+def test_x11_coordinate_click_accepts_negative_virtual_desktop_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, object, object, object]] = []
+
+    class Display:
+        def __init__(self, name):
+            assert name == ":99"
+
+        def has_extension(self, name):
+            return name == "XTEST"
+
+        def xtest_fake_input(self, event_type, detail=0, *, x=None, y=None):
+            calls.append((event_type, detail, x, y))
+
+        def sync(self):
+            return None
+
+        def close(self):
+            return None
+
+    modules = {
+        "Xlib.display": SimpleNamespace(Display=Display),
+        "Xlib.X": SimpleNamespace(MotionNotify=6, ButtonPress=4, ButtonRelease=5),
+        "Xlib.ext.xtest": SimpleNamespace(),
+    }
+    monkeypatch.setattr(linux_platform, "_import_optional", modules.__getitem__)
+    platform = linux_platform.LinuxDesktopPlatform({"DISPLAY": ":99"})
+
+    result = platform.click_at(-120, 240, button="left")
+
+    assert result == {
+        "status": "completed",
+        "backend": "x11",
+        "x": -120,
+        "y": 240,
+        "button": "left",
+    }
+    assert calls[0] == (6, 0, -120, 240)
+
+
 def test_coordinate_click_fails_closed_outside_x11(monkeypatch) -> None:
     monkeypatch.setattr(
         linux_platform,
@@ -1172,7 +1428,7 @@ def test_qwidget_click_through_preserves_visible_window(tmp_path: Path) -> None:
     try:
         import PySide6  # noqa: F401
     except (ImportError, ModuleNotFoundError, OSError):
-        return
+        pytest.skip("requires PySide6")
 
     source_root = Path(__file__).resolve().parents[1] / "src"
     script = """
@@ -1245,7 +1501,7 @@ def test_qt_opengl_window_constructor_requests_alpha_without_set_color(tmp_path:
     try:
         import PySide6  # noqa: F401
     except (ImportError, ModuleNotFoundError, OSError):
-        return
+        pytest.skip("requires PySide6")
 
     source_root = Path(__file__).resolve().parents[1] / "src"
     sprite_dir = Path(__file__).resolve().parents[1] / "resources" / "sprites"
@@ -1299,7 +1555,7 @@ def test_qt_opengl_bubble_preserves_head_and_tail_within_fixed_region(tmp_path: 
     try:
         import PySide6  # noqa: F401
     except (ImportError, ModuleNotFoundError, OSError):
-        return
+        pytest.skip("requires PySide6")
 
     source_root = Path(__file__).resolve().parents[1] / "src"
     script = """
@@ -1388,7 +1644,7 @@ def test_wayland_window_controls_expose_degraded_state_for_both_hosts(tmp_path: 
     try:
         import PySide6  # noqa: F401
     except (ImportError, ModuleNotFoundError, OSError):
-        return
+        pytest.skip("requires PySide6")
 
     project_root = Path(__file__).resolve().parents[1]
     source_root = project_root / "src"
@@ -1954,15 +2210,17 @@ def test_web_live2d_probe_prefers_declared_expression_and_motion_files(tmp_path:
     assert "motionState.procedural = false" in html
 
 
+@pytest.mark.xvfb
+@pytest.mark.webengine
 def test_web_live2d_long_bubble_is_scrollable_and_bounded(tmp_path: Path) -> None:
     """真实 WebEngine DOM 不得让长气泡覆盖整个模型视口。"""
 
     if shutil.which("xvfb-run") is None:
-        return
+        pytest.skip("requires xvfb-run")
     try:
         import PySide6  # noqa: F401
     except (ImportError, ModuleNotFoundError, OSError):
-        return
+        pytest.skip("requires PySide6")
 
     project_root = Path(__file__).resolve().parents[1]
     source_root = project_root / "src"
@@ -2052,15 +2310,17 @@ app.exec()
     assert payload["debug"]["boundsHeight"] > 0
 
 
+@pytest.mark.xvfb
+@pytest.mark.webengine
 def test_web_live2d_expression_and_motion_parameters_do_not_leak(tmp_path: Path) -> None:
     """真实帧只报告已探测的 Cubism 绑定，其余动作走页面变换。"""
 
     if shutil.which("xvfb-run") is None:
-        return
+        pytest.skip("requires xvfb-run")
     try:
         import PySide6  # noqa: F401
     except (ImportError, ModuleNotFoundError, OSError):
-        return
+        pytest.skip("requires PySide6")
 
     project_root = Path(__file__).resolve().parents[1]
     source_root = project_root / "src"
@@ -2313,15 +2573,17 @@ app.exec()
     assert payload["motionRequestRestored"] == pytest.approx(timeline_baseline, abs=0.15)
 
 
+@pytest.mark.xvfb
+@pytest.mark.webengine
 def test_web_live2d_real_frame_keeps_alpha_and_uniform_scale(tmp_path: Path) -> None:
     """真实 WebEngine 合成帧不能退化成黑底或非等比缩放。"""
 
     if shutil.which("xvfb-run") is None:
-        return
+        pytest.skip("requires xvfb-run")
     try:
         import PySide6  # noqa: F401
     except (ImportError, ModuleNotFoundError, OSError):
-        return
+        pytest.skip("requires PySide6")
 
     project_root = Path(__file__).resolve().parents[1]
     source_root = project_root / "src"
@@ -2435,15 +2697,17 @@ app.exec()
     assert payload["debug"]["boundsY"] + payload["debug"]["boundsHeight"] <= 480
 
 
+@pytest.mark.xvfb
+@pytest.mark.webengine
 def test_web_live2d_resize_during_motion_keeps_scale_baseline(tmp_path: Path) -> None:
     """动作进行中调整窗口不能因瞬态 keyform 让模型缩放抽搐。"""
 
     if shutil.which("xvfb-run") is None:
-        return
+        pytest.skip("requires xvfb-run")
     try:
         import PySide6  # noqa: F401
     except (ImportError, ModuleNotFoundError, OSError):
-        return
+        pytest.skip("requires PySide6")
 
     project_root = Path(__file__).resolve().parents[1]
     source_root = project_root / "src"
@@ -2551,15 +2815,17 @@ app.exec()
     assert max(scales) - min(scales) < 0.002
 
 
+@pytest.mark.xvfb
+@pytest.mark.webengine
 def test_web_live2d_hit_test_rejects_transparent_texture_meshes(tmp_path: Path) -> None:
     """点击命中必须遵循纹理 alpha，而不是把整块 ArtMesh 当成实体。"""
 
     if shutil.which("xvfb-run") is None:
-        return
+        pytest.skip("requires xvfb-run")
     try:
         import PySide6  # noqa: F401
     except (ImportError, ModuleNotFoundError, OSError):
-        return
+        pytest.skip("requires PySide6")
 
     project_root = Path(__file__).resolve().parents[1]
     source_root = project_root / "src"

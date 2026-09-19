@@ -11,6 +11,9 @@ from pathlib import Path
 import pytest
 
 
+@pytest.mark.e2e
+@pytest.mark.xvfb
+@pytest.mark.webengine
 @pytest.mark.skipif(
     shutil.which("xvfb-run") is None or shutil.which("xdotool") is None,
     reason="X11 physical input smoke requires xvfb-run and xdotool",

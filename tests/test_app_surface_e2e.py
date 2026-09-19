@@ -9,6 +9,10 @@ from pathlib import Path
 
 import pytest
 
+# 该文件唯一用例经 xvfb-run 启动真实 WebEngine 表面并做截图验收：
+# 分属 xvfb 与 webengine 重层，且按像素验收归入 e2e 层。
+pytestmark = [pytest.mark.xvfb, pytest.mark.webengine, pytest.mark.e2e]
+
 
 @pytest.mark.skipif(shutil.which("xvfb-run") is None, reason="requires Xvfb")
 def test_real_app_web_surface_has_no_opaque_black_rectangle() -> None:

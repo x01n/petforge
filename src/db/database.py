@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -13,6 +14,8 @@ from pathlib import Path
 from core.memory_embedding import compute_embedding, valid_embedding_item
 
 SCHEMA_VERSION = 7
+
+logger = logging.getLogger(__name__)
 
 
 class SchemaMigrator:
@@ -434,7 +437,11 @@ class SchemaMigrator:
                 connection.execute(statement)
             for statement in self._ANN_TRIGGER_STATEMENTS:
                 connection.execute(statement)
-            self._repair_memory_embeddings(connection, current_version)
+            if current_version != SCHEMA_VERSION:
+                # 全表逐行 json.loads 校验只在 schema 版本实际升级时执行一次
+                # （memory_schema_version 尾部会被本迁移写为 SCHEMA_VERSION），
+                # 避免每次启动对 memories 做无条件 O(n) 校验扫描。
+                self._repair_memory_embeddings(connection, current_version)
             self._ensure_memory_fts(connection)
             connection.execute(
                 """
@@ -465,8 +472,9 @@ class Database:
         if raw_path != ":memory:":
             try:
                 self.connection.execute("PRAGMA journal_mode = WAL")
-            except sqlite3.DatabaseError:
-                pass
+            except sqlite3.DatabaseError as exc:
+                # 降级语义保留：WAL 失败不阻断数据库打开与后续读写。
+                logger.warning("未能启用 SQLite WAL 日志模式，保持默认日志模式: %s", exc)
         with self._lock:
             SchemaMigrator().migrate(self.connection)
             self._ensure_defaults()

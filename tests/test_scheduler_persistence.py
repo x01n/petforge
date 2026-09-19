@@ -62,7 +62,8 @@ def test_scheduler_task_state_restores_and_records_failure() -> None:
     assert task["next_run_at"] == 103.0
     runs = repository.list_runs(kind="task", item_id="task-a")
     assert runs[0]["status"] == "failed"
-    assert "action failed" in runs[0]["error_text"]
+    # 第 9 轮起动作失败回执只写异常类名，正文不进持久化记录。
+    assert runs[0]["error_text"] == "RuntimeError"
 
 
 def test_scheduler_owner_isolation_and_json_action_validation() -> None:
@@ -71,7 +72,7 @@ def test_scheduler_owner_isolation_and_json_action_validation() -> None:
         task_id="owned",
         name="任务",
         expression="every:1s",
-        action={"identity": "pet:ping"},
+        action={"identity": "pet:play_motion", "arguments": {"name": "wave"}},
         owner="owner-a",
     )
     with pytest.raises(PermissionError):
@@ -79,7 +80,7 @@ def test_scheduler_owner_isolation_and_json_action_validation() -> None:
             task_id="owned",
             name="覆盖",
             expression="every:1s",
-            action={"identity": "pet:ping"},
+            action={"identity": "pet:play_motion", "arguments": {"name": "wave"}},
             owner="owner-b",
         )
     with pytest.raises(ValueError, match="JSON"):
@@ -87,19 +88,20 @@ def test_scheduler_owner_isolation_and_json_action_validation() -> None:
             task_id="bad",
             name="坏任务",
             expression="every:1s",
-            action={"value": object()},
+            action={"identity": "pet:play_motion", "value": object()},
             owner="owner-a",
         )
 
 
 def test_scheduler_rejects_unbounded_identifiers_and_non_finite_clock() -> None:
+    action = {"identity": "pet:play_motion", "arguments": {"name": "wave"}}
     scheduler = SchedulerService()
     with pytest.raises(ValueError, match="invalid"):
         scheduler.upsert(
             task_id="bad-owner",
             name="任务",
             expression="every:1s",
-            action={"identity": "pet:ping"},
+            action=action,
             owner="line\nbreak",
         )
     with pytest.raises(ValueError, match="invalid"):
@@ -107,7 +109,7 @@ def test_scheduler_rejects_unbounded_identifiers_and_non_finite_clock() -> None:
             task_id="bad-expression",
             name="任务",
             expression="every:1s\n",
-            action={"identity": "pet:ping"},
+            action=action,
             owner="owner",
         )
     broken_clock = SchedulerService(clock=lambda: float("nan"))
@@ -116,7 +118,7 @@ def test_scheduler_rejects_unbounded_identifiers_and_non_finite_clock() -> None:
             task_id="bad-clock",
             name="任务",
             expression="every:1s",
-            action={"identity": "pet:ping"},
+            action=action,
             owner="owner",
         )
     with pytest.raises(ValueError, match="finite"):
@@ -186,6 +188,46 @@ def test_trigger_state_restores_debounce_and_records_success() -> None:
     assert calls == ["window"]
     runs = repository.list_runs(kind="trigger", item_id="window")
     assert runs[0]["status"] == "completed"
+
+
+def test_trigger_emits_structured_lifecycle_logs_and_status_counts(caplog) -> None:
+    now = [100.0]
+
+    async def run(_action, _trigger, _payload):
+        return {"status": "completed"}
+
+    triggers = TriggerService(clock=lambda: now[0], action_runner=run)
+    triggers.register(
+        trigger_id="logged-trigger",
+        event_name="idle",
+        action={"identity": "pet:speak"},
+        owner="owner",
+        debounce_seconds=5,
+    )
+    caplog.set_level("INFO", logger="services.scheduler.triggers")
+
+    assert asyncio.run(triggers.emit_idle({"user_active": True})) == ("logged-trigger",)
+    now[0] = 101.0
+    assert asyncio.run(triggers.emit_idle({"user_active": True})) == ()
+
+    payloads = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "services.scheduler.triggers"
+    ]
+    assert [item["event"] for item in payloads] == [
+        "scheduler.trigger.started",
+        "scheduler.trigger.completed",
+        "scheduler.trigger.skipped",
+    ]
+    assert payloads[1]["duration_ms"] == 0.0
+    assert payloads[1]["reason_code"] == "ok"
+    assert payloads[2]["reason_code"] == "cooldown"
+    status = triggers.status()
+    assert status["event_count"] == 2
+    assert status["matched_count"] == 1
+    assert status["completed_count"] == 1
+    assert status["skipped_count"] == 1
 
 
 def test_trigger_rejects_non_finite_clock() -> None:
@@ -270,7 +312,7 @@ def test_persistence_failure_does_not_block_memory_scheduler() -> None:
         task_id="memory-only",
         name="内存任务",
         expression="every:1s",
-        action={"identity": "pet:ping"},
+        action={"identity": "pet:play_motion", "arguments": {"name": "wave"}},
         owner="owner",
     )
     assert scheduler.list_tasks()[0]["task_id"] == "memory-only"
@@ -287,7 +329,7 @@ def test_scheduler_restore_rejects_non_boolean_enabled_snapshot() -> None:
                     "task_id": "malformed-enabled",
                     "name": "坏快照",
                     "expression": "every:1s",
-                    "action": {"identity": "pet:ping"},
+                    "action": {"identity": "pet:play_motion", "arguments": {"name": "wave"}},
                     "owner": "owner",
                     "next_run_at": 10.0,
                     "enabled": "false",

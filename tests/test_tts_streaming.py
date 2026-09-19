@@ -1648,6 +1648,15 @@ def test_tts_logs_request_metadata_without_text_or_options(caplog) -> None:
     assert backend.request_id not in rendered
     assert secret_text not in rendered
     assert secret_key not in rendered
+    completed = next(
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if '"event": "tts.synthesis.complete"' in record.getMessage()
+    )
+    assert completed["audio_chunk_count"] == 1
+    assert completed["audio_bytes"] == 2
+    assert completed["time_to_first_audio_ms"] >= 0
+    assert completed["duration_ms"] >= 0
 
 
 def test_tts_worker_ipc_cancellation_uses_info_terminal_event(caplog) -> None:

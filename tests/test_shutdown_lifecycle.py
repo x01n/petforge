@@ -9,11 +9,17 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 from app.loop import RuntimeLoop
 from app.runtime import build_runtime
 from config.loader import LoadedConfiguration
 from config.resources import inspect_resources
 from gui.qt6 import app as qt_app
+
+# 前两个信号处理器用例以 FakeApplication 纯逻辑验证，后两个 RuntimeLoop
+# 用例不依赖 Qt/Xvfb；仅 test_qt_signal_shutdown_wakes_event_loop 真实
+# 启动 xvfb-run + QApplication 子进程，故 xvfb 只打在该用例上。
 
 
 def test_shutdown_signal_handlers_request_qt_quit_and_restore(monkeypatch) -> None:
@@ -75,6 +81,7 @@ def test_shutdown_signal_handlers_skip_non_main_thread(monkeypatch) -> None:
     result[0]()
 
 
+@pytest.mark.xvfb
 def test_qt_signal_shutdown_wakes_event_loop(tmp_path: Path) -> None:
     """真实 Qt 事件循环收到 SIGTERM 后应在短时间内退出。"""
 

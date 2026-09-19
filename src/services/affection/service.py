@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,7 +16,13 @@ AFFECTION_MIN = 0
 AFFECTION_MAX = 100
 AFFECTION_GAIN_PER_CHAT = 1
 AFFECTION_DAILY_CAP = 15
-MOODS = ("平静", "开心", "忧郁", "烦躁", "困倦", "期待")
+MOODS = ("高兴", "平静", "困倦", "烦躁", "难过", "期待", "好奇", "生气", "孤独")
+MOOD_ALIASES = {"开心": "高兴", "忧郁": "难过"}
+_STALE_MOOD_HINT = (
+    "距上次心情标记已超过 {hours} 小时；请根据你的人设与当前上下文决定是否更新"
+    "心情：若认为情绪应随时间恢复，请在回答末尾的 <meapet> 指令里给出更合适或"
+    "保持的 <mood>；不强制恢复平静。"
+)
 
 
 @dataclass(frozen=True)
@@ -58,11 +66,70 @@ class AffectionChange:
 class AffectionService:
     """在事务内执行边界裁剪与每日正向增量限制。"""
 
-    def __init__(self, database: Database, today: Callable[[], date] | None = None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        today: Callable[[], date] | None = None,
+        *,
+        decay_enabled: bool = True,
+        decay_after_seconds: float = 14_400.0,
+        decay_prompt_probability: float = 0.5,
+    ) -> None:
         if not isinstance(database, Database):
             raise TypeError("database must be a Database")
+        if not isinstance(decay_enabled, bool):
+            raise ValueError("decay_enabled must be a boolean")
+        if (
+            isinstance(decay_after_seconds, bool)
+            or not math.isfinite(float(decay_after_seconds))
+            or float(decay_after_seconds) < 600.0
+        ):
+            raise ValueError("decay_after_seconds must be a finite number >= 600")
+        if (
+            isinstance(decay_prompt_probability, bool)
+            or not math.isfinite(float(decay_prompt_probability))
+            or not 0.0 <= float(decay_prompt_probability) <= 1.0
+        ):
+            raise ValueError("decay_prompt_probability must be within [0, 1]")
         self._database = database
         self._today = today or date.today
+        self._decay_enabled = bool(decay_enabled)
+        self._decay_after_seconds = float(decay_after_seconds)
+        self._decay_prompt_probability = float(decay_prompt_probability)
+
+    def _mood_configuration(self) -> tuple[bool, float, float]:
+        """返回 (decay_enabled, decay_after_seconds, decay_prompt_probability)。"""
+
+        return (
+            self._decay_enabled,
+            self._decay_after_seconds,
+            self._decay_prompt_probability,
+        )
+
+    def configure_mood(
+        self,
+        *,
+        decay_enabled: bool,
+        decay_after_seconds: float,
+        decay_prompt_probability: float,
+    ) -> None:
+        if not isinstance(decay_enabled, bool):
+            raise ValueError("decay_enabled must be a boolean")
+        if (
+            isinstance(decay_after_seconds, bool)
+            or not math.isfinite(float(decay_after_seconds))
+            or float(decay_after_seconds) < 600.0
+        ):
+            raise ValueError("decay_after_seconds must be a finite number >= 600")
+        if (
+            isinstance(decay_prompt_probability, bool)
+            or not math.isfinite(float(decay_prompt_probability))
+            or not 0.0 <= float(decay_prompt_probability) <= 1.0
+        ):
+            raise ValueError("decay_prompt_probability must be within [0, 1]")
+        self._decay_enabled = bool(decay_enabled)
+        self._decay_after_seconds = float(decay_after_seconds)
+        self._decay_prompt_probability = float(decay_prompt_probability)
 
     @staticmethod
     def tier_for(value: int) -> AffectionTier:
@@ -184,22 +251,66 @@ class AffectionService:
         if row is None:
             return "平静"
         value = str(row["value"] or "平静")
-        return value if value in MOODS else "平静"
+        normalized = MOOD_ALIASES.get(value, value)
+        return normalized if normalized in MOODS else "平静"
 
     def set_mood(self, mood: str) -> str:
         value = str(mood or "").strip()
-        if value not in MOODS:
+        normalized = MOOD_ALIASES.get(value, value)
+        if normalized not in MOODS:
             raise ValueError("mood is unsupported")
         with self._database.transaction() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO mea_state (key, value) VALUES (?, ?)",
-                ("mood", value),
+                ("mood", normalized),
             )
             connection.execute(
                 "INSERT OR REPLACE INTO mea_state (key, value) VALUES (?, ?)",
                 ("mood_updated", str(time.time())),
             )
-        return value
+        return normalized
+
+    def stale_mood_hint(
+        self, now: float | None = None, rng: Callable[[], float] | None = None
+    ) -> str:
+
+        if not self._decay_enabled:
+            return ""
+        current = self.get_mood()
+        if current in ("", "平静"):
+            return ""
+        row = self._read_mood_updated()
+        if row is None:
+            return ""
+        try:
+            updated = float(str(row))
+        except (TypeError, ValueError):
+            return ""
+        if not math.isfinite(updated) or updated <= 0:
+            return ""
+        instant = float(now if now is not None else time.time())
+        if not math.isfinite(instant) or instant < updated:
+            return ""
+        if instant - updated < self._decay_after_seconds:
+            return ""
+        sampler = rng if rng is not None else random.random
+        try:
+            roll = float(sampler())
+        except (TypeError, ValueError, OverflowError):
+            return ""
+        if not math.isfinite(roll) or not 0.0 <= roll <= 1.0:
+            return ""
+        if roll >= self._decay_prompt_probability:
+            return ""
+        hours = max(1, int((instant - updated) / 3600.0))
+        return _STALE_MOOD_HINT.format(hours=hours)
+
+    def _read_mood_updated(self) -> object:
+        with self._database._lock:
+            row = self._database.connection.execute(
+                "SELECT value FROM mea_state WHERE key = ?", ("mood_updated",)
+            ).fetchone()
+        return None if row is None else row["value"]
 
     def get_total_chats(self) -> int:
         return self._state_int("total_chats", 0)

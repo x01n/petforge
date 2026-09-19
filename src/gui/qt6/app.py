@@ -35,6 +35,7 @@ from config.editor import (
 from config.loader import (
     ConfigurationError,
     LoadedConfiguration,
+    _module_project_root,
     configuration_source_digest,
     default_configuration_values,
     expand_environment_values,
@@ -71,12 +72,35 @@ from gui.renderers.protocol import normalize_renderer_backend
 from gui.renderers.sprite import SpriteRenderer
 from gui.renderers.web_live2d import WebLive2DRenderer
 from gui.web.server import LocalWebServer
-from logger import recent_log_records
+from logger import recent_log_records, recent_log_summary
 from services.conversation.interaction_contract import pet_feedback
 from services.model_routing.channels import channel_from_mapping
 from services.tts.coordinator import SpeechStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_api_audit_filters(filters: object) -> dict[str, object]:
+
+    if not isinstance(filters, Mapping):
+        return {}
+    sanitized: dict[str, object] = {}
+    for key, value in filters.items():
+        if key not in _AUDIT_FILTER_KEYS:
+            continue
+        text = _safe_ui_text(value, limit=128)
+        if not text:
+            continue
+        sanitized[key] = text
+    return sanitized
+
+
+def _web_control_state_signature(state: Mapping[str, object]) -> str:
+    """生成网页控制面内容签名，忽略仅用于客户端顺序控制的 revision。"""
+
+    comparable = {key: value for key, value in state.items() if key != "revision"}
+    return json.dumps(comparable, ensure_ascii=False, sort_keys=True, default=str)
+
 
 # 连续输入在取消旧回合后短暂合并，避免高负载 Qt 事件循环先启动中间消息，
 # 随后又启动最新消息，导致模型请求数量和桌宠动作出现多余一轮。
@@ -88,6 +112,10 @@ _TTS_MOUTH_SILENCE_DEBOUNCE_MS = 120
 _RESTART_READY_ARGUMENT = "--restart-ready-file"
 _RESTART_READY_TIMEOUT_SECONDS = 20.0
 _RESTART_RENDER_READY_TIMEOUT_SECONDS = 15.0
+# 与单实例锁同目录的“干净关闭”标记，用于区分正常退出与未写入标记的崩溃。
+_RUNTIME_LIFECYCLE_MARKER = "meapet.runtime.lifecycle"
+# 审计筛选只允许这两个键进入 API 调用审计查询，其余键在脱敏层直接丢弃。
+_AUDIT_FILTER_KEYS = frozenset({"status", "channel_id"})
 _CONSOLE_MODULE_IDS = frozenset(
     {
         "model",
@@ -179,6 +207,153 @@ def _restart_child_arguments(argv: list[str], marker_path: Path) -> list[str]:
     return result
 
 
+def _module_startup_directory(fallback: str | os.PathLike[str]) -> Path:
+    """返回 ``-m app`` 重启可用且不依赖调用 cwd 的工作目录。
+
+    ``QProcess.startDetached`` 会隐式拒绝空字符串工作目录，因此只在候选
+    目录存在且指向目录时使用；否则回退到调用方传入的目录。
+    """
+
+    root = _module_project_root()
+    candidate = Path(root) if root is not None else Path(fallback).expanduser()
+    try:
+        if candidate.is_dir():
+            return candidate.resolve()
+    except OSError:
+        pass
+    return Path(fallback).expanduser()
+
+
+def _install_single_instance_lock(configuration: LoadedConfiguration) -> None:
+    """按用户数据目录建立单实例 QLockFile；不阻止测试构造窗口。
+
+    只有 ``run()`` 启动入口调用本函数，直接构造 PetConsoleWindow /
+    WebPetHost 的测试路径不会触碰锁。锁文件放在用户可写数据目录，保证
+    两个不同用户同时在同机运行互不干扰。tryLock 失败后先读锁文件内
+    记录的 PID：进程已不存在时视为陈旧锁，removeStaleLockFile 后重试
+    一次；否则拒绝启动。MEAPET_SINGLE_INSTANCE=0 时整体跳过，便于测试
+    与开发环境。
+
+    初始化异常不向上抛：单实例能力是尽力保证，不能因数据目录权限问题
+    阻断启动。
+    """
+
+    if not parse_bool(
+        os.environ.get("MEAPET_SINGLE_INSTANCE", "1"),
+        field_name="MEAPET_SINGLE_INSTANCE",
+        default=True,
+    ):
+        return
+    # run() 在调用本函数前已确认 pyside6_available；这里保持函数级
+    # 延迟导入，避免模块顶部的 PySide6 依赖扩散到纯逻辑测试导入路径。
+    from PySide6.QtCore import QLockFile
+
+    storage_values = configuration.values.get("storage", {})
+    database_value = storage_values.get("database") if isinstance(storage_values, Mapping) else None
+    try:
+        lock = QLockFile(str(_single_instance_lock_path(Path(str(database_value or "")))))
+        lock.setStaleLockTime(0)
+        if lock.tryLock(100):
+            _single_instance_lock_holder["pid"] = os.getpid()
+            _single_instance_lock_holder["lock"] = lock
+            return
+        lock_path = Path(lock.fileName())
+        # QLockFile 锁文件第一行是持有进程 PID；读取失败按无记录处理。
+        try:
+            recorded_pid = int(lock_path.read_text(encoding="utf-8").splitlines()[0].strip() or 0)
+        except (OSError, ValueError, UnicodeError, IndexError):
+            recorded_pid = 0
+        if recorded_pid > 0 and _process_is_alive(recorded_pid):
+            logger.warning("另一个 MeaPet 实例（PID %d）正在运行，本次启动被拒绝", recorded_pid)
+            return
+        lock.removeStaleLockFile()
+        if lock.tryLock(100):
+            logger.info("已清理陈旧单实例锁并取得锁：%s", lock.fileName())
+            _single_instance_lock_holder["pid"] = os.getpid()
+            _single_instance_lock_holder["lock"] = lock
+        else:
+            logger.warning("单实例锁竞争失败，本次启动未取得锁：%s", lock.fileName())
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        logger.debug("single instance lock setup failed: %s", type(exc).__name__)
+
+
+def _release_single_instance_lock() -> None:
+    """在 run() 的 finally 释放单实例锁；两次调用幂等。"""
+
+    lock = _single_instance_lock_holder.get("lock")
+    if lock is None:
+        return
+    _single_instance_lock_holder.clear()
+    try:
+        lock.unlock()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        logger.debug("single instance lock release failed: %s", type(exc).__name__)
+    try:
+        lock.deleteLater()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _single_instance_lock_path(database_path: Path) -> Path:
+    """由 storage.database 推导锁路径：与数据库同目录的稳定锁文件。
+
+    解析失败（空串、相对路径无基准）时退回系统临时目录，保证函数永远
+    返回一个可构造的锁文件路径。
+    """
+
+    try:
+        target = database_path.expanduser() if database_path.name else None
+    except (OSError, ValueError):
+        target = None
+    if target is not None and target.is_absolute():
+        return target.parent / "meapet.single_instance.lock"
+    temp_directory = Path(tempfile.gettempdir())
+    resolved_user = Path.home().expanduser().resolve()
+    entry = ".meapet-lock-" + (
+        str(resolved_user).replace("/", "_") if str(resolved_user) else "unknown-user"
+    )
+    return temp_directory / entry
+
+
+def _process_is_alive(pid: int) -> bool:
+    """POSIX 语义进程存活探测；不可用平台统一按存活处理。"""
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (AttributeError, OSError):
+        return True
+    return True
+
+
+def _restart_launch_arguments(
+    child_arguments: list[str],
+    *,
+    frozen: bool,
+) -> list[str]:
+    """构造 restart_application 传给 QProcess 的参数向量。
+
+    冻结环境不追加 ``-m app``，否则 PyInstaller/Nuitka 产物内的 Python
+    解释器环境找不到可分发的 ``app`` 模块（sys.frozen 进程没有站点包
+    入口）；源码环境保留 ``-m app``，与 ``src/app/__main__.py`` 的启动
+    语义一致。
+    """
+
+    if frozen:
+        return list(child_arguments)
+    return ["-m", "app", *child_arguments]
+
+
+def _restart_working_directory() -> str:
+    """返回子进程工作目录：首选模块项目根，保证 ``-m app`` 可解析。"""
+
+    fallback = str(sys.path[0]) if sys.path and str(sys.path[0]) else str(Path.cwd())
+    return str(_module_startup_directory(fallback))
+
+
 def _write_restart_ready_receipt(
     path: str | Path,
     *,
@@ -220,6 +395,62 @@ def _write_restart_ready_receipt(
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _write_clean_shutdown_marker(database_path: object = None) -> None:
+    """正常关闭时在数据库同目录写“干净关闭”标记；失败静默降级。
+
+    写入复用 ``_single_instance_lock_path`` 的风格推导目录：该标记只辅助
+    崩溃诊断（下次启动时发现缺失而记录 warning），任何权限、磁盘或路径
+    异常都不能反过来阻断退出流程。
+    """
+
+    try:
+        raw_path = database_path if database_path is not None else ""
+        base = Path(str(raw_path or "")).expanduser() if str(raw_path or "") else None
+    except (OSError, ValueError):
+        base = None
+    if base is not None and base.is_absolute():
+        target = base.parent / _RUNTIME_LIFECYCLE_MARKER
+    else:
+        target = _single_instance_lock_path(Path(str(raw_path or ""))).with_name(
+            _RUNTIME_LIFECYCLE_MARKER
+        )
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("w", encoding="utf-8") as stream:
+            stream.write("clean-shutdown\n")
+    except (OSError, UnicodeError, ValueError):
+        logger.debug("clean shutdown marker write failed", exc_info=True)
+
+
+def _warn_missing_clean_shutdown_marker(database_path: object = None) -> bool:
+    """启动时确认上次会话是否留下干净关闭标记；缺失仅记录，不阻断启动。"""
+
+    try:
+        raw_path = database_path if database_path is not None else ""
+        base = Path(str(raw_path or "")).expanduser() if str(raw_path or "") else None
+    except (OSError, ValueError):
+        base = None
+    if base is not None and base.is_absolute():
+        target = base.parent / _RUNTIME_LIFECYCLE_MARKER
+    else:
+        target = _single_instance_lock_path(Path(str(raw_path or ""))).with_name(
+            _RUNTIME_LIFECYCLE_MARKER
+        )
+    try:
+        first_line = (
+            target.read_text(encoding="utf-8").splitlines()[0].strip() if target.is_file() else ""
+        )
+    except (OSError, UnicodeError, ValueError):
+        first_line = ""
+    if first_line == "clean-shutdown":
+        return True
+    logger.warning("上次会话未留下干净关闭标记，可能存在崩溃或强制退出：%s", target)
+    return False
+
+
+_single_instance_lock_holder: dict[str, object] = {}
 
 
 def _restart_ready_receipt_matches(
@@ -1060,6 +1291,14 @@ def _install_shutdown_signal_handlers(app: Any) -> Callable[[], None]:
     sigterm = getattr(signal, "SIGTERM", None)
     if sigterm is not None:
         signals.append(sigterm)
+    # Windows 控制台路径没有 POSIX SIGTERM；防御式注册 CTRL_C/CTRL_BREAK，
+    # 常量缺失（非 Windows 或替代实现）时保持现有行为不变。
+    for windows_name in ("CTRL_C_EVENT", "CTRL_BREAK_EVENT"):
+        if getattr(signal, "SIGINT", None) == getattr(signal, windows_name, None):
+            continue
+        windows_signal = getattr(signal, windows_name, None)
+        if windows_signal is not None and windows_signal not in signals:
+            signals.append(windows_signal)
     shutdown_requested = False
     shutdown_timer: Any = None
 
@@ -2271,6 +2510,9 @@ def run(
     )
     if early_backend != "vulkan":
         _configure_qt_webengine_renderer()
+    # 单实例互斥只保护完整 GUI 会话；--no-gui/--validate 与直接构造
+    # 窗口的测试路径不经过本函数（它们不轻取用户数据目录锁）。
+    _install_single_instance_lock(configuration)
     owns_runtime = runtime is None
     if owns_runtime:
         _prepare_qt_platform(configuration)
@@ -2299,6 +2541,15 @@ def run(
             select_output_device = getattr(audio_player, "set_output_device_id", None)
             if callable(select_output_device):
                 select_output_device(output_device_id)
+        storage_values_for_marker = configuration.values.get("storage", {})
+        try:
+            _warn_missing_clean_shutdown_marker(
+                storage_values_for_marker.get("database")
+                if isinstance(storage_values_for_marker, Mapping)
+                else None
+            )
+        except Exception:
+            logger.debug("clean shutdown marker check skipped", exc_info=True)
         runtime_loop = RuntimeLoop(runtime)
         asr_values = configuration.values.get("asr", {})
         asr_values = asr_values if isinstance(asr_values, Mapping) else {}
@@ -2356,6 +2607,7 @@ def run(
         except BaseException as cleanup_error:
             logger.warning("Qt startup cleanup failed: %s", type(cleanup_error).__name__)
         finally:
+            _release_single_instance_lock()
             restore_signal_handlers()
         raise
     assert dispatcher is not None
@@ -2398,7 +2650,7 @@ def run(
     renderer_labels = {
         "opengl": "OpenGL Live2D",
         "web_live2d": "Web Live2D",
-        "sprite": "精灵回退",
+        "sprite": "精灵（显式）",
         "vulkan": "Vulkan",
     }
     logger.info(
@@ -2428,7 +2680,6 @@ def run(
         else ""
     )
     pending_renderer_model_persistence: dict[int, tuple[str, str]] = {}
-    allow_renderer_fallback = renderer_selection.allows_runtime_fallback
     ui_values = configuration.values.get("ui", {})
     if not isinstance(ui_values, Mapping):
         ui_values = {}
@@ -2515,7 +2766,8 @@ def run(
     tts_degraded_contexts: set[object] = set()
     web_renderer: WebLive2DRenderer | None = None
     web_host: WebPetHost | None = None
-    last_web_control_state_json = ""
+    last_web_control_state_signature = ""
+    last_web_snapshot_at = 0.0
     web_revision = 0
     web_operation_sequence = 0
     web_last_operation: dict[str, object] = {
@@ -2538,6 +2790,22 @@ def run(
         "kind": "",
         "status": "idle",
         "message": "",
+    }
+    # 网页控制台不直接读取文件/数据库；只保存本地异步读取后的有界诊断结果，
+    # 再由 gui.web.control_surface 做第二次公开投影。
+    web_diagnostics: dict[str, dict[str, object]] = {
+        "api_audit": {
+            "status": "idle",
+            "count": 0,
+            "summary": {
+                "total": 0,
+                "by_status": (),
+                "by_channel": (),
+                "latency_ms": {"avg_first": None, "avg_total": None, "max_total": None},
+            },
+            "records": (),
+        },
+        "logs": {"status": "idle", "count": 0, "records": ()},
     }
     window: Any = None
     topmost_controller = _TopmostTransitionController(
@@ -2814,17 +3082,38 @@ def run(
 
         return await runtime.execute_console_tool(identity, arguments)
 
-    async def _read_api_audit() -> Mapping[str, object]:
-        """在 RuntimeLoop 所在线程读取有界、已脱敏 API 审计摘要。"""
+    async def _read_api_audit(filters: Mapping[str, object] | None = None) -> Mapping[str, object]:
+        """在 RuntimeLoop 所在线程读取有界、已脱敏 API 审计摘要与聚合。"""
 
-        records = runtime.api_call_audit_public_records(limit=50)
-        return {"status": "available", "count": len(records), "records": records}
+        sanitized = _sanitize_api_audit_filters(filters)
+        records = runtime.api_call_audit_public_records(limit=50, **sanitized)
+        try:
+            summary = runtime.api_call_audit_summary(**sanitized)
+        except ValueError:
+            summary = {
+                "total": 0,
+                "by_status": (),
+                "by_channel": (),
+                "latency_ms": {"avg_first": None, "avg_total": None, "max_total": None},
+            }
+        return {
+            "status": "available",
+            "count": len(records),
+            "summary": summary,
+            "records": records,
+            "filters": dict(sanitized),
+        }
 
     async def _read_log_records() -> Mapping[str, object]:
         """读取本机有界日志环；日志正文已经在 sink 边界脱敏。"""
 
         records = recent_log_records(limit=200)
-        return {"status": "available", "count": len(records), "records": records}
+        return {
+            "status": "available",
+            "count": len(records),
+            "summary": recent_log_summary(limit=200),
+            "records": records,
+        }
 
     def _request_console_read(label: str, identity: str, arguments: Mapping[str, object]) -> object:
         """提交控制台只读请求，并由 Qt 定时器消费完成结果。"""
@@ -2887,7 +3176,7 @@ def run(
     def _poll_console_reads() -> None:
         """在 Qt 主线程读取只读请求结果并更新控制台。"""
 
-        nonlocal web_observation
+        nonlocal web_observation, web_diagnostics
 
         for label, future in tuple(pending_console_reads.items()):
             if not future.done():
@@ -2900,6 +3189,28 @@ def run(
                 result = {"status": "unavailable", "reason": "桌面读取暂时不可用，请稍后重试"}
             if label == "模块状态":
                 result = _augment_module_status(result)
+            if label == "API调用审计":
+                diagnostic_key = "api_audit"
+            elif label == "运行日志":
+                diagnostic_key = "logs"
+            else:
+                diagnostic_key = ""
+            if diagnostic_key:
+                value = (
+                    dict(result)
+                    if isinstance(result, Mapping)
+                    else {
+                        "status": "unavailable",
+                        "count": 0,
+                        "records": (),
+                    }
+                )
+                web_diagnostics[diagnostic_key] = value
+                _append_web_timeline(
+                    "read_api_audit" if diagnostic_key == "api_audit" else "read_log_records",
+                    value.get("status", "completed"),
+                    _safe_console_result(label, value),
+                )
             observation_kind = (
                 "foreground_window"
                 if label == "前台窗口"
@@ -3724,6 +4035,12 @@ def run(
             "recall_limit": value.get("recall_limit", 0),
             "context_max_chars": value.get("context_max_chars", 0),
             "max_memories": value.get("max_memories", 0),
+            "prune_importance_floor": value.get("prune_importance_floor", 0),
+            "exchange_importance": value.get("exchange_importance", 0),
+            "extract_default_priority": value.get("extract_default_priority", 0),
+            "always_recall_priority": value.get("always_recall_priority", 0),
+            "recall_min_similarity": value.get("recall_min_similarity", 0.0),
+            "auto_extract_enabled": bool(value.get("auto_extract_enabled", False)),
             "consolidation_enabled": bool(value.get("consolidation_enabled", False)),
             "summarization_enabled": bool(value.get("summarization_enabled", False)),
             "summary_running": bool(summary_status.get("running", False)),
@@ -3740,6 +4057,59 @@ def run(
                 if bool(value.get("enabled", False))
                 else "记忆已关闭"
             ),
+        }
+
+    def _web_scheduler_state() -> dict[str, object]:
+        """生成调度与主动触发摘要，不公开动作参数或任务正文。"""
+
+        try:
+            scheduler_status = runtime.scheduler.status()
+            trigger_status = runtime.triggers.status()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return {"status": "unavailable", "running": False}
+        return {
+            "status": "running" if bool(scheduler_status.get("running", False)) else "stopped",
+            "running": bool(scheduler_status.get("running", False)),
+            "task_count": scheduler_status.get("task_count", 0),
+            "trigger_count": trigger_status.get("trigger_count", 0),
+            "event_count": trigger_status.get("event_count", 0),
+            "matched_count": trigger_status.get("matched_count", 0),
+            "completed_count": trigger_status.get("completed_count", 0),
+            "failed_count": trigger_status.get("failed_count", 0),
+            "skipped_count": trigger_status.get("skipped_count", 0),
+            "last_status": trigger_status.get("last_status", "idle"),
+            "last_duration_ms": trigger_status.get("last_duration_ms"),
+            "persistence": scheduler_status.get("persistence", "detached"),
+        }
+
+    def _web_proactive_state() -> dict[str, object]:
+        """生成主动行为预算摘要，不公开规则指令和事件内容。"""
+
+        proactive = getattr(runtime, "proactive", None)
+        diagnostics = getattr(proactive, "diagnostics", None) if proactive is not None else None
+        if not callable(diagnostics):
+            return {"status": "unavailable", "enabled": False, "running": False}
+        try:
+            value = diagnostics()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return {"status": "unavailable", "enabled": False, "running": False}
+        if not isinstance(value, Mapping):
+            return {"status": "unavailable", "enabled": False, "running": False}
+        return {
+            "status": str(value.get("status", "idle") or "idle")[:32],
+            "enabled": bool(value.get("enabled", False)),
+            "running": bool(value.get("running", False)),
+            "rule_count": value.get("rule_count", 0),
+            "pending_events": value.get("pending_events", 0),
+            "waiting_for_conversation": bool(value.get("waiting_for_conversation", False)),
+            "hourly_used": value.get("hourly_used", 0),
+            "hourly_budget": value.get("hourly_budget", 0),
+            "daily_used": value.get("daily_used", 0),
+            "daily_budget": value.get("daily_budget", 0),
+            "accepted": value.get("accepted", 0),
+            "completed": value.get("completed", 0),
+            "dropped": value.get("dropped", 0),
+            "budget_rejections": value.get("budget_rejections", 0),
         }
 
     def _safe_web_result(kind: str, result: object) -> dict[str, object]:
@@ -3830,6 +4200,51 @@ def run(
             "model": active_model_key,
             "models": tuple(renderer_model_choices)[:32],
         }
+        ready_status = getattr(renderer, "ready_status", None)
+        if ready_status is None:
+            ready_status = getattr(target, "lifecycle_status", None)
+        if ready_status is not None:
+            ready_state = getattr(getattr(ready_status, "state", None), "value", "")
+            renderer_state.update(
+                {
+                    "ready": bool(getattr(ready_status, "ready", False))
+                    or bool(getattr(ready_status, "available", False)),
+                    "lifecycle_state": str(ready_state or "")[:32],
+                    "actual_api": str(
+                        getattr(ready_status, "actual_api", "")
+                        or getattr(ready_status, "requested_api", "")
+                        or ""
+                    )[:32].lower(),
+                }
+            )
+        performance = getattr(renderer, "performance_settings", None)
+        if isinstance(performance, Mapping):
+            for key in ("frame_rate", "geometry_audit_hz"):
+                value = performance.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    renderer_state[key] = float(value)
+        request_performance = getattr(renderer, "request_performance_diagnostics", None)
+        if callable(request_performance):
+            try:
+                diagnostics = request_performance()
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                diagnostics = {}
+            if isinstance(diagnostics, Mapping):
+                performance_fields = {
+                    "renderedFrames": "rendered_frames",
+                    "throttledFrames": "throttled_frames",
+                    "frame_time_ms": "frame_time_ms",
+                    "largeFrameDeltas": "large_frame_deltas",
+                    "geometryAudits": "geometry_audits",
+                    "geometryAuditCacheHits": "geometry_cache_hits",
+                    "geometryAuditCacheMisses": "geometry_cache_misses",
+                    "geometryVertexDirtyFrames": "geometry_vertex_dirty_frames",
+                    "geometryStructuralDirtyFrames": "geometry_structural_dirty_frames",
+                }
+                for source_key, public_key in performance_fields.items():
+                    value = diagnostics.get(source_key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        renderer_state[public_key] = max(0.0, float(value))
         locked_getter = getattr(target, "is_window_locked", None)
         topmost_status = topmost_controller.status()
         shape_getter = getattr(target, "surface_mask_status", None)
@@ -3878,6 +4293,8 @@ def run(
             "theme": theme_tokens,
             "memory": _web_memory_state(),
             "activity": dict(activity_status) if isinstance(activity_status, Mapping) else {},
+            "scheduler": _web_scheduler_state(),
+            "proactive": _web_proactive_state(),
             "renderer": renderer_state,
             "window": {
                 "locked": bool(locked_getter()) if callable(locked_getter) else False,
@@ -3893,6 +4310,10 @@ def run(
             "feedback": feedback,
             "tts": {**dict(web_tts_state), **dict(tts_diagnostics)},
             "observation": dict(web_observation),
+            "diagnostics": {
+                "api_audit": dict(web_diagnostics.get("api_audit", {})),
+                "logs": dict(web_diagnostics.get("logs", {})),
+            },
             "timeline": tuple(web_timeline),
             "parts": [
                 {"id": "head", "label": "摸摸头", "description": "猫猫头反馈"},
@@ -3958,7 +4379,18 @@ def run(
         normalized = str(kind or "").strip().lower()
         if normalized == "open_config":
             show_console()
-            if console is None or not console.show_settings():
+            section = str(payload.get("section", "") or "").strip().lower()
+            if section not in {
+                "",
+                "memory",
+                "scheduler",
+                "proactive",
+                "tts",
+                "llm",
+                "rendering",
+            }:
+                section = ""
+            if console is None or not console.show_settings(section or None):
                 return _safe_web_result(
                     normalized, {"status": "unavailable", "reason": "配置中心不可用"}
                 )
@@ -4179,6 +4611,10 @@ def run(
             return _safe_web_result(normalized, read_foreground_window())
         if normalized == "read_processes":
             return _safe_web_result(normalized, read_processes())
+        if normalized == "read_api_audit":
+            return _safe_web_result(normalized, read_api_audit())
+        if normalized == "read_log_records":
+            return _safe_web_result(normalized, read_log_records())
         return _safe_web_result(
             normalized, {"status": "unavailable", "reason": "网页动作不在允许列表"}
         )
@@ -4203,6 +4639,15 @@ def run(
             console_recovery_available = True
             set_ui_interaction_lock(True)
             web_console.set_state(web_control_state())
+            # 关键状态恢复：控制台在极小窗口也要能看到桌宠位置与关键
+            # 按钮；窗口构造时已按可用屏幕裁剪，这里同步当前几何作为
+            # 最小尺寸基准，避免 show 后 Qt 重新展开到默认值。
+            try:
+                base_width = int(web_console.width())
+                base_height = int(web_console.height())
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                base_width, base_height = 1120, 780
+            web_console.setMinimumSize(min(320, base_width), min(360, base_height))
             web_console.show_and_focus()
             _place_widget_adjacent(
                 web_console,
@@ -4336,7 +4781,8 @@ def run(
         nonlocal pending_cancel_future, pending_cancel_operation_id
         nonlocal pending_submit_text, pending_resubmit_scheduled, pending_resubmit_token
         nonlocal pet_feedback_notice
-        nonlocal last_web_control_state_json, web_revision, pending_web_operation_id
+        nonlocal last_web_control_state_signature, web_revision, pending_web_operation_id
+        nonlocal last_web_snapshot_at
         nonlocal web_last_operation
         nonlocal last_applied_theme_signature
         nonlocal last_microphone_signature
@@ -4400,16 +4846,24 @@ def run(
         _poll_console_approvals()
         _poll_pet_affection()
         _refresh_console_approvals()
-        if web_console is not None or local_web_server is not None:
+        web_visible = (
+            web_console is not None and web_console.isVisible() and not web_console.isMinimized()
+        )
+        web_events = local_web_server is not None and local_web_server.events_enabled
+        web_interaction = getattr(getattr(runtime, "interaction_state", None), "snapshot", None)
+        web_interval = 0.1 if getattr(web_interaction, "busy", False) else 1.0
+        web_now = monotonic()
+        if (web_visible or web_events) and web_now - last_web_snapshot_at >= web_interval:
+            last_web_snapshot_at = web_now
             web_state = web_control_state()
-            web_state_json = json.dumps(web_state, ensure_ascii=False, sort_keys=True, default=str)
-            if web_state_json != last_web_control_state_json:
+            web_state_signature = _web_control_state_signature(web_state)
+            if web_state_signature != last_web_control_state_signature:
                 web_revision += 1
                 web_state["revision"] = web_revision
-                last_web_control_state_json = json.dumps(
-                    web_state, ensure_ascii=False, sort_keys=True, default=str
-                )
-                if web_console is not None:
+                # revision 不能参与下一轮内容比较，否则任何外部重置或
+                # 同步都可能把协议版本字段误判为业务状态变化。
+                last_web_control_state_signature = web_state_signature
+                if web_visible:
                     web_console.set_state(web_state)
                 if local_web_server is not None and local_web_server.events_enabled:
                     try:
@@ -5162,12 +5616,22 @@ def run(
         descriptor, marker_text = tempfile.mkstemp(prefix="meapet-restart-", suffix=".json")
         os.close(descriptor)
         marker = Path(marker_text)
-        arguments = ["-m", "app", *_restart_child_arguments(sys.argv[1:], marker)]
+        existing_child_arguments = _restart_child_arguments(sys.argv[1:], marker)
+        # 冻结产物没有可分发的 ``app`` 入口模块，直接以 [可执行文件,
+        # 原始参数] 重来；源码环境则保持 ``python -m app`` 的入口语义，
+        # 并把 cwd 改为模块所在项目根，用户从其他目录启动时 -m app
+        # 同样能找到模块。QProcess 会拒绝空 workingDirectory，因此
+        # 两种模式都保证传入非空目录。
+        arguments = _restart_launch_arguments(
+            existing_child_arguments,
+            frozen=getattr(sys, "frozen", False),
+        )
+        working_directory = _restart_working_directory()
         try:
             started, process_id = QProcess.startDetached(
                 sys.executable,
                 arguments,
-                str(Path.cwd()),
+                working_directory,
             )
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
             marker.unlink(missing_ok=True)
@@ -5349,21 +5813,28 @@ def run(
         rescan_renderer_models()
         return _request_console_read("模块状态", "system:module_status", {})
 
-    def read_api_audit() -> object:
-        """读取模型与工具调用的脱敏审计摘要，不进入网页公开状态。"""
+    def read_api_audit(filters: Mapping[str, object] | None = None) -> object:
+        """读取模型与工具调用的脱敏审计摘要，不进入网页公开状态。
 
+        筛选键只有 status/channel_id 能进入数据库查询；其余键在
+        _read_api_audit 内被丢弃，避免未知字段钻进仓库层。
+        """
+
+        nonlocal web_diagnostics
         label = "API调用审计"
         current = pending_console_reads.get(label)
         if current is not None and not current.done():
             return {"status": "degraded", "reason": "API audit call remains in flight"}
         if runtime_loop is None or not runtime_loop.running:
             try:
-                return dict(asyncio.run(_read_api_audit()))
+                result = dict(asyncio.run(_read_api_audit(filters)))
             except Exception as exc:
                 logger.warning("API 审计读取失败：%s", type(exc).__name__)
-                return {"status": "unavailable", "reason": "API 审计暂时不可用"}
+                result = {"status": "unavailable", "reason": "API 审计暂时不可用"}
+            web_diagnostics["api_audit"] = dict(result)
+            return result
         try:
-            future = runtime_loop.submit(_read_api_audit())
+            future = runtime_loop.submit(_read_api_audit(filters))
         except RuntimeError:
             return {"status": "unavailable", "reason": "runtime loop is not running"}
         pending_console_reads[label] = future
@@ -5374,16 +5845,19 @@ def run(
     def read_log_records() -> object:
         """读取最近结构化运行日志，不读取日志文件路径。"""
 
+        nonlocal web_diagnostics
         label = "运行日志"
         current = pending_console_reads.get(label)
         if current is not None and not current.done():
             return {"status": "degraded", "reason": "log records call remains in flight"}
         if runtime_loop is None or not runtime_loop.running:
             try:
-                return dict(asyncio.run(_read_log_records()))
+                result = dict(asyncio.run(_read_log_records()))
             except Exception as exc:
                 logger.warning("运行日志读取失败：%s", type(exc).__name__)
-                return {"status": "unavailable", "reason": "运行日志暂时不可用"}
+                result = {"status": "unavailable", "reason": "运行日志暂时不可用"}
+            web_diagnostics["logs"] = dict(result)
+            return result
         try:
             future = runtime_loop.submit(_read_log_records())
         except RuntimeError:
@@ -5833,6 +6307,47 @@ def run(
 
     renderer_model_rollbacks: set[int] = set()
 
+    def switch_live2d_model(*, model_key: str | None = None) -> Mapping[str, object]:
+        """模型可见的换模入口：重扫目录并原子换装当前模型。
+
+        ``model_key`` 必须是资源相对键且经 ``MutablePetController`` 已在
+        runtime 侧完成路径校验；这里只对候选列表做一次存在性确认，避免
+        把未经 catalog 确认的路径交给 reload_model。空键只重扫不换模。
+        """
+
+        if not model_key:
+            return rescan_renderer_models(reload_current=False)
+        if model_key not in renderer_model_choices:
+            return {
+                "status": "unavailable",
+                "model_key": model_key,
+                "reason": "请求的 Live2D 模型不在资源目录中",
+            }
+        if renderer_selection.backend != "web_live2d":
+            # 原生 OpenGL/Vulkan/精灵宿主的换模入口仍要求安全重启或
+            # 资源重载；模型可见工具只以明确的 restarted 边界回执。
+            return {
+                "status": "unavailable",
+                "model_key": model_key,
+                "reason": "当前渲染后端不支持运行中换模，请先在控制台切换模型",
+            }
+        # 换模前先重扫，取到最新 catalog 与目标描述符路径。
+        refresh = rescan_renderer_models(reload_current=False)
+        if str(refresh.get("status", "")) != "available":
+            return {**refresh, "model_key": model_key}
+        selection = renderer_model_catalog.select(model_key)
+        reload_model = getattr(web_renderer, "reload_model", None)
+        if not callable(reload_model) or selection.selected is None:
+            return {
+                "status": "unavailable",
+                "model_key": model_key,
+                "reason": "当前渲染宿主无法重新加载模型",
+            }
+        return _renderer_model_reload_result(
+            reload_model(selection.selected.descriptor, force=True),
+            model_key,
+        )
+
     def rescan_renderer_models(*, reload_current: bool = False) -> Mapping[str, object]:
         """显式重扫模型目录，并让控制台只接收资源相对键。"""
 
@@ -6254,6 +6769,7 @@ def run(
                 "list_processes": read_processes,
                 "module_status": read_module_status,
                 "api_audit": read_api_audit,
+                "audit_refresh": lambda filters=None: read_api_audit(filters),
                 "log_records": read_log_records,
                 "mcp_content": show_mcp_content,
                 "module_test": test_console_module,
@@ -6397,7 +6913,7 @@ def run(
             renderer_labels = {
                 "opengl": "OpenGL Live2D",
                 "web_live2d": "Web Live2D",
-                "sprite": "精灵回退",
+                "sprite": "精灵（显式）",
                 "unavailable": "不可用",
             }
             renderer_hint = "渲染：" + renderer_labels.get(actual_renderer_backend, "自动后端")
@@ -6509,89 +7025,6 @@ def run(
         # 快捷键由 HotkeyManager 统一按 YAML 注册；这里仅连接窗口自身的
         # 双击/右键信号，避免固定组合键与配置覆盖相互重复触发。
 
-    def activate_sprite_fallback(message: str) -> None:
-        """在 WebEngine 运行期加载失败时切换到可用的精灵窗口。"""
-
-        nonlocal web_renderer, web_host, window
-        if not allow_renderer_fallback:
-            logger.error(
-                "显式渲染后端运行期失败，禁止静默切换精灵：requested=%s reason=%s",
-                renderer_selection.requested_backend,
-                _safe_ui_text(message, limit=160) or "渲染页面不可用",
-            )
-            return
-        if window is not None:
-            return
-        renderer = SpriteRenderer(resource_root / "sprites")
-        fallback = PetOpenGLWindow(
-            renderer,
-            platform=platform,
-            sprite_scale=sprite_scale,
-            always_on_top=always_on_top,
-        )
-        # QOpenGLWindow 使用 QWindow.setTitle；明确标记回退窗口，便于
-        # X11/Wayland 诊断当前实际渲染后端，也避免用户误以为仍在使用
-        # 已失败的 Web Live2D 页面。
-        set_title = getattr(fallback, "setTitle", None)
-        if callable(set_title):
-            set_title("MeaPet Sprite")
-        fallback.textSubmitted.connect(submit_text)
-        connect_window_controls(fallback)
-        snapshot = runtime.conversation.presentation.snapshot
-        fallback.set_speech(
-            _friendly_stream_text(snapshot.rendered_text) or idle_message,
-            mood=snapshot.rendered_mood,
-            speaking=False,
-        )
-        window = fallback
-        failed_host = web_host
-        web_host = None
-        runtime.pet_controller.attach(fallback)
-        fallback.show()
-        # QOpenGLWindow 的 framebuffer/alpha 在 show 后才稳定；与明确 sprite
-        # 入口保持同一时序，避免回退窗口首帧把输入区域报告为空。
-        fallback.set_surface_mask_enabled(surface_mask_required)
-        exclude_pet_window(fallback)
-        if console is not None:
-            capabilities = getattr(renderer, "capabilities", None)
-            console.set_action_capabilities(
-                getattr(capabilities, "expressions", ()),
-                getattr(capabilities, "motions", ()),
-            )
-            renderer_status_setter = getattr(console, "set_renderer_status", None)
-            if callable(renderer_status_setter):
-                renderer_status_setter(
-                    "sprite",
-                    available=bool(getattr(capabilities, "available", False)),
-                    reason=message,
-                )
-        failed_renderer = web_renderer
-        web_renderer = None
-        failed_host_shutdown = False
-        if failed_host is not None:
-            try:
-                # 运行期回退时先拆掉 Chromium 视口上的事件过滤器，避免
-                # 旧页面继续收到拖动/右键事件；renderer.shutdown 随后负责
-                # 释放页面和 WebChannel。
-                failed_host.shutdown()
-                failed_host_shutdown = True
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                logger.debug("failed Web Live2D host cleanup during fallback", exc_info=True)
-        # WebPetHost 正常情况下已经拥有并关闭 renderer/view；只有宿主不存在
-        # 或关闭失败时才执行一次直接 renderer 清理，避免原生 surface 二次释放。
-        if failed_renderer is not None and not failed_host_shutdown:
-            failed_view = getattr(failed_renderer, "view", None)
-            for method_name in ("hide", "close"):
-                method = getattr(failed_view, method_name, None)
-                if callable(method):
-                    try:
-                        method()
-                    except (AttributeError, RuntimeError, TypeError):
-                        pass
-            failed_renderer.shutdown()
-        safe_reason = _safe_ui_text(message, limit=160) or "渲染页面不可用"
-        logger.warning("Web Live2D unavailable at runtime; using sprite fallback: %s", safe_reason)
-
     def configure_recovery_tray() -> None:
         """提供点击穿透后的可见恢复入口，不依赖宠物窗口继续接收鼠标事件。"""
 
@@ -6683,8 +7116,6 @@ def run(
                         pass
                     tray_watch_timer = None
 
-            # show() 只提交注册请求；等 Qt 处理一次事件后再确认托盘确实可见，
-            # 之后持续监测托盘是否被桌面环境隐藏，避免点击穿透失去恢复入口。
             QTimer.singleShot(0, verify_tray_visibility)
             tray_watch_timer = QTimer(app)
             tray_watch_timer.setInterval(3000)
@@ -6763,17 +7194,11 @@ def run(
 
         nonlocal behavior_interaction_active
         target = window if window is not None else web_host
-        # 行为循环在独立线程中运行；仅依赖下一次轮询会让拖动开始后
-        # 仍提交一个迟到步进。Qt 定时器看到用户正在悬停/拖动时立即
-        # 推进行为代际，锁定窗口则不返回 interacting，保持自主行为。
         interacting = getattr(runtime.pet_controller, "is_user_interacting", None)
         if callable(interacting):
             try:
                 state = interacting()
                 if inspect.isawaitable(state):
-                    # Qt 定时器不应在主线程等待后台协程；若兼容控制器
-                    # 意外返回 awaitable，主动回收未调度对象，避免退出时
-                    # 出现 RuntimeWarning 或把协程对象当作真值。
                     closer = getattr(state, "close", None)
                     if callable(closer):
                         closer()
@@ -6812,6 +7237,9 @@ def run(
         set_title = getattr(window, "setTitle", None)
         if callable(set_title):
             set_title("MeaPet Sprite")
+        # 换模入口绑定到实际 attach 的宿主实例；runtime 通过鸭子类型
+        # 转发 switch_live2d_model，因此该属性必须存在于宿主对象上。
+        window.switch_live2d_model = switch_live2d_model
         runtime.pet_controller.attach(window)
         window.textSubmitted.connect(submit_text)
         connect_window_controls(window)
@@ -6835,15 +7263,14 @@ def run(
             window = PetOpenGLWindow(
                 live2d,
                 platform=platform,
-                fallback_renderer=(
-                    SpriteRenderer(resource_root / "sprites") if allow_renderer_fallback else None
-                ),
+                fallback_renderer=None,
                 sprite_scale=sprite_scale,
                 always_on_top=always_on_top,
             )
             set_title = getattr(window, "setTitle", None)
             if callable(set_title):
                 set_title("MeaPet Live2D")
+            window.switch_live2d_model = switch_live2d_model
             runtime.pet_controller.attach(window)
             window.textSubmitted.connect(submit_text)
             connect_window_controls(window)
@@ -6855,7 +7282,7 @@ def run(
             renderer_instance = WebLive2DRenderer(
                 resource_root,
                 model_path=renderer_selection.model_path,
-                failure_callback=activate_sprite_fallback if allow_renderer_fallback else None,
+                failure_callback=None,
                 natural_layout=True,
                 frame_rate=float(rendering_values.get("frame_rate", 60.0)),
                 geometry_audit_hz=float(rendering_values.get("geometry_audit_hz", 30.0)),
@@ -6882,6 +7309,7 @@ def run(
                     close_callback=hide_pet_to_tray,
                 )
                 web_host.set_model_reload_callback(on_renderer_model_reload)
+                web_host.switch_live2d_model = switch_live2d_model
                 runtime.pet_controller.attach(web_host)
                 web_host.set_speech(idle_message, mood="neutral", speaking=False)
                 # WebEngine 没有 QOpenGLWindow 的右键信号，快捷键由统一管理器注册。
@@ -6891,8 +7319,6 @@ def run(
                 # 同步 Shape 才能同时约束顶层和子表面，避免透明角点拦截桌面。
                 web_host.set_surface_mask_enabled(surface_mask_required)
                 exclude_pet_window(view)
-            elif window is None and allow_renderer_fallback:
-                attach_sprite_window()
             elif window is None:
                 reason = str(
                     getattr(renderer_instance.capabilities, "message", "Web Live2D 初始化失败")
@@ -6918,6 +7344,7 @@ def run(
                     + str(initialization.reason or "unknown Vulkan initialization error")
                 )
             window = initialization.renderer
+            window.switch_live2d_model = switch_live2d_model
             runtime.pet_controller.attach(window)
             text_submitted = getattr(window, "textSubmitted", None)
             if callable(getattr(text_submitted, "connect", None)):
@@ -6955,7 +7382,9 @@ def run(
             # 抢在透明窗口创建前显示，也让用户仍能看到桌宠本体。
             QTimer.singleShot(450, open_model_setup_on_start)
         # 窗口已经 attach 后再启动后台行为，避免首个随机动作落到占位控制器。
-        runtime_loop.start()
+        runtime_start_timeout = float(ui_values.get("runtime_start_timeout_seconds", 10.0))
+        runtime_start_timeout = max(0.1, runtime_start_timeout)
+        runtime_loop.start(timeout=runtime_start_timeout)
         if restart_ready_file is not None:
             target = window if window is not None else web_host
             target_renderer = getattr(target, "renderer", target)
@@ -7107,6 +7536,13 @@ def run(
                     logger.debug(
                         "database fallback cleanup failed: %s", type(database_error).__name__
                     )
+            storage_marker = configuration.values.get("storage", {})
+            try:
+                _write_clean_shutdown_marker(
+                    storage_marker.get("database") if isinstance(storage_marker, Mapping) else None
+                )
+            except Exception:
+                logger.debug("clean shutdown marker write skipped", exc_info=True)
             for pending in tuple(pending_console_reads.values()):
                 try:
                     pending.cancel()
@@ -7192,4 +7628,5 @@ def run(
                         type(exc).__name__,
                     )
         finally:
+            _release_single_instance_lock()
             restore_signal_handlers()

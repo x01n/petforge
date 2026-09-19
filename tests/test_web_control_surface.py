@@ -73,6 +73,121 @@ def test_public_control_state_filters_approval_identifiers_and_parameters() -> N
     assert "private-approval-view" not in encoded
 
 
+def test_public_control_state_projects_diagnostics_without_payloads() -> None:
+    state = public_control_state(
+        {
+            "diagnostics": {
+                "api_audit": {
+                    "status": "available",
+                    "count": 1,
+                    "records": [
+                        {
+                            "kind": "model",
+                            "status": "completed",
+                            "channel_id": "primary",
+                            "requested_model": "requested-model",
+                            "response_model": "served-model",
+                            "time_to_first_token_ms": 12.5,
+                            "total_duration_ms": 50.0,
+                            "tool_execution_count": 2,
+                            "input_payload": {"secret": "hidden"},
+                            "output_text": "private response",
+                        }
+                    ],
+                },
+                "logs": {
+                    "status": "available",
+                    "count": 1,
+                    "records": [
+                        {
+                            "level": "INFO",
+                            "logger": "runtime",
+                            "event": "model.call.completed",
+                            "status": "completed",
+                            "duration_ms": 50.0,
+                            "message": "private payload",
+                        }
+                    ],
+                },
+            }
+        }
+    )
+    assert state["diagnostics"]["api_audit"]["count"] == 1
+    record = state["diagnostics"]["api_audit"]["records"][0]
+    assert record["model"] == "served-model"
+    assert record["tool_count"] == 2
+    assert "input_payload" not in record
+    assert "output_text" not in record
+    log_record = state["diagnostics"]["logs"]["records"][0]
+    assert log_record["event"] == "model.call.completed"
+    assert "message" not in log_record
+
+
+def test_public_control_state_exposes_bounded_memory_priority_policy() -> None:
+    public = public_control_state(
+        {
+            "memory": {
+                "enabled": True,
+                "recall_limit": 7,
+                "context_max_chars": 4000,
+                "max_memories": 2000,
+                "prune_importance_floor": 2,
+                "exchange_importance": 4,
+                "extract_default_priority": 6,
+                "always_recall_priority": 9,
+                "recall_min_similarity": 0.42,
+                "auto_extract_enabled": True,
+            }
+        }
+    )
+    memory = public["memory"]
+    assert memory["prune_importance_floor"] == 2
+    assert memory["exchange_importance"] == 4
+    assert memory["extract_default_priority"] == 6
+    assert memory["always_recall_priority"] == 9
+    assert memory["recall_min_similarity"] == 0.42
+    assert memory["auto_extract_enabled"] is True
+
+
+def test_public_control_state_projects_scheduler_and_proactive_budget() -> None:
+    public = public_control_state(
+        {
+            "scheduler": {
+                "status": "running",
+                "running": True,
+                "task_count": 3,
+                "trigger_count": 4,
+                "event_count": 8,
+                "matched_count": 2,
+                "completed_count": 2,
+                "failed_count": 0,
+                "skipped_count": 6,
+                "last_status": "completed",
+                "last_duration_ms": 12.5,
+                "action": {"secret": "hidden"},
+            },
+            "proactive": {
+                "status": "ready",
+                "enabled": True,
+                "running": True,
+                "rule_count": 2,
+                "pending_events": 1,
+                "hourly_used": 1,
+                "hourly_budget": 6,
+                "daily_used": 2,
+                "daily_budget": 24,
+                "budget_rejections": 3,
+                "instruction": "private prompt",
+            },
+        }
+    )
+    assert public["scheduler"]["trigger_count"] == 4
+    assert public["scheduler"]["last_duration_ms"] == 12.5
+    assert public["proactive"]["hourly_budget"] == 6
+    assert public["proactive"]["budget_rejections"] == 3
+    assert "private prompt" not in json.dumps(public, ensure_ascii=False)
+
+
 def test_public_control_state_exposes_safe_topmost_boundary() -> None:
     public = public_control_state(
         {
@@ -340,6 +455,12 @@ def test_public_memory_status_exposes_strategy_only() -> None:
         "recall_limit": 7,
         "context_max_chars": 6000,
         "max_memories": 2000,
+        "prune_importance_floor": 0,
+        "exchange_importance": 0,
+        "extract_default_priority": 0,
+        "always_recall_priority": 0,
+        "recall_min_similarity": 0.0,
+        "auto_extract_enabled": False,
         "consolidation_enabled": True,
         "summarization_enabled": False,
         "summary_running": False,
@@ -351,6 +472,10 @@ def test_public_memory_status_exposes_strategy_only() -> None:
         "extraction_last_status": "",
         "vector_index_size": 0,
         "lexical_index": "unavailable",
+        "recall_total": 0,
+        "recall_hit_rate": 0.0,
+        "recall_top_mean_score": 0.0,
+        "recall_calibration": 0.0,
         "message": "记忆已启用，新的对话会按优先级召回",
     }
     encoded = json.dumps(state, ensure_ascii=False)
@@ -595,6 +720,28 @@ def test_control_surface_html_is_click_first_and_contains_no_raw_config_editor()
     assert "textarea" not in html
     assert "api_key" not in html
     assert "approval_id" not in html
+
+
+def test_public_renderer_state_exposes_lifecycle_and_performance_fields() -> None:
+    state = public_control_state(
+        {
+            "renderer": {
+                "backend": "web_live2d",
+                "available": True,
+                "ready": True,
+                "lifecycle_state": "ready",
+                "actual_api": "opengl",
+                "frame_rate": 60.0,
+                "geometry_audit_hz": 30.0,
+            }
+        }
+    )
+
+    assert state["renderer"]["ready"] is True
+    assert state["renderer"]["lifecycle_state"] == "ready"
+    assert state["renderer"]["actual_api"] == "opengl"
+    assert state["renderer"]["frame_rate"] == 60.0
+    assert state["renderer"]["geometry_audit_hz"] == 30.0
 
 
 def test_public_renderer_state_uses_friendly_label_only() -> None:
@@ -1027,3 +1174,51 @@ def test_web_console_uses_winui_navigation_and_fluent_md3_layers() -> None:
     assert "<svg" in html
     for legacy_color in ("#3d3154", "#493757", "#62456f", "#ff9dbe", "#21182d"):
         assert legacy_color not in html.casefold()
+
+
+def test_public_control_state_projects_api_audit_aggregate_summary() -> None:
+    state = public_control_state(
+        {
+            "diagnostics": {
+                "api_audit": {
+                    "status": "available",
+                    "count": 1,
+                    "summary": {
+                        "total": 1,
+                        "by_status": [
+                            {
+                                "key": "status:completed",
+                                "count": 1,
+                                "avg_first_ms": 12.5,
+                                "avg_total_ms": 50.0,
+                                "max_total_ms": 50.0,
+                            }
+                        ],
+                        "by_channel": [
+                            {
+                                "key": "channel:primary",
+                                "count": 1,
+                                "avg_first_ms": 12.5,
+                                "avg_total_ms": 50.0,
+                                "max_total_ms": 50.0,
+                            }
+                        ],
+                        "latency_ms": {
+                            "avg_first": 12.5,
+                            "avg_total": 50.0,
+                            "max_total": 50.0,
+                        },
+                    },
+                    "records": [],
+                }
+            }
+        }
+    )
+    summary = state["diagnostics"]["api_audit"]["summary"]
+    assert summary["total"] == 1
+    assert summary["by_status"][0]["key"] == "status:completed"
+    assert summary["by_status"][0]["count"] == 1
+    assert summary["by_status"][0]["avg_first_ms"] == 12.5
+    assert summary["by_status"][0]["avg_total_ms"] == 50.0
+    assert summary["by_channel"][0]["key"] == "channel:primary"
+    assert set(summary["latency_ms"]) == {"avg_first", "avg_total", "max_total"}

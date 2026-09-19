@@ -247,6 +247,99 @@ def test_vision_summary_task_is_cancelled_with_main_stream() -> None:
     asyncio.run(scenario())
 
 
+def test_vision_summary_is_reclaimed_when_runtime_capability_changes() -> None:
+    async def scenario() -> None:
+        summary_started = asyncio.Event()
+        summary_cancelled = asyncio.Event()
+
+        class _Runtime:
+            def __init__(self, channel_id: str, *, probe_support: bool = True) -> None:
+                self.channel_id = channel_id
+                self.provider = "test"
+                self.protocol = "openai_chat"
+                self._support_calls = 0
+                self._probe_support = probe_support
+
+            def supports(self, capability: str) -> bool:
+                if capability != "vision":
+                    return False
+                self._support_calls += 1
+                if self.channel_id == "primary" and self._support_calls == 1:
+                    return self._probe_support
+                return self.channel_id in {"primary", "summary"}
+
+            async def stream(
+                self,
+                request: ChatRequest,
+                *,
+                context: ConversationContext | None = None,
+                cancel_event: asyncio.Event | None = None,
+            ) -> AsyncIterator[object]:
+                del cancel_event
+                current = context or ConversationContext("profile", "session", "turn", 0)
+                if self.channel_id == "summary":
+                    summary_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        summary_cancelled.set()
+                    return
+                if self.channel_id == "primary":
+                    yield TextDelta(current, "视觉主渠道直接回答")
+                    yield TurnFinished(current)
+                    return
+                yield TextDelta(current, "视觉主渠道直接回答")
+                yield TurnFinished(current)
+
+            async def aclose(self) -> None:
+                return None
+
+        runtimes = {
+            "primary": _Runtime("primary", probe_support=False),
+            "direct": _Runtime("direct"),
+            "summary": _Runtime("summary"),
+        }
+        router = ModelRouter(
+            [
+                ChannelConfig(
+                    "primary",
+                    base_url="https://primary.invalid/v1",
+                    model="main-model",
+                    capabilities=("streaming",),
+                    retry=RetryPolicy(max_attempts=1, initial_delay_seconds=0),
+                ),
+                ChannelConfig(
+                    "direct",
+                    base_url="https://direct.invalid/v1",
+                    model="direct-model",
+                    capabilities=("streaming", "vision"),
+                    priority=20,
+                ),
+                ChannelConfig(
+                    "summary",
+                    base_url="https://summary.invalid/v1",
+                    model="vision-model",
+                    capabilities=("streaming", "vision"),
+                    priority=30,
+                ),
+            ],
+            routes={
+                "dialogue": {"channel": "primary"},
+                "vision": {"channel": "summary"},
+            },
+            adapter_factory=lambda channel: channel.id,
+            runtime_factory=lambda _adapter, channel: runtimes[channel.id],
+        )
+
+        response = await asyncio.wait_for(router.complete(_image_request()), timeout=1)
+
+        assert response.text == "视觉主渠道直接回答"
+        assert summary_started.is_set()
+        assert summary_cancelled.is_set()
+
+    asyncio.run(scenario())
+
+
 def test_cancelled_vision_attempt_does_not_count_as_channel_failure() -> None:
     cancelled = _RecordingAdapter(
         "不会返回",

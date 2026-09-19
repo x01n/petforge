@@ -41,7 +41,7 @@ def _selection(
     )
 
 
-def test_default_registry_binds_real_vulkan_factory_and_fails_without_sprite() -> None:
+def test_default_registry_requires_live2d_vulkan_provider() -> None:
     registry = RendererRegistry.default()
 
     assert registry.backends == ("opengl", "web_live2d", "sprite", "vulkan")
@@ -67,7 +67,7 @@ def test_default_registry_binds_real_vulkan_factory_and_fails_without_sprite() -
     assert selection.compatibility_alias == "vllank"
     assert result.state is RendererInitializationState.UNAVAILABLE
     assert result.renderer is None
-    assert "Vulkan" in result.reason
+    assert "Vulkan rendering is unavailable" in result.reason
 
 
 def test_reserved_vulkan_resource_reload_is_explicitly_unavailable(tmp_path: Path) -> None:

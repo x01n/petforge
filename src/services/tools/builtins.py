@@ -11,6 +11,7 @@ import io
 import re
 import shutil
 import subprocess
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from threading import Event, Lock, Thread
@@ -487,6 +488,7 @@ def register_builtin_tools(
     platform: object,
     pet_controller: object,
     scheduler: object | None = None,
+    trigger_service: object | None = None,
     tts: object | None = None,
     asr: object | None = None,
     asr_provider: Callable[[], object | None] | None = None,
@@ -1065,6 +1067,60 @@ def register_builtin_tools(
 
         return await move(arguments, context, force_internal=True)
 
+    async def list_live2d_models(
+        arguments: Mapping[str, Any], context: ToolCallContext
+    ) -> Mapping[str, Any]:
+        """列出当前资源树可用 Live2D 模型，只暴露资源相对键。"""
+
+        del arguments, context
+        available = _call(pet_controller, "available_models")
+        if inspect.isawaitable(available):
+            available = await available
+        if not isinstance(available, (list, tuple)):
+            return {"status": "unavailable", "reason": "模型目录暂不可用"}
+        models: list[str] = []
+        for item in available:
+            text = str(item or "").strip()
+            if text and text not in models:
+                models.append(text)
+        return {
+            "status": "completed",
+            "models": models,
+            "count": len(models),
+        }
+
+    async def switch_live2d_model(
+        arguments: Mapping[str, Any], context: ToolCallContext
+    ) -> Mapping[str, Any]:
+        """切换当前 Live2D 模型；回显只包含资源相对键与状态。"""
+
+        del context
+        model_key = str(arguments.get("model_key", "") or "").strip()
+        if not model_key or len(model_key) > 512 or any(char in model_key for char in "\r\n\x00"):
+            return {"status": "failed", "reason": "模型键不可用"}
+        result = _call(pet_controller, "switch_live2d_model", model_key)
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, Mapping):
+            return {"status": "failed", "reason": "模型切换回执不可用"}
+        safe: dict[str, object] = {
+            "status": str(result.get("status", "unavailable") or "unavailable"),
+            "model_key": model_key,
+        }
+        # 宿主回执可能携带绝对路径；只透传状态与确认后的资源键。
+        reason = result.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            safe["reason"] = reason[:256]
+        if str(safe.get("status", "")).lower() not in {
+            "unavailable",
+            "failed",
+            "denied",
+        }:
+            safe["persistence_status"] = str(
+                result.get("persistence_status", "pending") or "pending"
+            )
+        return safe
+
     async def expression(
         arguments: Mapping[str, Any], context: ToolCallContext
     ) -> Mapping[str, Any]:
@@ -1122,6 +1178,7 @@ def register_builtin_tools(
         if not text or len(text) > 2000:
             raise ValueError("speech text is invalid")
         mood = str(arguments.get("mood", "neutral"))
+        silent = bool(arguments.get("silent", False))
         visual_result = _call(pet_controller, "speak", text, mood=mood)
         if inspect.isawaitable(visual_result):
             visual_result = await visual_result
@@ -1183,6 +1240,9 @@ def register_builtin_tools(
             generation_id,
             mode,
         )
+        if silent:
+            # 模型显式要求本次不发声：正文由视觉/气泡展示，语音队列跳过。
+            return {"status": "silent", "rendered": rendered, "segments": []}
         result = _call(
             tts,
             "enqueue_text",
@@ -1305,6 +1365,8 @@ def register_builtin_tools(
         # 只有调用方显式提供元数据时才传入新参数，保持旧宿主的
         # ``upsert`` 鸭子类型兼容；当前 SchedulerService 会进一步严格
         # 校验 ``require_user_active`` 的布尔值。
+        # 频率下限在 SchedulerService 内生效；低于下限的表达式会以
+        # 明确 reason 返回，分支返回值保持与其他入口一致的 Mapping。
         if "metadata" in arguments:
             metadata = arguments.get("metadata")
             schedule_kwargs["metadata"] = (
@@ -1313,7 +1375,83 @@ def register_builtin_tools(
         result = _call(scheduler, "upsert", **schedule_kwargs)
         if inspect.isawaitable(result):
             result = await result
-        return dict(result) if isinstance(result, Mapping) else {"status": "scheduled"}
+        output = dict(result) if isinstance(result, Mapping) else {"status": "scheduled"}
+        # 描述性回执给模型足够信息续写下一步；元数据保持可读但不含密钥，
+        # 已由 SchedulerService 严格校验 require_user_active。
+        if "owner" in output:
+            output["owner"] = context.profile_id if str(output.get("owner", "")) else ""
+        return output
+
+    async def list_schedules(
+        arguments: Mapping[str, Any], context: ToolCallContext
+    ) -> Mapping[str, Any]:
+        """列出当前会话创建的定时任务，供模型回读自己的提醒。"""
+
+        del arguments
+        if scheduler is None:
+            return {"status": "unavailable", "reason": "调度器未启用"}
+        owner = f"{context.profile_id}:{context.session_id}"
+        list_call = _call(scheduler, "list_tasks", owner=owner)
+        if inspect.isawaitable(list_call):
+            list_call = await list_call
+        tasks = list(list_call) if isinstance(list_call, (list, tuple)) else []
+        rows = []
+        for item in tasks:
+            if not isinstance(item, Mapping):
+                continue
+            rows.append(
+                {
+                    "task_id": str(item.get("task_id", ""))[:128],
+                    "name": str(item.get("name", ""))[:128],
+                    "expression": str(item.get("expression", ""))[:128],
+                    "enabled": bool(item.get("enabled", True)),
+                    "next_run_at": float(item.get("next_run_at", 0.0) or 0.0),
+                    "metadata": dict(item.get("metadata") or {}),
+                }
+            )
+        return {"status": "completed", "tasks": tuple(rows), "count": len(rows)}
+
+    async def remove_schedule(
+        arguments: Mapping[str, Any], context: ToolCallContext
+    ) -> Mapping[str, Any]:
+        """删除当前会话创建的定时任务；只能删除自己属主的任务。"""
+
+        task_id = str(arguments.get("task_id") or "").strip()
+        if not task_id or len(task_id) > 128 or any(char in task_id for char in "\r\n\x00"):
+            return {"status": "failed", "reason": "任务标识不可用"}
+        if scheduler is None:
+            return {"status": "unavailable", "reason": "调度器未启用"}
+        owner = f"{context.profile_id}:{context.session_id}"
+        result = _call(scheduler, "remove", task_id=task_id, owner=owner)
+        if inspect.isawaitable(result):
+            result = await result
+        return {"status": "removed" if result else "unchanged"}
+
+    async def define_trigger(
+        arguments: Mapping[str, Any], context: ToolCallContext
+    ) -> Mapping[str, Any]:
+        """创建窗口停留等事件触发器；动作执行前仍走统一审批管线。"""
+
+        if trigger_service is None:
+            return {"status": "unavailable", "reason": "触发器服务未启用"}
+        owner = f"{context.profile_id}:{context.session_id}"
+        requested_id = str(arguments.get("trigger_id") or "").strip()
+        trigger_id = requested_id or f"trigger-{uuid.uuid4().hex[:12]}"
+        if len(trigger_id) > 128 or any(char in trigger_id for char in "\r\n\x00"):
+            return {"status": "failed", "reason": "触发器标识不可用"}
+        register_kwargs: dict[str, object] = {
+            "trigger_id": trigger_id,
+            "event_name": str(arguments.get("event_name") or "").strip(),
+            "action": dict(arguments.get("action") or {}),
+            "owner": owner,
+        }
+        conditions_mapping = dict(arguments.get("conditions") or {})
+        if conditions_mapping:
+            register_kwargs["metadata"] = {"conditions": conditions_mapping}
+        result = _call(trigger_service, "register", **register_kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return {"status": "registered", **(dict(result) if isinstance(result, Mapping) else {})}
 
     async def run_command(
         arguments: Mapping[str, Any], context: ToolCallContext
@@ -1701,7 +1839,7 @@ def register_builtin_tools(
             ),
             ToolSpec(
                 "pet:speak",
-                "将短句排入流式语音队列",
+                "将短句排入流式语音队列；本次不想发声时设置 silent: true，正文仍显示",
                 {
                     "type": "object",
                     "properties": {
@@ -1710,6 +1848,7 @@ def register_builtin_tools(
                         "language": {"type": "string", "maxLength": 16},
                         "voice": {"type": "string", "minLength": 1, "maxLength": 128},
                         "role": {"type": "string", "maxLength": 128},
+                        "silent": {"type": "boolean"},
                     },
                     "required": ["text"],
                     "additionalProperties": False,
@@ -1763,6 +1902,34 @@ def register_builtin_tools(
                 read_only=True,
             ),
             ToolSpec(
+                "pet:list_models",
+                "列出当前资源目录中可用 Live2D 模型，只暴露资源相对键",
+                {"type": "object", "properties": {}, "additionalProperties": False},
+                list_live2d_models,
+                RiskLevel.LOW,
+                "pet_control",
+                read_only=True,
+            ),
+            ToolSpec(
+                "pet:switch_model",
+                "把桌宠切换到指定的 Live2D 模型资源键",
+                {
+                    "type": "object",
+                    "properties": {
+                        "model_key": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512,
+                        }
+                    },
+                    "required": ["model_key"],
+                    "additionalProperties": False,
+                },
+                switch_live2d_model,
+                RiskLevel.MEDIUM,
+                "pet_control",
+            ),
+            ToolSpec(
                 "pet:set_click_through",
                 "切换桌宠窗口的点击穿透状态；高风险状态需要确认",
                 {
@@ -1777,7 +1944,12 @@ def register_builtin_tools(
             ),
             ToolSpec(
                 "scheduler:upsert",
-                "创建或更新桌宠定时任务",
+                (
+                    "创建或更新桌宠定时任务；每天同一时刻的提醒用 daily:HH:MM"
+                    "（24 小时制），周期用 every:<数值><ms、s、m 或 h>；"
+                    "action 是工具身份与参数的结构；凌晨提醒配合 "
+                    "metadata.require_user_active 只在本机活跃时执行"
+                ),
                 {
                     "type": "object",
                     "properties": {
@@ -1791,6 +1963,51 @@ def register_builtin_tools(
                     "additionalProperties": False,
                 },
                 schedule,
+                RiskLevel.MEDIUM,
+                "scheduler",
+            ),
+            ToolSpec(
+                "scheduler:list",
+                "列出模型自己创建的定时任务，用于回读提醒并清理过期项目",
+                {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                list_schedules,
+                RiskLevel.LOW,
+                "scheduler",
+            ),
+            ToolSpec(
+                "scheduler:remove",
+                "删除模型自己创建的一个定时任务",
+                {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    },
+                    "required": ["task_id"],
+                    "additionalProperties": False,
+                },
+                remove_schedule,
+                RiskLevel.LOW,
+                "scheduler",
+            ),
+            ToolSpec(
+                "scheduler:set_trigger",
+                "创建窗口停留、用户活跃等事件触发器；动作执行前仍走统一审批管线",
+                {
+                    "type": "object",
+                    "properties": {
+                        "trigger_id": {"type": "string", "maxLength": 128},
+                        "event_name": {"type": "string", "minLength": 1, "maxLength": 64},
+                        "conditions": {"type": "object"},
+                        "action": {"type": "object"},
+                    },
+                    "required": ["event_name", "action"],
+                    "additionalProperties": False,
+                },
+                define_trigger,
                 RiskLevel.MEDIUM,
                 "scheduler",
             ),

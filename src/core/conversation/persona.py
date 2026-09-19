@@ -260,6 +260,9 @@ class PersonaPromptBundle:
         sections.append("【桌宠人设】\n" + "\n".join(profile_lines))
         if prompts.tool_guidance:
             sections.append("【工具规则】\n" + prompts.tool_guidance)
+        from services.directives import directives_output_hint
+
+        sections.append("【平台指令】\n" + directives_output_hint(persona.language or ""))
         return "\n\n".join(section for section in sections if section.strip())
 
 

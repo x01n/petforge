@@ -26,6 +26,10 @@ from services.ipc import IPCProcessError, JSONLSubprocessClient
 
 logger = logging.getLogger(__name__)
 
+# 取消后的模型重建窗口：取消路径自身不清标志，而是 5 秒内自动重启预热，
+# 与 TTS 的进程保留策略对齐。若后续改造为常驻模型保留，这里一并收敛。
+ASR_CANCEL_RETRY_SECONDS = 5.0
+
 
 class ASRService:
     def __init__(
@@ -108,6 +112,9 @@ class ASRService:
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
         self._started = False
+        self._asr_start_failures = 0
+        self._cancel_retry_at = 0.0
+        self._cancel_retry_task: asyncio.Task[None] | None = None
 
     @property
     def running(self) -> bool:
@@ -198,6 +205,33 @@ class ASRService:
                         "error_type": type(exc).__name__,
                     },
                 )
+                # 仅对"进程退出类"故障做短窗口自动重试，避免模型文件损坏或
+                # 协议不兼容时无限烧启动预算。任何一次成功起点后计数即清零。
+                self._asr_start_failures += 1
+                reason_code = (
+                    exc.reason_code if isinstance(exc, IPCProcessError) else type(exc).__name__
+                )
+                eligible_reason = reason_code in (
+                    "worker_exited",
+                    "spawn_failed",
+                    "response_timeout",
+                )
+                if self._asr_start_failures <= 2 and eligible_reason:
+                    log_event(
+                        logger,
+                        "asr.model.load.retry",
+                        component="asr.service",
+                        status="retrying",
+                        level=logging.INFO,
+                        fields={
+                            "backend": self.backend,
+                            "model": self.model_name,
+                            "attempt": self._asr_start_failures + 1,
+                            "reason_code": reason_code,
+                        },
+                    )
+                    return await self.start()
+                self._asr_start_failures = 0
                 return self._set_unavailable(
                     "unavailable",
                     f"ASR initialization failed: {type(exc).__name__}",
@@ -205,6 +239,7 @@ class ASRService:
             finally:
                 progress_task.cancel()
                 await asyncio.gather(progress_task, return_exceptions=True)
+            self._asr_start_failures = 0
             self._started = True
             self._health = ASRHealth(
                 "ready",
@@ -360,8 +395,16 @@ class ASRService:
                         await asyncio.wait_for(process.wait(), timeout=2.0)
                     except TimeoutError:
                         pass
+                # 与 TTS/cancel 对齐：等待窗口保持极小以免把仍持有模型的可用进程
+                # 错误判死；未退出时进程与模型直接复用，无需重建。
+                if self.running:
+                    raise asyncio.CancelledError
+                # 旧式兼容路径：worker 在 cancel 请求后真正 break/退出，
+                # 重新热身加载模型再继续服务。下一次 start 会基于
+                # _poisoned 状态重新拉起进程。
                 self._started = False
                 self._set_unavailable("unavailable", "ASR request was cancelled")
+                self._schedule_cancel_retry()
                 raise asyncio.CancelledError
             confidence_value = event.payload.get("confidence")
             confidence = (
@@ -390,6 +433,44 @@ class ASRService:
             if self._transcription_task is current_task:
                 self._transcription_task = None
             self._transcribe_claimed = False
+
+    def _schedule_cancel_retry(self) -> None:
+        """安排一次有界延迟的模型重载，不阻塞取消路径。
+
+        该路径只对取消后的单次重建负责；若产品需要替换为常驻恢复策略，
+        可在此处统一收敛。
+        """
+
+        if self._closing or self._closed:
+            return
+        task = self._cancel_retry_task
+        if task is not None and not task.done():
+            return
+        self._cancel_retry_at = time.monotonic() + ASR_CANCEL_RETRY_SECONDS
+        self._cancel_retry_task = asyncio.create_task(
+            self._cancel_retry_once(), name="meapet-asr-cancel-retry"
+        )
+
+    async def _cancel_retry_once(self) -> None:
+        remaining = max(0.0, self._cancel_retry_at - time.monotonic())
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        if self._closing or self._closed:
+            return
+        try:
+            health = await self.start()
+        except asyncio.CancelledError:
+            raise
+        except (IPCProcessError, OSError, RuntimeError, TypeError, ValueError):
+            health = self._set_unavailable("unavailable", "ASR model restore failed")
+        log_event(
+            logger,
+            "asr.model.restore",
+            component="asr.service",
+            status="ready" if health.ready else "unavailable",
+            level=logging.INFO if health.ready else logging.WARNING,
+            fields={"backend": self.backend, "model": self.model_name},
+        )
 
     async def cancel(self, request_id: str) -> bool:
         """取消模型加载中的调用，或向正在推理的 worker 发送协议中断。"""

@@ -25,6 +25,8 @@ from .content import (
 )
 from .protocol import (
     MCP_PROTOCOL_VERSION,
+    MCP_TOOL_LIST_MAX_ENTRIES,
+    MCP_TOOL_LIST_MAX_PAGES,
     MCPCloseHandler,
     MCPConnectionHandler,
     MCPNotificationDispatcher,
@@ -534,12 +536,14 @@ class StdioMCPClient:
         tools: list[MCPTool] = []
         cursor: str | None = None
         seen_cursors: set[str] = set()
-        while True:
+        for _page in range(MCP_TOOL_LIST_MAX_PAGES):
             params: dict[str, Any] = {} if cursor is None else {"cursor": cursor}
             result = await self.request("tools/list", params)
             raw_tools = result.get("tools", ())
             if not isinstance(raw_tools, list):
                 raise MCPProtocolError("MCP tools/list result.tools must be a list")
+            if len(tools) + len(raw_tools) > MCP_TOOL_LIST_MAX_ENTRIES:
+                raise MCPProtocolError("MCP tools/list exceeds the entry limit")
             for raw_tool in raw_tools:
                 if not isinstance(raw_tool, Mapping):
                     raise MCPProtocolError("MCP tools/list tool entry must be an object")
@@ -549,14 +553,14 @@ class StdioMCPClient:
                     raise MCPProtocolError("MCP tools/list contains an invalid tool") from exc
             next_cursor = result.get("nextCursor", result.get("next_cursor"))
             if next_cursor is None:
-                break
+                return tuple(tools)
             if not isinstance(next_cursor, str) or not next_cursor.strip():
                 raise MCPProtocolError("MCP tools/list nextCursor must be a non-empty string")
             cursor = next_cursor
             if cursor in seen_cursors:
                 raise MCPProtocolError("MCP tools/list pagination repeated a cursor")
             seen_cursors.add(cursor)
-        return tuple(tools)
+        raise MCPProtocolError("MCP tools/list exceeds the page limit")
 
     async def call_tool(
         self, name: str, arguments: Mapping[str, Any] | None = None

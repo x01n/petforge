@@ -134,7 +134,6 @@ def test_reload_restores_old_instance_when_new_generation_fails() -> None:
     asyncio.run(scenario())
 
 
-
 def test_reconfigure_reports_restored_old_instance_as_failure() -> None:
     events: list[str] = []
     manager = ModuleManager()
@@ -271,6 +270,46 @@ def test_reconfigure_replaces_returned_instance_and_advances_generation() -> Non
         assert events == [
             "old:load",
             "old:start",
+            "old:stop",
+            "old:unload",
+            "new:load",
+            "new:start",
+        ]
+        await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_reconfigure_replaces_reload_configuration_result_and_advances_generation() -> None:
+    events: list[str] = []
+    manager = ModuleManager()
+
+    class Reloadable(_Module):
+        async def reload_configuration(self, _configuration):
+            events.append("old:prepare")
+            return _Module(events, "new")
+
+    manager.register(ModuleDescriptor("tts", lambda context: Reloadable(events, "old")))
+
+    async def scenario() -> None:
+        await manager.start()
+        old_gate = manager._records["tts"].gate
+        assert old_gate is not None
+        before_generation = int(manager.status("tts")["generation"])
+
+        result = await manager.reconfigure({"voice": "new"})
+
+        assert result["status"] == "reloaded"
+        assert result["reloaded"] == ("tts",)
+        status = manager.status("tts")
+        assert status["state"] == ModuleState.RUNNING.value
+        assert int(status["generation"]) > before_generation
+        assert not old_gate.active
+        assert manager._records["tts"].instance is not None
+        assert events == [
+            "old:load",
+            "old:start",
+            "old:prepare",
             "old:stop",
             "old:unload",
             "new:load",

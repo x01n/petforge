@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import wave
 from dataclasses import dataclass
 from pathlib import Path
 
 from core.rendering.resources import is_valid_webp, validate_model3_description
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -48,8 +51,36 @@ def _inspect_wav(path: Path) -> AudioAsset:
 
 
 def _file_is_nonempty(path: Path) -> bool:
+    """判定文件是否含有真实资源数据，拒绝 Git LFS 指针占位文件。
+
+    LFS 指针满足三行结构：``version https://git-lfs.github.com/spec/v1``、
+    ``oid sha256:<hex>``、``size <n>``。若 ``git lfs pull`` 从未执行，
+    仓库内只有数百字节的指针文本，把它当成权重会点亮 TTS 能力并让加载
+    阶段在异步处失败；这里按缺失处理并记录 warning，不中断启动。
+    """
     try:
-        return path.is_file() and path.stat().st_size > 0
+        if not path.is_file():
+            return False
+        size = path.stat().st_size
+        if size <= 0:
+            return False
+        if size <= 1024:
+            with path.open("rb") as stream:
+                head = stream.read(256)
+            if head.startswith(b"version https://git-lfs.github.com/spec/v1"):
+                logger.warning("resource file is a Git LFS pointer: %s", path)
+                return False
+            lines = head.decode("utf-8", errors="replace").splitlines()
+            if len(lines) == 3 and all(
+                (
+                    lines[0].startswith("version "),
+                    lines[1].startswith("oid sha256:"),
+                    lines[2].startswith("size "),
+                )
+            ):
+                logger.warning("resource file is a Git LFS pointer: %s", path)
+                return False
+        return True
     except OSError:
         return False
 
@@ -72,16 +103,20 @@ def inspect_resources(root: str | Path) -> ResourceInventory:
     if legacy_model_paths:
         warnings.append("Live2D .model.json descriptors are unsupported without an exact schema")
     if model3_paths and len(model_paths) != len(model3_paths):
-        warnings.append("Live2D .model3.json descriptors are invalid; sprite fallback is required")
+        warnings.append(
+            "Live2D .model3.json descriptors are invalid; Live2D rendering is unavailable"
+        )
     if not model_paths:
-        warnings.append("no usable Live2D model3 descriptor was found; sprite fallback is required")
+        warnings.append(
+            "no usable Live2D model3 descriptor was found; Live2D rendering is unavailable"
+        )
 
     sprite_paths = tuple((resource_root / "sprites").glob("*.webp"))
     sprite_count = sum(1 for path in sprite_paths if is_valid_webp(path))
     if sprite_paths and sprite_count != len(sprite_paths):
         warnings.append("invalid WebP sprite files were ignored")
     if not sprite_count:
-        warnings.append("no WebP sprite fallback was found")
+        warnings.append("no WebP sprite resource was found for explicit sprite rendering")
 
     # 资源包当前使用 ``vits_models`` 目录；保留 ``models`` 作为显式兼容目录。
     # 只收集实际存在的权重文件，不能因目录名称存在就宣称 GSV 可用。

@@ -14,7 +14,7 @@ import os
 from collections.abc import Mapping
 from ctypes import wintypes
 from threading import RLock
-from time import sleep, time
+from time import monotonic, sleep, time
 from typing import Any, cast
 
 from .protocol import CapabilityState, PlatformCapability, PlatformSnapshot, WindowContext
@@ -137,6 +137,8 @@ _AUTOMATION_MAX_STEPS = 16
 _AUTOMATION_MAX_TEXT_LENGTH = 512
 _AUTOMATION_MAX_WAIT_MS = 2_000
 _AUTOMATION_MAX_WAIT_TOTAL_MS = 5_000
+_AUTOMATION_FOREGROUND_TIMEOUT_MS = 250
+_AUTOMATION_FOREGROUND_POLL_MS = 10
 _AUTOMATION_COORDINATE_LIMIT = 1_000_000
 _AUTOMATION_VIRTUAL_KEYS = {
     "backspace": 0x08,
@@ -401,6 +403,30 @@ def _automation_failure(reason: str, *, completed: list[dict[str, object]]) -> d
         "reason": reason,
         "completed_steps": tuple(completed),
     }
+
+
+def _wait_for_foreground_window(user32: object, hwnd: int) -> bool:
+    """等待 ``SetForegroundWindow`` 的异步 z-order 结果可被回读。
+
+    Windows 可能先接受前台切换请求，再在稍后的消息循环中更新真实前台窗口。
+    输入注入必须等到回读确认，避免把后续键盘事件发送给旧窗口；等待有严格上限，
+    不会让自动化批处理无限阻塞。
+    """
+
+    getter = getattr(user32, "GetForegroundWindow", None)
+    if not callable(getter):
+        return False
+    deadline = monotonic() + (_AUTOMATION_FOREGROUND_TIMEOUT_MS / 1000.0)
+    while True:
+        try:
+            if _as_int(getter()) == hwnd:
+                return True
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False
+        sleep(min(_AUTOMATION_FOREGROUND_POLL_MS / 1000.0, remaining))
 
 
 def _is_windows(value: bool | None = None) -> bool:
@@ -775,16 +801,16 @@ def _psutil_processes(
                 if pid <= 0:
                     continue
                 username = info.get("username")
-                if (
-                    current_user
-                    and username
-                    and not _windows_identity_matches(
+                # 已知当前用户时必须能证明进程归属该用户。Windows
+                # 权限不足可能使 psutil 返回空 username；此时不能把
+                # 未知身份的进程 fail-open 暴露给桌面上下文工具。
+                if current_user:
+                    if not username or not _windows_identity_matches(
                         username,
                         current_user,
                         environ=environ,
-                    )
-                ):
-                    continue
+                    ):
+                        continue
                 processes.append(
                     {
                         "pid": pid,
@@ -1968,19 +1994,9 @@ class WindowsDesktopPlatform:
                     return _automation_failure(
                         "Win32 window activation failed", completed=completed
                     )
-                foreground = getattr(user32, "GetForegroundWindow", None)
-                if not callable(foreground):
+                if not _wait_for_foreground_window(user32, hwnd):
                     return _automation_failure(
-                        "Win32 foreground readback is unavailable", completed=completed
-                    )
-                try:
-                    if _as_int(foreground()) != hwnd:
-                        return _automation_failure(
-                            "Win32 foreground readback did not match", completed=completed
-                        )
-                except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-                    return _automation_failure(
-                        "Win32 foreground readback failed", completed=completed
+                        "Win32 foreground readback did not match", completed=completed
                     )
                 completed.append({"index": index, "type": step_type, "status": "completed"})
                 continue

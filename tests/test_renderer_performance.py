@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from gui.renderers import assets
 from gui.renderers.assets import RenderAssetInventory, RendererRegistry
 from gui.renderers.protocol import CANONICAL_RENDERER_BACKEND_CHOICES, normalize_renderer_backend
-from gui.renderers.threed import probe_qt_vulkan_runtime
+from gui.renderers.threed import probe_live2d_vulkan_runtime, probe_qt_vulkan_runtime
 
 
 def test_explicit_sprite_selection_skips_live2d_runtime_probes(monkeypatch) -> None:
@@ -126,6 +126,64 @@ def test_qt_vulkan_probe_requires_exact_scenegraph_bindings_and_loader() -> None
         "present:QSGRendererInterface.GraphicsApi.Vulkan",
         "loader:libvulkan.so.1",
     )
+
+
+def test_live2d_vulkan_probe_requires_the_complete_provider_contract() -> None:
+    missing = probe_live2d_vulkan_runtime(importer=lambda _name: SimpleNamespace())
+    assert missing.available is False
+    assert "contract is incomplete" in missing.detail
+    assert "missing:live2d.vulkan.create" in missing.evidence
+
+    complete = probe_live2d_vulkan_runtime(
+        importer=lambda _name: SimpleNamespace(
+            create=lambda: None,
+            load_model=lambda: None,
+            resize=lambda: None,
+            render=lambda: None,
+            shutdown=lambda: None,
+        )
+    )
+    assert complete.available is True
+    assert complete.evidence == (
+        "present:live2d.vulkan.create",
+        "present:live2d.vulkan.load_model",
+        "present:live2d.vulkan.resize",
+        "present:live2d.vulkan.render",
+        "present:live2d.vulkan.shutdown",
+    )
+
+
+def test_default_vulkan_probe_does_not_accept_qt_vulkan_without_live2d_provider(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    model_root = tmp_path / "resources" / "live2d" / "model" / "demo"
+    model_root.mkdir(parents=True)
+    (model_root / "demo.moc3").write_bytes(b"moc")
+    (model_root / "texture.png").write_bytes(b"texture")
+    (model_root / "demo.model3.json").write_text(
+        '{"FileReferences":{"Moc":"demo.moc3","Textures":["texture.png"]}}',
+        encoding="utf-8",
+    )
+    inventory = assets.probe_render_assets(tmp_path / "resources")
+    monkeypatch.setattr(
+        assets,
+        "probe_qt_vulkan_runtime",
+        lambda: SimpleNamespace(available=True, detail="Qt Vulkan ready", evidence=("qt",)),
+    )
+    monkeypatch.setattr(
+        assets,
+        "probe_live2d_vulkan_runtime",
+        lambda: SimpleNamespace(
+            available=False,
+            detail="Live2D Vulkan provider is unavailable",
+            evidence=("missing:live2d.vulkan",),
+        ),
+    )
+
+    selection = RendererRegistry.default().select(inventory, requested_backend="vulkan")
+    assert selection.backend == "unavailable"
+    assert "Live2D Vulkan provider" in selection.reason
 
 
 def test_vulkan_factory_without_bound_probe_never_reports_available() -> None:

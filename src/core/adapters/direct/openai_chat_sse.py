@@ -34,6 +34,16 @@ except ImportError:  # pragma: no cover - 运行时由构造函数给出明确�
 
 _PROTECTED_HEADERS = frozenset({"authorization", "content-type", "accept"})
 
+# 渠道未显式配置超时（timeout_seconds 为 0）时叠加的默认总时限。
+# 0 在 ChannelConfig 中的语义是“由客户端决定”，而非零超时；若不叠加，
+# httpx 无超时且 SSE 可能无限挂起，重试回退永不触发。
+_DEFAULT_TOTAL_TIMEOUT_SECONDS = 60.0
+# drain 队列单次读取的等待上限：正常情况下 token 会连续到达，只有在流
+# 静默时才会命中，用于及时观察到取消事件而不引入新的总时限。
+_DRAIN_TIMEOUT_SECONDS = 10.0
+# 取消监控的轮询粒度；桥接的外部取消事件以该步长进入 drain 循环。
+_CANCEL_POLL_GRACE_SECONDS = 0.05
+
 
 def _as_jsonable_content(content: object) -> object:
     if isinstance(content, Mapping):
@@ -130,8 +140,9 @@ class OpenAIChatSSEAdapter(ProviderAdapter):
                 raise AdapterConfigurationError("httpx is required for OpenAIChatSSEAdapter")
             # 模型渠道地址由配置明确给出；不继承 HTTP_PROXY/HTTPS_PROXY，
             # 防止本地回环端点或用户指定代理被透明改写。
-            # 与提供方适配器保持一致：流式思考可能长时间没有新字节，
-            # 由渠道 timeout_seconds 负责总时限，不使用 httpx 默认 5 秒读取超时。
+            # 流式思考可能长时间没有新字节，httpx 层禁用默认 5 秒读取超时；
+            # 总时限由 ProviderAdapterRuntime 的默认总时限常量兜底，渠道
+            # 显式配置 timeout_seconds 时仍优先使用渠道值。
             client = httpx.AsyncClient(trust_env=False, timeout=None)
         self._client = client
         self._endpoint_override = str(endpoint or "").strip()
@@ -409,21 +420,18 @@ class OpenAIChatSSEAdapter(ProviderAdapter):
             state["event_emitted"] = True
         return tuple(events)
 
-    async def stream(
+    async def _drain_under_timeout(
         self,
         request: ChatRequest,
+        current_context: ConversationContext,
+        cancellation: asyncio.Event,
+        state: dict[str, Any],
         *,
-        context: ConversationContext | None = None,
-        cancel_event: asyncio.Event | None = None,
+        timeout_seconds: float,
     ) -> AsyncIterator[ProviderEvent]:
-        if self._closed:
-            raise ProviderAdapterError("adapter is closed", category="configuration")
-        current_context = ensure_context(context)
-        cancellation = cancel_event or asyncio.Event()
-        if cancellation.is_set():
-            raise AdapterCancelled()
-        state: dict[str, Any] = {"usage": {}, "done": False, "event_emitted": False}
-        try:
+        """在总时限与取消监控下消费单个流响应，超时映射为可重试错误。"""
+
+        async def inner() -> AsyncIterator[ProviderEvent]:
             stream_cm = await self._open_stream(request)
             async with stream_cm as response:
                 if cancellation.is_set():
@@ -445,6 +453,106 @@ class OpenAIChatSSEAdapter(ProviderAdapter):
                     usage=dict(state.get("usage") or {}),
                     response_model=str(state.get("response_model") or ""),
                 )
+
+        # drain 任务与消费者解耦：总时限到期时 finally 取消 pump，
+        # 取消能同步送达底层读取循环，把挂起的 httpx 读真正拆开。
+        queue: asyncio.Queue[ProviderEvent | BaseException] = asyncio.Queue()
+        drain_done = asyncio.Event()
+        _SENTINEL: object = object()
+
+        async def pump() -> None:
+            try:
+                async for event in inner():
+                    await queue.put(event)
+                await queue.put(_SENTINEL)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                await queue.put(exc)
+            finally:
+                drain_done.set()
+
+        async def waiter() -> None:
+            while not drain_done.is_set():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(drain_done.wait()),
+                        timeout=_CANCEL_POLL_GRACE_SECONDS,
+                    )
+                    return
+                except TimeoutError:
+                    if cancellation.is_set():
+                        pump_task.cancel()
+                        return
+
+        async def consume() -> AsyncIterator[ProviderEvent]:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=_DRAIN_TIMEOUT_SECONDS)
+                except TimeoutError:
+                    if drain_done.is_set():
+                        break
+                    continue
+                if item is _SENTINEL:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+
+        pump_task = asyncio.create_task(pump())
+        waiter_task = asyncio.create_task(waiter())
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                async for event in consume():
+                    yield event
+        except TimeoutError as exc:
+            raise ProviderAdapterError(
+                "provider request timed out",
+                category="timeout",
+                retryable=True,
+                before_first_event=not state.get("event_emitted", False),
+                cause=exc,
+            ) from exc
+        finally:
+            pump_task.cancel()
+            waiter_task.cancel()
+
+    async def stream(
+        self,
+        request: ChatRequest,
+        *,
+        context: ConversationContext | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AsyncIterator[ProviderEvent]:
+        if self._closed:
+            raise ProviderAdapterError("adapter is closed", category="configuration")
+        current_context = ensure_context(context)
+        cancellation = cancel_event or asyncio.Event()
+        if cancellation.is_set():
+            raise AdapterCancelled()
+        state: dict[str, Any] = {"usage": {}, "done": False, "event_emitted": False}
+        # 渠道 0/未配置时，总时限由 ProviderAdapterRuntime 的默认常量兜底；
+        # 直接使用本适配器的宿主仍叠加本底线，避免流无限挂起。
+        timeout = getattr(self.channel, "timeout_seconds", None)
+        if timeout is not None and float(timeout) > 0:
+            adjusted = self._drain_under_timeout(
+                request,
+                current_context,
+                cancellation,
+                state,
+                timeout_seconds=float(timeout),
+            )
+        else:
+            adjusted = self._drain_under_timeout(
+                request,
+                current_context,
+                cancellation,
+                state,
+                timeout_seconds=_DEFAULT_TOTAL_TIMEOUT_SECONDS,
+            )
+        try:
+            async for event in adjusted:
+                yield event
         except asyncio.CancelledError:
             raise
         except (ProviderAdapterError, AdapterCancelled):

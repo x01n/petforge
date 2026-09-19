@@ -6,7 +6,7 @@ import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from threading import RLock
-from time import time
+from time import sleep, time
 from typing import Any, cast
 
 from .protocol import (
@@ -1215,6 +1215,221 @@ def set_window_input_shape(
         )
 
 
+def _linux_automation_key(value: object) -> tuple[str, bool] | None:
+    """解析 X11 自动化按键，返回按键名称和是否需要 Shift。"""
+
+    if not isinstance(value, str):
+        return None
+    key = value.strip()
+    if not key:
+        return None
+    names = {
+        "backspace": "BackSpace",
+        "tab": "Tab",
+        "enter": "Return",
+        "shift": "Shift_L",
+        "ctrl": "Control_L",
+        "alt": "Alt_L",
+        "escape": "Escape",
+        "space": "space",
+        "page_up": "Prior",
+        "page_down": "Next",
+        "end": "End",
+        "home": "Home",
+        "left": "Left",
+        "up": "Up",
+        "right": "Right",
+        "down": "Down",
+        "insert": "Insert",
+        "delete": "Delete",
+        "win": "Super_L",
+    }
+    normalized = key.lower()
+    if normalized in names:
+        return (names[normalized], False)
+    if len(key) == 1 and key.isascii() and key.isprintable():
+        shifted = {
+            "!": "1",
+            "@": "2",
+            "#": "3",
+            "$": "4",
+            "%": "5",
+            "^": "6",
+            "&": "7",
+            "*": "8",
+            "(": "9",
+            ")": "0",
+            "_": "-",
+            "+": "=",
+            "{": "[",
+            "}": "]",
+            "|": "\\",
+            ":": ";",
+            '"': "'",
+            "<": ",",
+            ">": ".",
+            "?": "/",
+        }
+        if key in shifted:
+            return (shifted[key], True)
+        return (key.lower(), key.isalpha() and key.isupper())
+    if normalized.startswith("f") and normalized[1:].isdigit():
+        number = int(normalized[1:])
+        if 1 <= number <= 12:
+            return (f"F{number}", False)
+    return None
+
+
+def _linux_automation_failure(
+    reason: str, *, completed: list[dict[str, object]]
+) -> dict[str, object]:
+    """返回不含输入正文的 Linux 自动化失败结果。"""
+
+    return {
+        "status": "partial" if completed else "unavailable",
+        "backend": BACKEND_X11,
+        "reason": reason,
+        "completed": tuple(completed),
+    }
+
+
+def _linux_automation_window_id(value: object) -> int | None:
+    """按自动化契约解析 X11 窗口 ID。"""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if not isinstance(value, str) or not value.startswith("0x"):
+        return None
+    try:
+        parsed = int(value, 16)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _linux_automation_integer(value: object) -> int | None:
+    """读取严格 JSON 整数，拒绝布尔值和隐式转换。"""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return int(value)
+
+
+def _linux_automation_keycode(
+    display: object, keysym_module: object, value: object
+) -> tuple[int, bool] | None:
+    """把白名单按键解析为 X11 keycode。"""
+
+    parsed = _linux_automation_key(value)
+    if parsed is None:
+        return None
+    key_name, requires_shift = parsed
+    string_to_keysym = getattr(keysym_module, "string_to_keysym", None)
+    converter = getattr(display, "keysym_to_keycode", None)
+    if not callable(string_to_keysym) or not callable(converter):
+        return None
+    keysym = string_to_keysym(str(key_name))
+    if not keysym and len(str(key_name)) == 1:
+        keysym = ord(str(key_name))
+    if not keysym:
+        return None
+    try:
+        keycode = int(converter(keysym))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return (keycode, requires_shift) if keycode > 0 else None
+
+
+def _linux_automation_send_key(
+    display: object,
+    xtest_module: object,
+    x_module: object,
+    keysym_module: object,
+    value: object,
+    modifiers: Sequence[object],
+    repeat: int,
+    modifier_names: Mapping[str, object],
+) -> bool:
+    """通过 XTEST 发送一个有界按键序列。"""
+
+    key = _linux_automation_keycode(display, keysym_module, value)
+    if key is None or repeat < 1 or repeat > 5:
+        return False
+    if isinstance(modifiers, (str, bytes, bytearray)) or len(modifiers) > 3:
+        return False
+    modifier_codes: list[int] = []
+    for item in modifiers:
+        name = str(item).strip().lower()
+        if name not in modifier_names:
+            return False
+        parsed = _linux_automation_keycode(display, keysym_module, name)
+        if parsed is None or parsed[0] in modifier_codes:
+            return False
+        modifier_codes.append(parsed[0])
+    keycode, requires_shift = key
+    if requires_shift:
+        shift = _linux_automation_keycode(display, keysym_module, "shift")
+        if shift is None or shift[0] in modifier_codes:
+            return False
+        modifier_codes.append(shift[0])
+    fake_input = getattr(xtest_module, "fake_input", None)
+    key_press = getattr(x_module, "KeyPress", None)
+    key_release = getattr(x_module, "KeyRelease", None)
+    if not callable(fake_input) or key_press is None or key_release is None:
+        return False
+    try:
+        for modifier in modifier_codes:
+            fake_input(display, key_press, modifier)
+        for _ in range(repeat):
+            fake_input(display, key_press, keycode)
+            fake_input(display, key_release, keycode)
+        for modifier in reversed(modifier_codes):
+            fake_input(display, key_release, modifier)
+        synchronizer = getattr(display, "sync", None)
+        if not callable(synchronizer):
+            return False
+        synchronizer()
+        return True
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _linux_automation_send_text(
+    display: object,
+    xtest_module: object,
+    x_module: object,
+    keysym_module: object,
+    text: str,
+    modifier_names: Mapping[str, object],
+) -> bool:
+    """通过 XTEST 发送可打印 ASCII 按键文本。"""
+
+    if (
+        not text
+        or len(text) > 512
+        or any(
+            ord(character) < 32 or ord(character) == 127 or not character.isascii()
+            for character in text
+        )
+    ):
+        return False
+    for character in text:
+        if not _linux_automation_send_key(
+            display,
+            xtest_module,
+            x_module,
+            keysym_module,
+            character,
+            (),
+            1,
+            modifier_names,
+        ):
+            return False
+    return True
+
+
 class LinuxDesktopPlatform:
     """Linux 平台适配器门面。"""
 
@@ -1479,7 +1694,7 @@ class LinuxDesktopPlatform:
             return {"status": "unavailable", "reason": "click coordinates are invalid"}
         target_x = int(x)
         target_y = int(y)
-        if target_x < 0 or target_y < 0 or target_x > 1_000_000 or target_y > 1_000_000:
+        if abs(target_x) > 1_000_000 or abs(target_y) > 1_000_000:
             return {"status": "unavailable", "reason": "click coordinates are outside bounds"}
         if not isinstance(button, str):
             return {"status": "unavailable", "reason": "click button is unsupported"}
@@ -1529,14 +1744,236 @@ class LinuxDesktopPlatform:
         }
 
     def automation_batch(self, steps: object) -> Mapping[str, object]:
-        """Linux 尚无跨桌面会话的安全输入自动化实现，明确拒绝执行。"""
+        """在 X11/XTEST 上执行有限的跨应用自动化步骤。"""
 
-        del steps
-        return {
-            "status": "unavailable",
-            "backend": self.backend,
-            "reason": "desktop automation is only implemented for Windows",
-        }
+        if self.backend != BACKEND_X11:
+            return {
+                "status": "unavailable",
+                "backend": self.backend,
+                "reason": "desktop automation requires an X11 XTEST session",
+            }
+        if isinstance(steps, (str, bytes, bytearray)) or not isinstance(steps, (list, tuple)):
+            return {
+                "status": "unavailable",
+                "backend": BACKEND_X11,
+                "reason": "automation steps are invalid",
+            }
+        if not steps or len(steps) > 16:
+            return {
+                "status": "unavailable",
+                "backend": BACKEND_X11,
+                "reason": "automation step count is out of range",
+            }
+
+        display_module = _import_optional("Xlib.display")
+        x_module = _import_optional("Xlib.X")
+        xtest_module = _import_optional("Xlib.ext.xtest")
+        keysym_module = _import_optional("Xlib.XK")
+        display_class = getattr(display_module, "Display", None)
+        fake_input = getattr(xtest_module, "fake_input", None) if xtest_module else None
+        if (
+            not callable(display_class)
+            or x_module is None
+            or xtest_module is None
+            or not callable(fake_input)
+            or keysym_module is None
+        ):
+            return {
+                "status": "unavailable",
+                "backend": BACKEND_X11,
+                "reason": "python-xlib XTEST automation is unavailable",
+            }
+
+        display = None
+        completed: list[dict[str, object]] = []
+        total_wait_ms = 0
+        modifier_names = {"ctrl": True, "shift": True, "alt": True, "win": True}
+        try:
+            display_name = str(self._environment.get("DISPLAY", "") or "").strip()
+            if not display_name:
+                return {
+                    "status": "unavailable",
+                    "backend": BACKEND_X11,
+                    "reason": "DISPLAY is unavailable",
+                }
+            display = display_class(display_name)
+            has_extension = getattr(display, "has_extension", None)
+            if not callable(has_extension) or not has_extension("XTEST"):
+                return {
+                    "status": "unavailable",
+                    "backend": BACKEND_X11,
+                    "reason": "XTEST extension is unavailable",
+                }
+
+            for index, raw_step in enumerate(steps):
+                if not isinstance(raw_step, Mapping):
+                    return _linux_automation_failure(
+                        "automation step is invalid", completed=completed
+                    )
+                step_type = str(raw_step.get("type", "")).strip().lower()
+
+                if step_type == "wait":
+                    duration = _linux_automation_integer(raw_step.get("duration_ms"))
+                    if duration is None or duration < 0 or duration > 2_000:
+                        return _linux_automation_failure(
+                            "automation wait is out of range", completed=completed
+                        )
+                    total_wait_ms += duration
+                    if total_wait_ms > 5_000:
+                        return _linux_automation_failure(
+                            "automation total wait is out of range", completed=completed
+                        )
+                    if duration:
+                        sleep(duration / 1000.0)
+                    completed.append({"index": index, "type": step_type, "status": "completed"})
+                    continue
+
+                if step_type == "key":
+                    repeat = _linux_automation_integer(raw_step.get("repeat", 1))
+                    modifiers = raw_step.get("modifiers", ())
+                    if repeat is None or not isinstance(modifiers, (list, tuple)):
+                        return _linux_automation_failure(
+                            "automation key is invalid", completed=completed
+                        )
+                    if not _linux_automation_send_key(
+                        display,
+                        xtest_module,
+                        x_module,
+                        keysym_module,
+                        raw_step.get("key"),
+                        modifiers,
+                        repeat,
+                        modifier_names,
+                    ):
+                        return _linux_automation_failure(
+                            "X11 key input failed", completed=completed
+                        )
+                    completed.append(
+                        {
+                            "index": index,
+                            "type": step_type,
+                            "status": "completed",
+                            "repeat": repeat,
+                        }
+                    )
+                    continue
+
+                if step_type == "text":
+                    text = raw_step.get("text")
+                    if not isinstance(text, str) or not _linux_automation_send_text(
+                        display,
+                        xtest_module,
+                        x_module,
+                        keysym_module,
+                        text,
+                        modifier_names,
+                    ):
+                        return _linux_automation_failure(
+                            "X11 text input requires printable ASCII", completed=completed
+                        )
+                    completed.append(
+                        {
+                            "index": index,
+                            "type": step_type,
+                            "status": "completed",
+                            "characters": len(text),
+                        }
+                    )
+                    continue
+
+                if step_type in {"move_pointer", "click"}:
+                    x = _linux_automation_integer(raw_step.get("x"))
+                    y = _linux_automation_integer(raw_step.get("y"))
+                    if x is None or y is None or abs(x) > 1_000_000 or abs(y) > 1_000_000:
+                        return _linux_automation_failure(
+                            "automation coordinates are invalid", completed=completed
+                        )
+                    if step_type == "move_pointer":
+                        fake_input(
+                            display,
+                            getattr(x_module, "MotionNotify"),
+                            x=x,
+                            y=y,
+                        )
+                    else:
+                        button = str(raw_step.get("button", "left") or "").strip().lower()
+                        button_code = {"left": 1, "middle": 2, "right": 3}.get(button)
+                        if button_code is None:
+                            return _linux_automation_failure(
+                                "automation click is invalid", completed=completed
+                            )
+                        fake_input(
+                            display,
+                            getattr(x_module, "MotionNotify"),
+                            x=x,
+                            y=y,
+                        )
+                        fake_input(
+                            display,
+                            getattr(x_module, "ButtonPress"),
+                            detail=button_code,
+                        )
+                        fake_input(
+                            display,
+                            getattr(x_module, "ButtonRelease"),
+                            detail=button_code,
+                        )
+                    display.sync()
+                    completed.append({"index": index, "type": step_type, "status": "completed"})
+                    continue
+
+                if step_type in {"activate_window", "move_window"}:
+                    window_id = _linux_automation_window_id(raw_step.get("window_id"))
+                    if window_id is None:
+                        return _linux_automation_failure(
+                            "automation window id is invalid", completed=completed
+                        )
+                    window = display.create_resource_object("window", window_id)
+                    if step_type == "activate_window":
+                        setter = getattr(window, "set_input_focus", None)
+                        if not callable(setter):
+                            return _linux_automation_failure(
+                                "X11 window activation is unavailable", completed=completed
+                            )
+                        setter(
+                            getattr(x_module, "RevertToParent"),
+                            getattr(x_module, "CurrentTime"),
+                        )
+                    else:
+                        x = _linux_automation_integer(raw_step.get("x"))
+                        y = _linux_automation_integer(raw_step.get("y"))
+                        if x is None or y is None or abs(x) > 1_000_000 or abs(y) > 1_000_000:
+                            return _linux_automation_failure(
+                                "automation window position is invalid", completed=completed
+                            )
+                        configure = getattr(window, "configure", None)
+                        if not callable(configure):
+                            return _linux_automation_failure(
+                                "X11 window movement is unavailable", completed=completed
+                            )
+                        configure(x=x, y=y)
+                    display.sync()
+                    completed.append({"index": index, "type": step_type, "status": "completed"})
+                    continue
+
+                return _linux_automation_failure(
+                    "automation step type is unsupported", completed=completed
+                )
+            return {
+                "status": "completed",
+                "backend": BACKEND_X11,
+                "steps": tuple(completed),
+            }
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.debug("X11 automation failed: %s", type(exc).__name__)
+            return _linux_automation_failure("X11 automation failed", completed=completed)
+        finally:
+            closer = getattr(display, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
 
     def exclude_window_id(self, window_id: int) -> None:
         """排除属于桌宠自身的 X11 窗口。"""

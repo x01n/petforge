@@ -1289,7 +1289,10 @@ def test_cli_validation_reports_resource_warnings(
     assert cli_main(["--config", str(config_path), "--validate"]) == 0
     output = capsys.readouterr()
     assert "resource_warning: no usable Live2D model3 descriptor was found" in output.err
-    assert "resource_warning: no WebP sprite fallback was found" in output.err
+    assert (
+        "resource_warning: no WebP sprite resource was found for explicit sprite rendering"
+        in output.err
+    )
     assert "model_channel_ready: False" in output.out
     assert "rendering_backend_requested: auto" in output.out
     assert "rendering_backend_selected: unavailable" in output.out

@@ -14,6 +14,11 @@ if TYPE_CHECKING:
     from .content import MCPGetPromptResult, MCPPrompt, MCPReadResourceResult, MCPResource
 
 
+# tools/list 分页必须有统一上限，避免恶意或失控服务端造成无限请求与内存增长。
+MCP_TOOL_LIST_MAX_PAGES = 64
+MCP_TOOL_LIST_MAX_ENTRIES = 1024
+
+
 class MCPError(RuntimeError):
     """MCP 客户端错误基类。"""
 
@@ -414,6 +419,8 @@ __all__ = [
     "MCPConnectionHandler",
     "MCP_LIST_CHANGED_NOTIFICATIONS",
     "MCP_PROTOCOL_VERSION",
+    "MCP_TOOL_LIST_MAX_ENTRIES",
+    "MCP_TOOL_LIST_MAX_PAGES",
     "MCPNotificationHandler",
     "MCPNotificationDispatcher",
     "MCPProtocolError",

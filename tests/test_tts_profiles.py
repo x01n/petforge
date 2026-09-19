@@ -269,6 +269,39 @@ def test_profile_router_falls_back_and_cools_failed_profile() -> None:
     assert broken.calls == 2
 
 
+def test_profile_router_rewrites_profile_id_for_each_fallback_backend() -> None:
+    """后备后端必须收到自己的 profile 标识，而不是失败主 profile。"""
+
+    class RecordingBackend(_Backend):
+        def __init__(self, name: str, *, fail: bool = False) -> None:
+            super().__init__(name, fail=fail)
+            self.request_profile_ids: list[str] = []
+
+        async def stream(self, request: SpeechRequest):
+            self.request_profile_ids.append(request.profile_id)
+            async for chunk in super().stream(request):
+                yield chunk
+
+    primary = RecordingBackend("primary", fail=True)
+    fallback = RecordingBackend("fallback")
+    router = TTSProfileRouter(
+        {
+            "primary": TTSProfile("primary", primary, cooldown_seconds=0),
+            "fallback": TTSProfile("fallback", fallback),
+        },
+        default_profile="primary",
+        fallback_profiles=("fallback",),
+    )
+
+    async def scenario() -> list[bytes]:
+        request = SpeechRequest("fallback-profile-id", "你好。", profile_id="primary")
+        return [chunk.data async for chunk in router.stream(request)]
+
+    assert asyncio.run(scenario()) == [b"fallback"]
+    assert primary.request_profile_ids == ["primary"]
+    assert fallback.request_profile_ids == ["fallback"]
+
+
 def test_profile_router_retries_full_fallback_chain_when_all_profiles_are_cooling() -> None:
     """共同故障后仍应尝试已配置的后备 profile，而不是只重试主 profile。"""
 
@@ -886,3 +919,37 @@ def test_clear_context_routes_preserves_pinned_route_after_flush() -> None:
 
     assert character_voice.calls == 2
     assert global_voice.calls == 0
+
+
+def test_pinned_context_migrates_when_hot_reload_removes_its_profile() -> None:
+    """移除旧 profile 后，同一回合的后续句段不能静默丢失 TTS。"""
+
+    first_voice = _Backend("first")
+    replacement_voice = _Backend("replacement")
+    profile_router = TTSProfileRouter(
+        {
+            "first": TTSProfile("first", first_voice),
+            "replacement": TTSProfile("replacement", replacement_voice),
+        },
+        default_profile="first",
+    )
+    coordinator = TTSCoordinator(profile_router)
+    context = ConversationContext("profile", "local", "profile-removed", 1)
+
+    async def scenario() -> None:
+        assert coordinator.pin_context(context, language="zh") == ("zh", "first")
+        await coordinator.enqueue_text(context, "旧句。", language="zh", flush=True)
+
+        # 配置重载移除了旧 profile；当前回合仍有后续文本时，应迁移到
+        # 当前可用 profile，而不是继续提交已经不存在的 profile_id。
+        profile_router.reconfigure(
+            {"replacement": TTSProfile("replacement", replacement_voice)},
+            default_profile="replacement",
+        )
+        await coordinator.enqueue_text(context, "新句。", language="zh", flush=True)
+        coordinator.release_context(context)
+
+    asyncio.run(scenario())
+
+    assert first_voice.calls == 1
+    assert replacement_voice.calls == 1

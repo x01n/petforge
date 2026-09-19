@@ -935,6 +935,26 @@ window = PetConsoleWindow(callbacks={
     "api_audit": lambda: {
         "status": "available",
         "count": 1,
+        "summary": {
+            "total": 1,
+            "by_status": [
+                {
+                    "key": "status:completed",
+                    "count": 1,
+                    "avg_first_ms": 42.0,
+                    "avg_total_ms": 180.0,
+                }
+            ],
+            "by_channel": [
+                {
+                    "key": "channel:primary",
+                    "count": 1,
+                    "avg_first_ms": 42.0,
+                    "avg_total_ms": 180.0,
+                }
+            ],
+            "latency_ms": {"avg_first": 42.0, "avg_total": 180.0, "max_total": 180.0},
+        },
             "records": [{
                 "status": "completed",
                 "kind": "model",
@@ -988,6 +1008,10 @@ button = window.findChild(QPushButton, "apiAuditButton")
 assert button is not None
 button.click()
 output = window.findChild(type(window._diagnostic_output), "diagnosticOutput").toPlainText()
+assert "聚合摘要" in output
+assert "status:completed x 1" in output
+assert "channel:primary x 1" in output
+assert "平均首字 42ms" in output
 assert "primary" in output
 assert "openai / openai_chat" in output
 assert "渠道配置" in output
@@ -1021,6 +1045,68 @@ print("console-api-audit-ok")
     result = _run_qt_script(tmp_path, script)
     assert result.returncode == 0, result.stderr
     assert "console-api-audit-ok" in result.stdout
+
+
+def test_console_log_table_filters_structured_rows(tmp_path: Path) -> None:
+    script = r"""
+from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit, QTableWidget
+from gui.qt6.console import PetConsoleWindow
+
+app = QApplication.instance() or QApplication([])
+window = PetConsoleWindow()
+window.set_diagnostic_result("运行日志", {
+    "status": "available",
+    "count": 3,
+    "records": [
+        {
+            "level": "INFO",
+            "logger": "services.demo",
+            "event": "demo.started",
+            "status": "completed",
+            "message": "启动完成",
+        },
+        {
+            "level": "ERROR",
+            "logger": "services.demo",
+            "event": "demo.failed",
+            "status": "failed",
+            "message": "连接失败",
+        },
+        {
+            "level": "WARNING",
+            "logger": "services.other",
+            "event": "other.warning",
+            "status": "degraded",
+            "message": "已降级",
+        },
+    ],
+})
+app.processEvents()
+table = window.findChild(QTableWidget, "diagnosticLogTable")
+search = window.findChild(QLineEdit, "logSearchInput")
+level = window.findChild(QComboBox, "logLevelFilter")
+assert table is not None and search is not None and level is not None
+assert table.rowCount() == 3
+search.setText("failed")
+app.processEvents()
+assert table.rowCount() == 1
+assert table.item(0, 2).text() == "demo.failed"
+search.clear()
+level.setCurrentIndex(level.findData("WARNING"))
+app.processEvents()
+assert table.rowCount() == 1
+assert table.item(0, 0).text() == "WARNING"
+window.shutdown()
+app.processEvents()
+print("console-log-table-filter-ok")
+"""
+    try:
+        import PySide6  # noqa: F401
+    except (ImportError, ModuleNotFoundError, OSError):
+        return
+    result = _run_qt_script(tmp_path, script)
+    assert result.returncode == 0, result.stderr
+    assert "console-log-table-filter-ok" in result.stdout
 
 
 def test_configuration_panel_model_button_opens_clickable_dialog(tmp_path: Path) -> None:
@@ -2211,3 +2297,220 @@ print("console-window-receipt-state-ok")
     result = _run_qt_script(tmp_path, script)
     assert result.returncode == 0, result.stderr
     assert "console-window-receipt-state-ok" in result.stdout
+
+
+def test_console_api_audit_filter_panel_and_grouped_table(tmp_path: Path) -> None:
+    """筛选条与分组表：默认全量渲染、筛选行数与聚合摘要既有构造不变。"""
+
+    script = r"""
+from PySide6.QtWidgets import QApplication, QComboBox, QPushButton, QTableWidget
+from gui.qt6.console import PetConsoleWindow
+
+app = QApplication.instance() or QApplication([])
+payload = {
+    "status": "available",
+    "count": 2,
+    "summary": {
+        "total": 2,
+        "by_status": [
+            {"key": "status:completed", "count": 1, "avg_first_ms": 42.0, "avg_total_ms": 180.0},
+            {"key": "status:failed", "count": 1, "avg_first_ms": None, "avg_total_ms": 240.0},
+        ],
+        "by_channel": [
+            {"key": "channel:primary", "count": 1, "avg_first_ms": 42.0, "avg_total_ms": 180.0},
+            {"key": "channel:secondary", "count": 1, "avg_first_ms": None, "avg_total_ms": 240.0},
+        ],
+        "latency_ms": {"avg_first": 42.0, "avg_total": 210.0, "max_total": 240.0},
+    },
+    "records": [
+        {
+            "status": "completed", "kind": "model", "channel_id": "primary",
+            "channel_name": "主渠道", "provider": "openai", "protocol": "openai_chat",
+            "requested_model": "req", "response_model": "served",
+            "time_to_first_token_ms": 42.0, "total_duration_ms": 180.0,
+        },
+        {
+            "status": "failed", "kind": "channel", "channel_id": "secondary",
+            "provider": "mock", "protocol": "mock",
+            "requested_model": "req2", "time_to_first_token_ms": None,
+            "total_duration_ms": 240.0,
+        },
+    ],
+}
+window = PetConsoleWindow(callbacks={"api_audit": lambda: payload})
+window.findChild(QPushButton, "apiAuditButton").click()
+output = window._diagnostic_output.toPlainText()
+assert "API 调用审计：2 条" in output
+assert "聚合摘要" in output
+assert "status:completed x 1" in output
+assert "status:failed x 1" in output
+assert "channel:primary x 1" in output
+assert "channel:secondary x 1" in output
+table = window.findChild(QTableWidget, "diagnosticAuditTable")
+status_combo = window.findChild(QComboBox, "auditStatusFilter")
+channel_combo = window.findChild(QComboBox, "auditChannelFilter")
+refresh_button = window.findChild(QPushButton, "auditRefreshButton")
+assert table is not None
+assert status_combo is not None
+assert channel_combo is not None
+assert refresh_button is not None
+assert not table.isHidden()
+assert table.rowCount() == 2
+status_items = [status_combo.itemData(i) for i in range(status_combo.count())]
+channel_items = [channel_combo.itemData(i) for i in range(channel_combo.count())]
+assert status_items == ["", "completed", "failed"]
+assert channel_items == ["", "primary", "secondary"]
+# 分组表行列只包含白名单摘要字段，不携带请求 ID、载荷与密钥类内容
+headers = [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
+assert headers == ["状态", "类型", "渠道", "协议", "请求模型", "首字", "总耗时"]
+cell_texts = set()
+for row_index in range(table.rowCount()):
+    for column in range(table.columnCount()):
+        item = table.item(row_index, column)
+        if item is not None:
+            cell_texts.add(item.text())
+joined = " | ".join(sorted(cell_texts))
+assert "model-123" not in joined
+assert "密钥" not in joined
+assert "completed" in joined
+assert "主渠道" not in joined
+assert "primary / openai" in joined
+assert "req→served" in joined
+assert "42 ms" in joined
+assert "240 ms" in joined
+system_lines = window._log_lines if hasattr(window, "_log_lines") else []
+window.shutdown()
+app.processEvents()
+print("console-api-audit-filter-panel-ok")
+"""
+    try:
+        import PySide6  # noqa: F401
+    except (ImportError, ModuleNotFoundError, OSError):
+        return
+    result = _run_qt_script(tmp_path, script)
+    assert result.returncode == 0, result.stderr
+    assert "console-api-audit-filter-panel-ok" in result.stdout
+
+
+def test_console_api_audit_filter_refresh_routes_host_and_rejects_unknown(
+    tmp_path: Path,
+) -> None:
+    """audit_refresh 回调：过滤键与客户端读取一致，回执映射更新表格且不越权。"""
+
+    script = r"""
+from PySide6.QtWidgets import QApplication, QComboBox, QPushButton, QTableWidget
+from gui.qt6.console import PetConsoleWindow
+
+app = QApplication.instance() or QApplication([])
+seen_filters = []
+
+def audit_refresh(filters):
+    seen_filters.append(dict(filters or {}))
+    return {
+        "status": "available",
+        "count": 1,
+        "filters": dict(filters or {}),
+        "summary": {
+            "total": 1,
+            "by_status": [{"key": "status:failed", "count": 1}],
+            "by_channel": [{"key": "channel:secondary", "count": 1}],
+            "latency_ms": {"avg_first": None, "avg_total": 240.0, "max_total": 240.0},
+        },
+        "records": [
+            {
+                "status": "failed", "kind": "model", "channel_id": "secondary",
+                "protocol": "openai_chat", "requested_model": "req2",
+                "total_duration_ms": 240.0,
+            }
+        ],
+    }
+
+window = PetConsoleWindow(callbacks={
+    "api_audit": lambda: {
+        "status": "available",
+        "count": 2,
+        "summary": {
+            "total": 2,
+            "by_status": [
+                {"key": "status:completed", "count": 1},
+                {"key": "status:failed", "count": 1},
+            ],
+            "by_channel": [
+                {"key": "channel:primary", "count": 1},
+                {"key": "channel:secondary", "count": 1},
+            ],
+            "latency_ms": {"avg_first": None, "avg_total": None, "max_total": None},
+        },
+        "records": [
+            {"status": "completed", "channel_id": "primary", "kind": "model"},
+            {"status": "failed", "channel_id": "secondary", "kind": "model"},
+        ],
+    },
+    "audit_refresh": audit_refresh,
+})
+window.findChild(QPushButton, "apiAuditButton").click()
+status_combo = window.findChild(QComboBox, "auditStatusFilter")
+channel_combo = window.findChild(QComboBox, "auditChannelFilter")
+table = window.findChild(QTableWidget, "diagnosticAuditTable")
+assert status_combo.itemData(status_combo.count() - 1) == "failed"
+status_combo.setCurrentIndex(status_combo.findData("failed"))
+channel_combo.setCurrentIndex(channel_combo.findData("secondary"))
+table = window.findChild(QTableWidget, "diagnosticAuditTable")
+assert table.rowCount() == 1
+assert table.item(0, 0).text() == "failed"
+assert table.item(0, 2).text() == "secondary"
+assert seen_filters[-1] == {"status": "failed", "channel_id": "secondary"}
+# 所有已见过滤调用都不能携带未知或可疑键
+for received_filters in seen_filters:
+    unknown_keys = set(received_filters) - {"status", "channel_id"}
+    assert not unknown_keys, f"unexpected filter keys: {sorted(unknown_keys)}"
+window.shutdown()
+app.processEvents()
+print("console-api-audit-filter-refresh-ok")
+"""
+    try:
+        import PySide6  # noqa: F401
+    except (ImportError, ModuleNotFoundError, OSError):
+        return
+    result = _run_qt_script(tmp_path, script)
+    assert result.returncode == 0, result.stderr
+    assert "console-api-audit-filter-refresh-ok" in result.stdout
+
+
+def test_api_audit_filter_sanitizer_and_repository_alignment() -> None:
+    """白名单过滤键进入仓库层后行数对齐；未知/异常值被拒绝或归一。"""
+
+    from db import ApiCallAuditRepository, Database
+    from gui.qt6.app import _sanitize_api_audit_filters
+
+    db = Database(":memory:")
+    repository = ApiCallAuditRepository(db)
+    for index, (status, channel_id) in enumerate(
+        (
+            ("completed", "primary"),
+            ("completed", "primary"),
+            ("failed", "secondary"),
+            ("failed", "secondary"),
+        )
+    ):
+        handle = repository.start(
+            kind="model",
+            status=status,
+            channel_id=channel_id,
+            provider="openai",
+            started_at=float(index + 1),
+        )
+        handle.finish(status=status, completed_at=float(index + 1) + 0.25)
+    assert repository.count() == 4
+    assert repository.count(status="completed") == 2
+    assert repository.count(channel_id="secondary") == 2
+
+    unknown_like = {"session_id": "x", "limit": 999, "started_after": 0}
+    cleaned = _sanitize_api_audit_filters(unknown_like)
+    assert cleaned == {}
+    polluted = {"status": "completed", "channel_id": "primary", "api_key": "leak"}
+    cleaned = _sanitize_api_audit_filters(polluted)
+    assert cleaned == {"status": "completed", "channel_id": "primary"}
+    completed_records = repository.list_recent(limit=50, **cleaned)
+    assert completed_records and all(item.status == "completed" for item in completed_records)
+    assert repository.count(status="completed", channel_id="primary") == 2

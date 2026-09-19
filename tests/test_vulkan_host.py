@@ -114,7 +114,7 @@ raise SystemExit(0 if not result.available and result.renderer is None else 3)
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert "failed False True" in completed.stdout
+    assert "unavailable False True" in completed.stdout
 
 
 def test_vulkan_preparation_requests_global_alpha_before_first_quick_window() -> None:

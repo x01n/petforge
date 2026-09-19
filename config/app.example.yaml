@@ -63,6 +63,11 @@ llm:
     - vision
     enabled: true
     priority: 10
+    # 保留默认即可；渠道级可选键：
+    # audit_text_limit 调整该渠道请求审计正文的截断阈值（字符数，
+    # 不低于默认 4000 且不高于 32768；低于默认视为配置错误）。
+    # retry.fr2_allow_after_first_event: true 允许首事件后网络错误仍在
+    # 同渠道内重试（默认 false，保持首事件前重试语义）。
   models: {}
   routing:
     dialogue:
@@ -102,8 +107,13 @@ tools:
     - pet:play_motion
     - pet:speak
     - pet:set_click_through
+    - pet:list_models
+    - pet:switch_model
     scheduler:
     - scheduler:upsert
+    - scheduler:list
+    - scheduler:remove
+    - scheduler:set_trigger
     system:
     - system:module_status
     - system:transcribe_audio
@@ -114,6 +124,12 @@ tools:
     allow: []
     deny: []
     approval_ttl_seconds: 90
+    # XML approve 有界放行门控：默认关闭。启用后，回合收尾的
+    # <approve>true</approve> 只把本回合被拒绝/拦截的身份提为
+    # “本会话、短窗口、仅 MEDIUM 及以下”的放行集合；HIGH 与
+    # deny 名单永远不受影响。窗口过期或会话不匹配时审批照旧。
+    xml_approve_enabled: false
+    xml_approve_window_seconds: 15
   command_allowlist: []
   active_groups:
   - desktop_observation
@@ -171,6 +187,19 @@ memory:
   extract_default_priority: 5
   recall_min_similarity: 0.04
   always_recall_priority: 9
+  # 召回评分权重（未配置时用编译期默认并按比例归一）：
+  # relevance 相关性 / exact 精确命中 / tag 标签 / importance 优先级 /
+  # recency 新鲜度 / access 访问频次。
+  recall_weights:
+    relevance: 0.55
+    exact: 0.25
+    tag: 0.05
+    importance: 0.10
+    recency: 0.03
+    access: 0.02
+  # 窗口命中率偏低时给相关性维度最多 +gain 的有界校准。
+  recall_calibration_gain: 0.06
+  recall_calibration_limit: 4
   # 真实语义索引默认关闭；启用时只读取本地模型，不隐式联网下载。
   semantic:
     enabled: false
@@ -255,6 +284,8 @@ asr:
   # 中文参考音频在 SenseVoice auto 下实测会误判为 ja；中文桌宠默认锁定 zh。
   # 需要多语言自动检测时仍可显式改为 auto。
   language: zh
+  # 取消一次转录不会退出 ASR worker：进程与已加载模型保留，下次转写
+  # 直接复用；仅协议损坏与 shutdown 会真正重建（与 TTS cancel 语义对齐）。
   timeout_seconds: 60
   startup_timeout_seconds: 180
   max_audio_bytes: 16777216
@@ -287,6 +318,12 @@ config:
 scheduler:
   enabled: true
   poll_seconds: 0.5
+  # tasks 的 action.identity 受「调度动作身份白名单」约束：只允许示例
+  # GUI 预设（pet:play_motion、pet:set_expression、pet:speak、
+  # pet:autonomous_move、pet:list_models、pet:diary_recall）与
+  # proactive:run（须经 require_user_active 门禁）；scheduler 自指、
+  # system:run_command、desktop 自动化/截图身份一律拒绝。审批类动作请改用
+  # scheduler:set_trigger（触发器执行前仍走统一审批管线）。
   activity:
     enabled: true
     idle_seconds: 300
@@ -319,6 +356,25 @@ behavior:
       name: blink
     weight: 1
     duration_seconds: 0.8
+mood:
+  # 心情词汇集（9 值）：高兴/平静/困倦/烦躁/难过/期待/好奇/生气/孤独；
+  # 旧值自动归一：开心->高兴、忧郁->难过。
+  # 距上次 mood 写入超过 decay_after_seconds 后，以给定概率向模型注入
+  # 轻量判断提示，由模型按人设决定保持或更新心情；不强制恢复平静。
+  decay_enabled: true
+  decay_after_seconds: 14400
+  decay_prompt_probability: 0.5
+  # 主动行为心情门槛：系数 f<1 会按概率跳过背景主动（不扣预算/不去重），
+  # f>=1 恒通过。阈值之外的情绪按 1.0 处理；enabled: false 整体关闭。
+  proactive_mood_gate:
+    enabled: true
+    multipliers:
+      烦躁: 0.5
+      生气: 0.5
+      难过: 0.5
+      高兴: 1.2
+      期待: 1.2
+      好奇: 1.2
 proactive:
   enabled: false
   hourly_budget: 6
@@ -326,8 +382,11 @@ proactive:
   global_cooldown_seconds: 15
   dedupe_seconds: 60
   max_pending_events: 32
-  memory_context_chars: 2400
+  memory_context_chars: 2600
   max_tool_rounds: 2
+  # 全局要求用户活跃时才能进入主动回合；单条规则可显式
+  # require_user_active: false 豁免（默认关闭，凌晨提醒类仍按规则条件）。
+  user_active_required: false
   rules:
   - id: editor-focus
     event: window_active
@@ -356,6 +415,9 @@ ui:
     extra_stylesheet: ''
   qt_platform: auto
   auto_open_model_setup: true
+  # RuntimeLoop 后台服务启动超时（秒），默认 10，允许 0.1-300。超时后
+  # 取消启动任务并回归诊断，而不是直接退出进程。
+  runtime_start_timeout_seconds: 10
   hotkeys:
     enabled: true
     bindings:

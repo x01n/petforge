@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import math
 from collections import deque
 from collections.abc import Callable, Mapping
 from threading import Lock
 from time import monotonic
 
+from logger.events import log_event
+
 from .triggers import TriggerService
+
+logger = logging.getLogger(__name__)
 
 MIN_IDLE_SECONDS = 1.0
 MAX_IDLE_SECONDS = 7 * 24 * 60 * 60.0
@@ -344,6 +349,14 @@ class UserActivityTracker:
                 loop = self._loop
         if disabled:
             return self.status()
+        log_event(
+            logger,
+            "scheduler.activity.interaction",
+            component="scheduler.activity",
+            status="active",
+            reason_code="interaction",
+            fields={"source": safe_source, "interaction_count": self._interaction_count},
+        )
         self._schedule_drain(loop)
         return self.status()
 
@@ -384,6 +397,24 @@ class UserActivityTracker:
             except Exception as exc:
                 with self._lock:
                     self._last_error = f"{type(exc).__name__}: {exc}"
+                log_event(
+                    logger,
+                    "scheduler.activity.loop_failed",
+                    component="scheduler.activity",
+                    status="degraded",
+                    level=logging.WARNING,
+                    reason_code="poll_loop_failed",
+                    fields={"error_type": type(exc).__name__},
+                )
+                log_event(
+                    logger,
+                    "scheduler.activity.emit_failed",
+                    component="scheduler.activity",
+                    status="failed",
+                    level=logging.WARNING,
+                    reason_code="trigger_emit_failed",
+                    fields={"error_type": type(exc).__name__},
+                )
 
     async def poll_once(self, *, now: object | None = None) -> Mapping[str, object]:
         """检查一次空闲边沿并在 active -> idle 时触发 ``idle``。"""
@@ -419,6 +450,14 @@ class UserActivityTracker:
                     self._last_event_at = current
         if emit_payload is None:
             return self.status()
+        log_event(
+            logger,
+            "scheduler.activity.idle",
+            component="scheduler.activity",
+            status="idle",
+            reason_code="idle_threshold",
+            fields={"idle_count": self._idle_count},
+        )
         try:
             result = self._triggers.emit("idle", emit_payload)
             if inspect.isawaitable(result):
@@ -428,6 +467,15 @@ class UserActivityTracker:
         except Exception as exc:
             with self._lock:
                 self._last_error = f"{type(exc).__name__}: {exc}"
+            log_event(
+                logger,
+                "scheduler.activity.emit_failed",
+                component="scheduler.activity",
+                status="failed",
+                level=logging.WARNING,
+                reason_code="idle_emit_failed",
+                fields={"error_type": type(exc).__name__},
+            )
         return self.status()
 
     def set_system_idle_probe(self, probe: Callable[[], object] | None) -> Mapping[str, object]:

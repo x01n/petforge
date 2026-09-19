@@ -35,6 +35,7 @@ _FINGERPRINT_KEY = re.compile(
 )
 _SECRET_VALUE = re.compile(
     r"(?i)(?:\bsk-[a-z0-9_-]{8,}\b|"
+    r"(?:x-goog-api[_-]?key|session[_-]?key)[\"']?\s*[:=]\s*[\"']?[^\s,;\"']+[\"']?|"
     r"\b(?:api[_-]?key|token|secret|password|authorization|cookie|credential)\b"
     r"\s*[:=]\s*[^\s,;]+)"
 )

@@ -335,6 +335,7 @@ for _line in sys.stdin:
             "running": False,
             "ready": False,
             "pid": None,
+            "queue_depth": 0,
         }
 
         start_task = asyncio.create_task(backend.start())

@@ -1,5 +1,3 @@
-"""把统一事件流转换为桌宠气泡可消费的轻量状态。"""
-
 from __future__ import annotations
 
 import logging
@@ -19,6 +17,15 @@ from core.events.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _without_xml_marker(raw: str) -> str:
+    """剥离增量中出现的 XML 指令标记；未闭合标签只去掉已输出部分。"""
+
+    value = str(raw or "")
+    if "<meapet" not in value:
+        return value
+    return value.split("<meapet", 1)[0]
 
 
 @dataclass(frozen=True)
@@ -275,12 +282,15 @@ class PresentationService:
             snapshot = self._snapshot
             if isinstance(event, TextDelta):
                 if event.delta:
+                    # XML 指令行不进入气泡；标签可能在多个 delta 之间
+                    # 拆分，未闭合片段先剥掉再追加，收尾由会话层剔除残留。
+                    visible = _without_xml_marker(str(event.delta))
                     snapshot = replace(
                         snapshot,
                         direct_text="",
                         direct_mood="neutral",
                         tool_status="",
-                        text=self._append(snapshot.text, event.delta),
+                        text=self._append(snapshot.text, visible),
                     )
             elif isinstance(event, MurmurDelta) and self.show_murmur:
                 snapshot = replace(snapshot, murmur=self._append(snapshot.murmur, event.delta))
